@@ -24,10 +24,16 @@ storage:
   audit_max_backups: 10
 
 approval:
-  # 审批等待超时（秒）。0 表示一直等待用户批准或拒绝，直到客户端取消或触发急停
+  # 本地直连审批等待超时（秒）。0 表示一直等待用户批准或拒绝，直到客户端取消或触发急停
   timeout_seconds: 0
   # L1 限时批量授权允许的最大时长（分钟）
   max_grant_minutes: 60
+  # 远程云端客户端同步等待审批短窗口（秒），超时后不销毁审批单并转为异步续接
+  remote_wait_seconds: 45
+  # 远程异步续接审批单在本地控制台保留的最长秒数
+  pending_ttl_seconds: 900
+  # 远程重复请求指纹幂等去重窗口（秒）
+  idempotency_ttl_seconds: 300
 
 tasks:
   # 最大并发运行任务数
@@ -116,9 +122,32 @@ workspaces:
     read_only: false
     deny_globs: []
 
-# 阶段二预留：远程隧道 / Relay 配置（阶段一默认 disabled）
+# 阶段二：远程安全隧道 / 外部 HTTPS 反代配置
 relay:
-  enabled: false
-  provider: ""
-  endpoint: ""
+  # 可选值：disabled | cloudflared_quick | cloudflared_named | external
+  mode: "disabled"
+  # 固定公网 HTTPS 基地址（cloudflared_named / external 必填；cloudflared_quick 自动发现）
+  public_url: ""
+  # Cloudflare Named Tunnel Token（推荐使用 "env:CLOUDFLARE_TUNNEL_TOKEN" 从环境变量读取）
+  tunnel_token: ""
+  # 自定义本机 cloudflared 可执行路径（留空则自动从 PATH 探测）
+  cloudflared_bin: ""
+  # 触发 Kill All 一键急停时是否同时自动断开公网隧道
+  kill_all_disconnect_tunnel: false
+  # 设备唯一 ID（留空则首次启动自动生成并持久化至 data_dir/device.json）
   device_id: ""
+
+# 阶段二：内置单用户 OAuth 2.1 授权服务器配置（兼容 Gemini / ChatGPT / Claude Web 远程 MCP）
+oauth:
+  # 当 relay.mode != disabled 时默认自动开启
+  enabled: false
+  # 短期 Access Token 有效期（秒，默认 1 小时）
+  access_token_ttl_seconds: 3600
+  # 可轮换 Refresh Token 有效期（秒，默认 7 天）
+  refresh_token_ttl_seconds: 604800
+  # 一次性配对码有效期（秒，默认 5 分钟）
+  pairing_code_ttl_seconds: 300
+  # 允许符合 RFC 7591 的动态客户端注册（DCR）
+  allow_dynamic_registration: true
+  # 公网 OAuth 接口按来源 IP 每分钟请求速率上限
+  rate_limit_per_minute: 20

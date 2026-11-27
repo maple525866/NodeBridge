@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NodeBridge 本地安全审批与监控控制台</title>
+<title>NodeBridge 本地安全审批与远程管控控制台</title>
 <style>
   :root {
     --bg: #0f172a;
@@ -29,7 +29,7 @@
     padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--border);
     position: sticky; top: 0; z-index: 10;
   }
-  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 16px; }
+  .brand { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-weight: 700; font-size: 16px; }
   .pill { font-size: 12px; padding: 3px 9px; border-radius: 999px; font-weight: 600; }
   .pill-ok { background: rgba(34,197,94,.2); color: #86efac; }
   .pill-paused { background: rgba(239,68,68,.25); color: #fca5a5; }
@@ -51,12 +51,13 @@
   section {
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px;
   }
-  h2 { margin: 0 0 12px; font-size: 15px; display: flex; align-items: center; justify-content: space-between; }
-  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 18px; }
+  h2 { margin: 0 0 12px; font-size: 15px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 18px; }
   .card {
     background: var(--panel-alt); border: 1px solid var(--border); border-radius: 8px;
     padding: 14px; margin-bottom: 12px;
   }
+  .card-highlight { border-color: #3b82f6; box-shadow: 0 0 0 1px rgba(59,130,246,.35); }
   .meta { font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 12px; margin: 6px 0 10px; }
   pre.diff {
     margin: 8px 0 12px; padding: 10px; border-radius: 6px; background: #0b1220;
@@ -78,14 +79,20 @@
   }
   input[type="password"], input[type="text"] {
     width: 100%; padding: 10px; border-radius: 6px; border: 1px solid var(--border);
-    background: #0b1220; color: var(--text); margin: 10px 0 14px; font-family: monospace;
+    background: #0b1220; color: var(--text); margin: 8px 0 12px; font-family: monospace;
+  }
+  .inline-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 10px 0; font-size: 13px; }
+  .inline-form label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+  .code-badge {
+    display: inline-block; padding: 6px 10px; border-radius: 6px; background: #0b1220;
+    border: 1px solid #3b82f6; color: #93c5fd; font-family: ui-monospace, Consolas, monospace; font-size: 13px;
   }
 </style>
 </head>
 <body>
 <div id="authGate" class="auth-box" style="display:none;">
   <h2>NodeBridge 控制台登录</h2>
-  <p style="font-size:13px;color:var(--muted);">请输入配置文件中的 <code>server.admin_token</code> 以连接本地审批与急停面板。</p>
+  <p style="font-size:13px;color:var(--muted);">请输入配置文件中的 <code>server.admin_token</code> 以连接本地审批与远程管控面板。</p>
   <input id="tokenInput" type="password" placeholder="粘贴 admin_token">
   <button class="btn-grant" style="width:100%;" onclick="saveToken()">连接本地 Daemon</button>
   <div id="authErr" style="color:#fca5a5;font-size:12px;margin-top:8px;"></div>
@@ -94,8 +101,9 @@
 <div id="app" style="display:none;">
   <header>
     <div class="brand">
-      <span>NodeBridge 本地安全控制台</span>
+      <span>NodeBridge 安全控制台</span>
       <span id="statusPill" class="pill pill-ok">运行中</span>
+      <span id="relayPill" class="pill pill-l0">远程通道未启用</span>
       <span id="ssePill" class="pill pill-l0">SSE 连接中...</span>
     </div>
     <div class="controls">
@@ -107,12 +115,53 @@
   </header>
 
   <main>
+    <section id="oauthPendingSection" style="display:none;">
+      <h2>
+        <span>待确认的云端 OAuth 客户端绑定请求 <span id="oauthPendingCount" class="pill pill-l1">0</span></span>
+        <span style="font-size:12px;color:var(--muted);font-weight:400;">零长期凭据暴露公网 · 请确认客户端身份与权限范围</span>
+      </h2>
+      <div id="oauthPendingList"></div>
+    </section>
+
     <section>
       <h2>
-        <span>待人工审批队列 <span id="pendingCount" class="pill pill-l2">0</span></span>
+        <span>待人工审批工具队列 <span id="pendingCount" class="pill pill-l2">0</span></span>
         <span id="sysMeta" style="font-size:12px;color:var(--muted);font-weight:400;"></span>
       </h2>
       <div id="pendingList"></div>
+    </section>
+
+    <div class="grid-2">
+      <section>
+        <h2>
+          <span>远程安全隧道与公网 MCP 接入</span>
+          <div class="controls">
+            <button class="btn-approve" onclick="connectRelay()">启动/重连隧道</button>
+            <button class="btn-danger" onclick="disconnectRelay()">一键断开隧道</button>
+          </div>
+        </h2>
+        <div id="relayBox"></div>
+      </section>
+
+      <section>
+        <h2>
+          <span>一次性短期配对码（OAuth 绑定）</span>
+          <button class="btn-grant" onclick="createPairingCode()">生成 5 分钟配对码</button>
+        </h2>
+        <div class="inline-form">
+          <label><input type="checkbox" id="pairReadOnly"> 仅授予只读权限</label>
+          <span id="pairWsChecks"></span>
+        </div>
+        <div id="pairingList"></div>
+      </section>
+    </div>
+
+    <section>
+      <h2>
+        <span>已授权的远程 OAuth 2.1 客户端</span>
+        <button class="btn-danger" onclick="revokeAllOAuth()">吊销全部远程令牌</button>
+      </h2>
+      <div id="oauthClientTable"></div>
     </section>
 
     <div class="grid-2">
@@ -143,7 +192,10 @@
 
 <script>
 let adminToken = '';
-let state = { pending: [], grants: [], tasks: [], audit: [], workspaces: [], pause: {} };
+let state = {
+  pending: [], grants: [], tasks: [], audit: [], workspaces: [], pause: {},
+  relay: {}, oauth_pending: [], oauth_clients: [], pairing_codes: []
+};
 let eventSource = null;
 
 function init() {
@@ -185,7 +237,9 @@ async function api(path, opts = {}) {
     document.getElementById('authErr').textContent = 'Admin Token 无效，请重新输入。';
     throw new Error('Unauthorized');
   }
-  return res.json();
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
 }
 
 async function connect() {
@@ -210,12 +264,19 @@ function startSSE() {
   const pill = document.getElementById('ssePill');
   eventSource.onopen = () => { pill.textContent = 'SSE 实时连接'; pill.className = 'pill pill-ok'; };
   eventSource.onerror = () => { pill.textContent = 'SSE 重连中...'; pill.className = 'pill pill-l2'; };
-  ['approval_created', 'approval_resolved', 'grants_updated', 'pause_changed', 'task_updated', 'audit_recorded']
-    .forEach(evt => eventSource.addEventListener(evt, () => refreshState()));
+  [
+    'approval_created', 'approval_resolved', 'grants_updated', 'pause_changed',
+    'task_updated', 'audit_recorded', 'relay_updated',
+    'oauth_auth_requested', 'oauth_auth_resolved', 'oauth_clients_updated', 'oauth_pairing_created'
+  ].forEach(evt => eventSource.addEventListener(evt, () => refreshState()));
 }
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function copyText(text) {
+  if (navigator.clipboard) navigator.clipboard.writeText(text);
 }
 
 function renderDiff(diffText) {
@@ -240,22 +301,75 @@ function renderAll() {
     sp.className = 'pill pill-ok';
   }
 
+  const relay = state.relay || {};
+  const rp = document.getElementById('relayPill');
+  if (!relay.enabled) {
+    rp.textContent = '仅本地回环模式';
+    rp.className = 'pill pill-l0';
+  } else if (relay.connected && !relay.disconnected_by_user) {
+    rp.textContent = '公网隧道在线';
+    rp.className = 'pill pill-ok';
+  } else if (relay.disconnected_by_user) {
+    rp.textContent = '隧道已手动断开';
+    rp.className = 'pill pill-paused';
+  } else {
+    rp.textContent = '隧道连接中...';
+    rp.className = 'pill pill-l2';
+  }
+
   const cap = state.capability || {};
   document.getElementById('sysMeta').textContent =
-    `MCP: ${state.mcp_listen || ''} | ${cap.os || ''}/${cap.arch || ''} | Git: ${cap.git_available ? cap.git_version : '未检测'} | Shell: ${cap.default_shell || '-'}`;
+    `设备: ${state.device_id || '-'} | MCP: ${state.mcp_listen || ''} | ${cap.os || ''}/${cap.arch || ''} | Git: ${cap.git_available ? cap.git_version : '未检测'}`;
 
-  // 待审批列表
+  const wss = state.workspaces || [];
+
+  // 待确认的 OAuth 客户端绑定
+  const oPending = state.oauth_pending || [];
+  const oSec = document.getElementById('oauthPendingSection');
+  document.getElementById('oauthPendingCount').textContent = oPending.length;
+  if (!oPending.length) {
+    oSec.style.display = 'none';
+  } else {
+    oSec.style.display = 'block';
+    document.getElementById('oauthPendingList').innerHTML = oPending.map(req => `
+      <div class="card card-highlight">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+          <div>
+            <span class="pill pill-l1">OAuth 2.1</span>
+            <strong style="margin-left:6px;">${esc(req.client_name)}</strong>
+            <span class="mono" style="margin-left:8px;color:var(--muted);">${esc(req.client_id)}</span>
+          </div>
+          <span class="mono" style="color:var(--muted);">请求: ${esc(req.id)}</span>
+        </div>
+        <div class="meta">
+          <span>回调地址: <code class="mono">${esc(req.redirect_uri)}</code></span>
+          <span>Scope: <b>${esc((req.scopes||[]).join(' ') || 'mcp:tools')}</b></span>
+        </div>
+        <div class="inline-form">
+          <label><input type="checkbox" id="ro_${esc(req.id)}"> 限制为只读模式</label>
+          ${wss.map(w => `<label><input type="checkbox" name="ws_${esc(req.id)}" value="${esc(w.ID)}" checked> 工作区 ${esc(w.ID)}</label>`).join('')}
+        </div>
+        <div class="controls">
+          <button class="btn-approve" onclick="resolveOAuth('${esc(req.id)}', true)">批准客户端绑定</button>
+          <button class="btn-danger" onclick="resolveOAuth('${esc(req.id)}', false)">拒绝</button>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  // 待审批工具列表
   const pending = state.pending || [];
   document.getElementById('pendingCount').textContent = pending.length;
   const pEl = document.getElementById('pendingList');
   if (!pending.length) {
-    pEl.innerHTML = '<div class="empty">当前没有等待人工确认的操作。</div>';
+    pEl.innerHTML = '<div class="empty">当前没有等待人工确认的工具操作。</div>';
   } else {
     pEl.innerHTML = pending.map(r => `
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
           <div>
             <span class="pill pill-${(r.risk_level||'l2').toLowerCase()}">${esc(r.risk_level)}</span>
+            ${r.is_remote ? '<span class="pill pill-l1">远程</span>' : ''}
             <strong style="margin-left:6px;">${esc(r.tool)}</strong>
             <span class="mono" style="margin-left:8px;color:var(--muted);">${esc(r.id)}</span>
           </div>
@@ -263,6 +377,7 @@ function renderAll() {
         </div>
         <div class="meta">
           <span>工作区: <b>${esc(r.workspace_id)}</b></span>
+          ${r.client_id ? `<span>客户端: <code class="mono">${esc(r.client_id)}</code></span>` : ''}
           ${r.target_path ? `<span>路径: <code class="mono">${esc(r.target_path)}</code></span>` : ''}
           <span>原因: ${esc(r.reason)}</span>
         </div>
@@ -280,6 +395,68 @@ function renderAll() {
     `).join('');
   }
 
+  // 远程隧道状态卡
+  const relayBox = document.getElementById('relayBox');
+  if (!relay.enabled) {
+    relayBox.innerHTML = `<div class="empty">当前 <code>relay.mode</code> 为 <b>disabled</b>（仅本机监听）。如需连接 Gemini / ChatGPT / Claude Web，请在 YAML 配置中启用 <code>cloudflared_quick</code>、<code>cloudflared_named</code> 或 <code>external</code>。</div>`;
+  } else {
+    relayBox.innerHTML = `
+      <div class="card" style="margin-bottom:0;">
+        <div class="meta" style="margin-top:0;">
+          <span>模式: <b>${esc(relay.mode)}</b></span>
+          <span>设备 ID: <code class="mono">${esc(relay.device_id || state.device_id || '-')}</code></span>
+          <span>重连次数: <b>${esc(relay.reconnect_count || 0)}</b></span>
+        </div>
+        <div style="margin:8px 0;">
+          <div style="font-size:12px;color:var(--muted);">远程 MCP Server URL（复制到云端 AI 自定义连接器）：</div>
+          ${relay.mcp_endpoint ? `
+            <div style="display:flex;gap:8px;align-items:center;margin-top:4px;flex-wrap:wrap;">
+              <span class="code-badge">${esc(relay.mcp_endpoint)}</span>
+              <button onclick="copyText('${esc(relay.mcp_endpoint)}')">复制地址</button>
+            </div>
+          ` : `<div class="empty">等待获取公网地址...</div>`}
+        </div>
+        ${relay.last_error ? `<div style="color:#fca5a5;font-size:12px;margin-top:6px;">状态说明：${esc(relay.last_error)}</div>` : ''}
+      </div>
+    `;
+  }
+
+  // 配对码工作区复选框（仅首次或工作区变化时初始化）
+  const pWsEl = document.getElementById('pairWsChecks');
+  if (pWsEl.dataset.wsCount !== String(wss.length)) {
+    pWsEl.dataset.wsCount = String(wss.length);
+    pWsEl.innerHTML = wss.map(w => `<label><input type="checkbox" name="pair_ws" value="${esc(w.ID)}" checked> ${esc(w.ID)}</label>`).join('');
+  }
+
+  // 活跃配对码列表
+  const codes = state.pairing_codes || [];
+  document.getElementById('pairingList').innerHTML = !state.oauth_enabled
+    ? '<div class="empty">内置 OAuth 2.1 未启用。</div>'
+    : !codes.length
+      ? '<div class="empty">当前无待使用的配对码，点击右上角按钮可生成 5 分钟单次有效配对码。</div>'
+      : `<table><tr><th>一次性配对码</th><th>权限</th><th>过期时间</th></tr>` +
+        codes.map(c => `<tr>
+          <td><span class="code-badge">${esc(c.code)}</span> <button onclick="copyText('${esc(c.code)}')">复制</button></td>
+          <td>${c.read_only ? '只读' : '可读写'} / ${(c.allowed_workspaces&&c.allowed_workspaces.length)?esc(c.allowed_workspaces.join(',')):'全部工作区'}</td>
+          <td class="mono">${esc((c.expires_at||'').replace('T',' ').slice(0,19))}</td>
+        </tr>`).join('') + `</table>`;
+
+  // 已授权 OAuth 客户端
+  const clients = state.oauth_clients || [];
+  document.getElementById('oauthClientTable').innerHTML = !state.oauth_enabled
+    ? '<div class="empty">内置 OAuth 2.1 未启用。</div>'
+    : !clients.length
+      ? '<div class="empty">尚无已注册的远程 OAuth 2.1 客户端。</div>'
+      : `<table><tr><th>客户端名称</th><th>Client ID</th><th>权限边界</th><th>状态 / 活跃令牌</th><th>最后活跃</th><th>操作</th></tr>` +
+        clients.map(c => `<tr>
+          <td><b>${esc(c.client_name)}</b></td>
+          <td class="mono">${esc(c.client_id)}</td>
+          <td>${c.read_only ? '<span class="pill pill-l2">只读</span>' : '<span class="pill pill-l1">可读写</span>'} <span class="mono">${(c.allowed_workspaces&&c.allowed_workspaces.length)?esc(c.allowed_workspaces.join(',')):'全部工作区'}</span></td>
+          <td>${c.revoked ? '<span class="pill pill-paused">已吊销</span>' : c.authorized ? `<span class="pill pill-ok">已授权 (${c.active_tokens})</span>` : '<span class="pill pill-l0">未完成绑定</span>'}</td>
+          <td class="mono">${esc((c.last_used_at||'').replace('T',' ').slice(0,19) || '-')}</td>
+          <td>${!c.revoked ? `<button class="btn-danger" onclick="revokeClient('${esc(c.client_id)}')">吊销</button>` : '-'}</td>
+        </tr>`).join('') + `</table>`;
+
   // 临时批量授权
   const grants = state.grants || [];
   document.getElementById('grantList').innerHTML = !grants.length
@@ -289,7 +466,6 @@ function renderAll() {
       `</table>`;
 
   // 工作区列表
-  const wss = state.workspaces || [];
   document.getElementById('workspaceList').innerHTML = `<table><tr><th>ID</th><th>路径</th><th>模式</th></tr>` +
     wss.map(w => `<tr><td><b>${esc(w.ID)}</b></td><td class="mono">${esc(w.RealRoot || w.Root)}</td><td>${w.ReadOnly ? '只读' : '可读写(审批)'}</td></tr>`).join('') +
     `</table>`;
@@ -315,9 +491,10 @@ function renderAll() {
   const audits = state.audit || [];
   document.getElementById('auditTable').innerHTML = !audits.length
     ? '<div class="empty">暂无审计记录。</div>'
-    : `<table><tr><th>时间</th><th>工具</th><th>风险</th><th>裁决</th><th>状态</th><th>参数摘要（已脱敏）</th></tr>` +
+    : `<table><tr><th>时间</th><th>调用方</th><th>工具</th><th>风险</th><th>裁决</th><th>状态</th><th>参数摘要（已脱敏）</th></tr>` +
       audits.slice(0, 30).map(a => `<tr>
         <td class="mono">${esc((a.timestamp||'').replace('T',' ').slice(0,19))}</td>
+        <td class="mono">${esc(a.client_info || 'local')}</td>
         <td><b>${esc(a.tool)}</b></td>
         <td>${esc(a.risk_level||'-')}</td>
         <td>${esc(a.decision)}</td>
@@ -334,6 +511,53 @@ async function reject(id) {
   const note = prompt('请输入拒绝原因（可选）：', '用户在控制台拒绝');
   if (note === null) return;
   await api(`/api/approvals/${id}/reject`, { method: 'POST', body: JSON.stringify({ note, approver: 'web-console' }) });
+  refreshState();
+}
+async function resolveOAuth(reqId, approveFlag) {
+  const ro = document.getElementById('ro_' + reqId)?.checked || false;
+  const ws = Array.from(document.querySelectorAll(`input[name="ws_${reqId}"]:checked`)).map(el => el.value);
+  const action = approveFlag ? 'approve' : 'deny';
+  await api(`/api/oauth/requests/${reqId}/${action}`, {
+    method: 'POST',
+    body: JSON.stringify({ read_only: ro, allowed_workspaces: ws, note: approveFlag ? '控制台批准' : '控制台拒绝' })
+  });
+  refreshState();
+}
+async function createPairingCode() {
+  try {
+    const ro = document.getElementById('pairReadOnly').checked;
+    const ws = Array.from(document.querySelectorAll('input[name="pair_ws"]:checked')).map(el => el.value);
+    await api('/api/oauth/pairing-codes', { method: 'POST', body: JSON.stringify({ read_only: ro, allowed_workspaces: ws, note: 'web-console' }) });
+    refreshState();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+async function connectRelay() {
+  try {
+    await api('/api/relay/connect', { method: 'POST' });
+    refreshState();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+async function disconnectRelay() {
+  if (!confirm('确认立即断开远程公网隧道？断开后所有云端 AI 将无法连接本机，直到您手动重新启动隧道。')) return;
+  try {
+    await api('/api/relay/disconnect', { method: 'POST', body: JSON.stringify({ reason: '用户在控制台一键断开隧道' }) });
+    refreshState();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+async function revokeClient(clientId) {
+  if (!confirm(`确认吊销客户端 ${clientId} 的全部令牌与访问权限？`)) return;
+  await api(`/api/oauth/clients/${clientId}/revoke`, { method: 'POST' });
+  refreshState();
+}
+async function revokeAllOAuth() {
+  if (!confirm('确认吊销全部远程 OAuth 2.1 客户端与令牌？所有云端 AI 客户端将立即失效并需重新配对授权！')) return;
+  await api('/api/oauth/revoke-all', { method: 'POST' });
   refreshState();
 }
 async function revokeGrants(wsId) {

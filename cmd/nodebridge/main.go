@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"nodebridge/internal/config"
 	"nodebridge/internal/core/approval"
 	"nodebridge/internal/core/audit"
+	"nodebridge/internal/core/oauth"
 	"nodebridge/internal/core/policy"
 	"nodebridge/internal/core/session"
 	"nodebridge/internal/core/store"
@@ -34,7 +36,7 @@ import (
 	"nodebridge/internal/transport/relay"
 )
 
-const appVersion = "0.1.0"
+const appVersion = "0.2.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -67,6 +69,14 @@ func main() {
 		err = runKillSwitch(args, "resume")
 	case "tasks":
 		err = runTasks(args)
+	case "pair":
+		err = runPair(args)
+	case "tunnel":
+		err = runTunnel(args)
+	case "clients":
+		err = runClients(args)
+	case "doctor":
+		err = runDoctor(args)
 	case "version", "-v", "--version":
 		fmt.Printf("nodebridge %s\n", appVersion)
 	case "help", "-h", "--help":
@@ -91,9 +101,13 @@ func printUsage() {
 
 子命令:
   init       生成包含随机高熵 Token 的默认配置文件 nodebridge.yaml
-  daemon     启动本地常驻守护进程（Streamable HTTP MCP + 本地 Web 审批控制台）
+  daemon     启动本地常驻守护进程（Streamable HTTP MCP + 内置 OAuth 2.1 + 安全隧道 + Web 控制台）
   stdio      启动轻量 stdio 桥接模式，将 stdin/stdout MCP 请求转发到本地常驻 Daemon
-  status     查看本地 Daemon 状态、急停状态与待审批摘要
+  status     查看本地 Daemon 状态、远程隧道、急停状态与待审批摘要
+  pair       生成 5 分钟一次性 OAuth 2.1 配对码（支持 --readonly 与 --workspaces 限定范围）
+  tunnel     查看、启动或一键断开远程公网隧道（status | connect | disconnect）
+  clients    管理已绑定的远程 OAuth 2.1 客户端（list | revoke <client_id> | revoke-all）
+  doctor     全面自检本地 Daemon、cloudflared、公网 HTTPS 隧道及 OAuth 2.1 发现元数据
   approve    在命令行批准指定审批单（支持 --grant-minutes 授予 L1 限时批量授权）
   reject     在命令行拒绝指定审批单
   pause      暂停接收新的写入与命令任务
@@ -107,6 +121,8 @@ func runInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	cfgPath := fs.String("config", "nodebridge.yaml", "输出配置文件路径")
 	workspace := fs.String("workspace", ".", "默认授权工作区目录")
+	relayMode := fs.String("relay-mode", config.RelayModeDisabled, "远程通道模式: disabled | cloudflared_quick | cloudflared_named | external")
+	publicURL := fs.String("public-url", "", "固定公网 HTTPS 地址（named/external 模式必填）")
 	force := fs.Bool("force", false, "覆盖已存在的配置文件")
 	_ = fs.Parse(args)
 
@@ -120,6 +136,11 @@ func runInit(args []string) error {
 	if err != nil {
 		return err
 	}
+	cfg.Relay.Mode = strings.TrimSpace(*relayMode)
+	cfg.Relay.PublicURL = strings.TrimRight(strings.TrimSpace(*publicURL), "/")
+	if cfg.Relay.EffectiveMode() != config.RelayModeDisabled {
+		cfg.OAuth.Enabled = true
+	}
 	if err := config.Save(*cfgPath, cfg); err != nil {
 		return err
 	}
@@ -129,6 +150,7 @@ func runInit(args []string) error {
 	fmt.Printf("授权工作区 [default]: %s\n", cfg.Workspaces[0].Root)
 	fmt.Printf("MCP 端点: http://%s/mcp\n", cfg.Server.MCPListen)
 	fmt.Printf("本地审批控制台: http://%s/\n", cfg.Server.AdminListen)
+	fmt.Printf("远程接入模式: %s (OAuth 2.1=%v)\n", cfg.Relay.EffectiveMode(), cfg.OAuth.Enabled)
 	fmt.Println("提示：请妥善保管配置文件中的 mcp_token 与 admin_token，切勿提交到公开 Git 仓库。")
 	return nil
 }
@@ -139,6 +161,11 @@ func runDaemon(args []string) error {
 	_ = fs.Parse(args)
 
 	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	deviceIdent, err := store.LoadOrCreateDeviceIdentity(cfg.Storage.DataDir, cfg.Relay.DeviceID)
 	if err != nil {
 		return err
 	}
@@ -174,6 +201,25 @@ func runDaemon(args []string) error {
 
 	policyEng := policy.NewEngine(cfg.Security)
 	broker := approval.NewBroker(cfg.Approval.TimeoutSeconds, cfg.Approval.MaxGrantMinutes, taskMgr.CancelAll)
+	broker.ConfigureRemote(cfg.Approval.RemoteWaitSeconds, cfg.Approval.PendingTTLSeconds, cfg.Approval.IdempotencyTTLSeconds)
+
+	relayConn, err := relay.NewConnector(cfg.Relay, cfg.Server.MCPListen, deviceIdent.DeviceID)
+	if err != nil {
+		return err
+	}
+
+	var oauthSrv *oauth.Server
+	if cfg.OAuth.Enabled {
+		oauthSrv, err = oauth.NewServer(oauth.Options{
+			Config:            cfg.OAuth,
+			DataDir:           cfg.Storage.DataDir,
+			DeviceID:          deviceIdent.DeviceID,
+			PublicURLProvider: relayConn.PublicURL,
+		})
+		if err != nil {
+			return err
+		}
+	}
 
 	mcpSrv := mcpserver.NewMCPServer(appVersion, tools.Deps{
 		FS:     fsMgr,
@@ -184,14 +230,20 @@ func runDaemon(args []string) error {
 		Audit:  auditLog,
 	})
 
-	authProvider := session.NewBearerTokenAuthProvider(cfg.Server.MCPToken)
+	staticAuth := session.NewBearerTokenAuthProvider(cfg.Server.MCPToken)
+	var authProvider session.AuthProvider = staticAuth
+	if oauthSrv != nil {
+		authProvider = session.NewCompositeAuthProvider(oauthSrv, staticAuth)
+	}
+
 	mcpHandler := mcpserver.NewHTTPHandler(mcpSrv, mcpserver.GatewayConfig{
 		AuthProvider:   authProvider,
+		OAuthServer:    oauthSrv,
+		RelayConnector: relayConn,
 		AllowedOrigins: cfg.Server.AllowedOrigins,
 		Version:        appVersion,
 	})
 
-	relayConn := relay.DisabledConnector{}
 	adminSrv := admin.NewServer(
 		cfg.Server.AdminToken,
 		cfg.Server.MCPListen,
@@ -202,8 +254,8 @@ func runDaemon(args []string) error {
 		capInfo,
 		relayConn,
 	)
+	adminSrv.AttachRemoteGovernance(deviceIdent.DeviceID, oauthSrv, cfg.Relay.KillAllDisconnectTunnel)
 
-	// 审批无限等待需要禁止固定 WriteTimeout 截断长连接响应
 	mcpHTTP := &http.Server{
 		Addr:              cfg.Server.MCPListen,
 		Handler:           mcpHandler,
@@ -231,8 +283,9 @@ func runDaemon(args []string) error {
 	}()
 	go func() {
 		log.Printf("[NodeBridge] 本地安全审批控制台已启动: http://%s/", cfg.Server.AdminListen)
-		log.Printf("[NodeBridge] 宿主机能力: %s/%s | Git=%v | Shell=%s | 授权工作区数=%d",
-			capInfo.OS, capInfo.Arch, capInfo.GitAvailable, capInfo.DefaultShell, len(cfg.Workspaces))
+		log.Printf("[NodeBridge] 设备 ID=%s | %s/%s | Git=%v | Shell=%s | 工作区=%d | Relay=%s | OAuth2.1=%v",
+			deviceIdent.DeviceID, capInfo.OS, capInfo.Arch, capInfo.GitAvailable, capInfo.DefaultShell,
+			len(cfg.Workspaces), cfg.Relay.EffectiveMode(), oauthSrv != nil)
 		if err := adminHTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("Admin Web 服务异常退出: %w", err)
 		}
@@ -320,6 +373,257 @@ func runTasks(args []string) error {
 	return nil
 }
 
+func runPair(args []string) error {
+	fs := flag.NewFlagSet("pair", flag.ExitOnError)
+	cfgPath := fs.String("config", "nodebridge.yaml", "YAML 配置文件路径")
+	readOnly := fs.Bool("readonly", false, "仅授予只读权限")
+	workspaces := fs.String("workspaces", "", "限定允许访问的工作区 ID，逗号分隔（为空表示允许全部）")
+	note := fs.String("note", "cli", "配对码备注")
+	_ = fs.Parse(args)
+
+	var wsList []string
+	for _, s := range strings.Split(*workspaces, ",") {
+		if trimmed := strings.TrimSpace(s); trimmed != "" {
+			wsList = append(wsList, trimmed)
+		}
+	}
+
+	raw, err := callAdminAPI(*cfgPath, http.MethodPost, "/api/oauth/pairing-codes", map[string]any{
+		"read_only":          *readOnly,
+		"allowed_workspaces": wsList,
+		"note":               *note,
+	})
+	if err != nil {
+		return err
+	}
+	var pc oauth.PairingCode
+	if err := json.Unmarshal(raw, &pc); err != nil {
+		fmt.Println(prettyJSON(raw))
+		return nil
+	}
+	fmt.Printf("一次性 OAuth 配对码: %s\n", pc.Code)
+	fmt.Printf("权限模式: %s | 允许工作区: %v\n", map[bool]string{true: "只读", false: "可读写(仍受本地审批约束)"}[pc.ReadOnly], pc.AllowedWorkspaces)
+	fmt.Printf("有效期至: %s（单次有效）\n", pc.ExpiresAt.Local().Format(time.RFC3339))
+	return nil
+}
+
+func runTunnel(args []string) error {
+	action := "status"
+	rest := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		action = strings.ToLower(strings.TrimSpace(args[0]))
+		rest = args[1:]
+	}
+	fs := flag.NewFlagSet("tunnel", flag.ExitOnError)
+	cfgPath := fs.String("config", "nodebridge.yaml", "YAML 配置文件路径")
+	reason := fs.String("reason", "CLI 手动断开隧道", "断开原因（仅 disconnect 使用）")
+	_ = fs.Parse(rest)
+
+	switch action {
+	case "status":
+		raw, err := callAdminAPI(*cfgPath, http.MethodGet, "/api/state", nil)
+		if err != nil {
+			return err
+		}
+		var st struct {
+			DeviceID string       `json:"device_id"`
+			Relay    relay.Status `json:"relay"`
+		}
+		_ = json.Unmarshal(raw, &st)
+		out, _ := json.MarshalIndent(st, "", "  ")
+		fmt.Println(string(out))
+		return nil
+	case "connect":
+		raw, err := callAdminAPI(*cfgPath, http.MethodPost, "/api/relay/connect", nil)
+		if err != nil {
+			return err
+		}
+		fmt.Println(prettyJSON(raw))
+		return nil
+	case "disconnect":
+		raw, err := callAdminAPI(*cfgPath, http.MethodPost, "/api/relay/disconnect", map[string]any{"reason": *reason})
+		if err != nil {
+			return err
+		}
+		fmt.Println(prettyJSON(raw))
+		return nil
+	default:
+		return fmt.Errorf("用法: nodebridge tunnel [status|connect|disconnect] [--config nodebridge.yaml]")
+	}
+}
+
+func runClients(args []string) error {
+	action := "list"
+	rest := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		action = strings.ToLower(strings.TrimSpace(args[0]))
+		rest = args[1:]
+	}
+	fs := flag.NewFlagSet("clients", flag.ExitOnError)
+	cfgPath := fs.String("config", "nodebridge.yaml", "YAML 配置文件路径")
+	_ = fs.Parse(rest)
+
+	switch action {
+	case "list":
+		raw, err := callAdminAPI(*cfgPath, http.MethodGet, "/api/state", nil)
+		if err != nil {
+			return err
+		}
+		var st struct {
+			Clients []oauth.ClientSummary `json:"oauth_clients"`
+		}
+		if err := json.Unmarshal(raw, &st); err != nil {
+			return err
+		}
+		if len(st.Clients) == 0 {
+			fmt.Println("当前没有已注册的远程 OAuth 2.1 客户端。")
+			return nil
+		}
+		for _, c := range st.Clients {
+			status := "ACTIVE"
+			if c.Revoked {
+				status = "REVOKED"
+			} else if !c.Authorized {
+				status = "UNBOUND"
+			}
+			perm := "RW"
+			if c.ReadOnly {
+				perm = "RO"
+			}
+			fmt.Printf("%s\t%-8s\t%-4s\ttokens=%d\t%s\n", c.ClientID, status, perm, c.ActiveTokens, c.ClientName)
+		}
+		return nil
+	case "revoke":
+		if fs.NArg() < 1 {
+			return errors.New("用法: nodebridge clients revoke [--config nodebridge.yaml] <client_id>")
+		}
+		clientID := fs.Arg(0)
+		raw, err := callAdminAPI(*cfgPath, http.MethodPost, "/api/oauth/clients/"+clientID+"/revoke", nil)
+		if err != nil {
+			return err
+		}
+		fmt.Println(prettyJSON(raw))
+		return nil
+	case "revoke-all":
+		raw, err := callAdminAPI(*cfgPath, http.MethodPost, "/api/oauth/revoke-all", nil)
+		if err != nil {
+			return err
+		}
+		fmt.Println(prettyJSON(raw))
+		return nil
+	default:
+		return errors.New("用法: nodebridge clients [list|revoke <client_id>|revoke-all] [--config nodebridge.yaml]")
+	}
+}
+
+func runDoctor(args []string) error {
+	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+	cfgPath := fs.String("config", "nodebridge.yaml", "YAML 配置文件路径")
+	_ = fs.Parse(args)
+
+	fmt.Println("=== NodeBridge 阶段二远程 MCP 接入自检 (doctor) ===")
+	okAll := true
+	check := func(passed bool, label, detail string) {
+		icon := "[OK]"
+		if !passed {
+			icon = "[FAIL]"
+			okAll = false
+		}
+		fmt.Printf("%-6s %s: %s\n", icon, label, detail)
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		check(false, "配置文件校验", err.Error())
+		return errors.New("自检未通过")
+	}
+	check(true, "配置文件校验", fmt.Sprintf("relay.mode=%s, oauth.enabled=%v, workspaces=%d", cfg.Relay.EffectiveMode(), cfg.OAuth.Enabled, len(cfg.Workspaces)))
+
+	if mode := cfg.Relay.EffectiveMode(); mode == config.RelayModeCloudflaredQuick || mode == config.RelayModeCloudflaredNamed {
+		bin := cfg.Relay.CloudflaredBin
+		if bin == "" {
+			bin = "cloudflared"
+		}
+		path, lookErr := exec.LookPath(bin)
+		if lookErr != nil {
+			check(false, "cloudflared 检测", "未找到可执行文件，请安装 Cloudflare Tunnel CLI")
+		} else {
+			check(true, "cloudflared 检测", path)
+		}
+	}
+
+	httpClient := &http.Client{Timeout: 8 * time.Second}
+
+	// 1. 本地 MCP healthz
+	localHealthURL := "http://" + cfg.Server.MCPListen + "/healthz"
+	resp, err := httpClient.Get(localHealthURL)
+	if err != nil {
+		check(false, "本地 MCP 服务", fmt.Sprintf("无法连接 %s（请先启动 nodebridge daemon）: %v", localHealthURL, err))
+		return errors.New("自检未通过")
+	}
+	resp.Body.Close()
+	check(resp.StatusCode == http.StatusOK, "本地 MCP 服务", fmt.Sprintf("%s -> HTTP %d", localHealthURL, resp.StatusCode))
+
+	// 2. 通过本地 Admin API 读取运行中公网 URL
+	rawState, err := callAdminAPI(*cfgPath, http.MethodGet, "/api/state", nil)
+	if err != nil {
+		check(false, "本地 Admin API", err.Error())
+		return errors.New("自检未通过")
+	}
+	var st struct {
+		DeviceID     string       `json:"device_id"`
+		OAuthEnabled bool         `json:"oauth_enabled"`
+		Relay        relay.Status `json:"relay"`
+	}
+	_ = json.Unmarshal(rawState, &st)
+	check(true, "设备身份与 Admin API", fmt.Sprintf("device_id=%s, oauth_enabled=%v", st.DeviceID, st.OAuthEnabled))
+
+	// 3. 校验公网入口与标准 RFC 9728 / RFC 8414 / 401 引导头
+	targetBase := strings.TrimRight(st.Relay.PublicURL, "/")
+	if targetBase == "" {
+		targetBase = "http://" + cfg.Server.MCPListen
+		fmt.Println("[WARN] 当前无公网隧道 URL，改用本地回环地址验证 OAuth 2.1 元数据与 401 响应头。")
+	} else {
+		check(st.Relay.Connected && !st.Relay.DisconnectedByUser, "远程隧道状态", fmt.Sprintf("connected=%v, url=%s", st.Relay.Connected, targetBase))
+	}
+
+	if st.OAuthEnabled {
+		prmResp, err := httpClient.Get(targetBase + "/.well-known/oauth-protected-resource")
+		if err != nil {
+			check(false, "RFC 9728 元数据", err.Error())
+		} else {
+			prmResp.Body.Close()
+			check(prmResp.StatusCode == http.StatusOK, "RFC 9728 元数据", fmt.Sprintf("%s/.well-known/oauth-protected-resource -> HTTP %d", targetBase, prmResp.StatusCode))
+		}
+
+		asmResp, err := httpClient.Get(targetBase + "/.well-known/oauth-authorization-server")
+		if err != nil {
+			check(false, "RFC 8414 元数据", err.Error())
+		} else {
+			asmResp.Body.Close()
+			check(asmResp.StatusCode == http.StatusOK, "RFC 8414 元数据", fmt.Sprintf("%s/.well-known/oauth-authorization-server -> HTTP %d", targetBase, asmResp.StatusCode))
+		}
+	}
+
+	mcpReq, _ := http.NewRequest(http.MethodPost, targetBase+"/mcp", strings.NewReader(`{}`))
+	mcpReq.Header.Set("Content-Type", "application/json")
+	mcpResp, err := httpClient.Do(mcpReq)
+	if err != nil {
+		check(false, "MCP 端点鉴权引导", err.Error())
+	} else {
+		mcpResp.Body.Close()
+		wwwAuth := mcpResp.Header.Get("WWW-Authenticate")
+		pass401 := mcpResp.StatusCode == http.StatusUnauthorized && (!st.OAuthEnabled || strings.Contains(wwwAuth, "resource_metadata="))
+		check(pass401, "MCP 端点鉴权引导", fmt.Sprintf("HTTP %d | WWW-Authenticate: %s", mcpResp.StatusCode, wwwAuth))
+	}
+
+	if !okAll {
+		return errors.New("部分诊断项未通过，请根据上述 [FAIL] 提示排查")
+	}
+	fmt.Println("全部自检通过！您现在可以将公网 MCP URL 配置到 Gemini Web / ChatGPT Web / Claude Web。")
+	return nil
+}
+
 func runApprovalDecision(args []string, approve bool) error {
 	name := "approve"
 	if !approve {
@@ -353,11 +657,15 @@ func runKillSwitch(args []string, action string) error {
 	fs := flag.NewFlagSet(action, flag.ExitOnError)
 	cfgPath := fs.String("config", "nodebridge.yaml", "YAML 配置文件路径")
 	reason := fs.String("reason", "", "操作说明")
+	disconnectTunnel := fs.Bool("disconnect-tunnel", false, "仅 stop-all 支持：同时强制断开远程隧道")
 	_ = fs.Parse(args)
 
 	var payload any
 	if action != "resume" {
-		payload = map[string]any{"reason": *reason}
+		payload = map[string]any{
+			"reason":            *reason,
+			"disconnect_tunnel": *disconnectTunnel,
+		}
 	}
 	raw, err := callAdminAPI(*cfgPath, http.MethodPost, "/api/kill-switch/"+action, payload)
 	if err != nil {

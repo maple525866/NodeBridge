@@ -83,7 +83,7 @@ func NewEngine(sec config.SecurityConfig) *Engine {
 // EvaluateTool 对非终端类内置 MCP 工具给出风险评估结果。
 func (e *Engine) EvaluateTool(toolName string) Evaluation {
 	switch toolName {
-	case "workspace.list", "workspace.read", "workspace.search", "git.status", "git.diff", "terminal.poll":
+	case "workspace.list", "workspace.read", "workspace.search", "git.status", "git.diff", "terminal.poll", "approval.status":
 		return Evaluation{
 			RiskLevel:     RiskL0,
 			Action:        ActionAllow,

@@ -3,14 +3,81 @@
 package store
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
+
+// DeviceIdentity 描述持久化在本地的独立设备身份信息。
+type DeviceIdentity struct {
+	DeviceID  string    `json:"device_id"`
+	Hostname  string    `json:"hostname,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// LoadOrCreateDeviceIdentity 读取或首次生成高熵持久化设备 ID（落盘 0600 权限）。
+func LoadOrCreateDeviceIdentity(dataDir, preferredID string) (DeviceIdentity, error) {
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return DeviceIdentity{}, fmt.Errorf("创建数据目录失败: %w", err)
+	}
+	path := filepath.Join(dataDir, "device.json")
+	preferredID = strings.TrimSpace(preferredID)
+	hostname, _ := os.Hostname()
+
+	if raw, err := os.ReadFile(path); err == nil && len(raw) > 0 {
+		var existing DeviceIdentity
+		if err := json.Unmarshal(raw, &existing); err == nil && strings.TrimSpace(existing.DeviceID) != "" {
+			if preferredID != "" && existing.DeviceID != preferredID {
+				existing.DeviceID = preferredID
+				_ = writeAtomicJSON(path, existing)
+			}
+			return existing, nil
+		}
+	}
+
+	devID := preferredID
+	if devID == "" {
+		buf := make([]byte, 8)
+		if _, err := rand.Read(buf); err != nil {
+			return DeviceIdentity{}, fmt.Errorf("生成设备 ID 失败: %w", err)
+		}
+		devID = "dev_" + strings.ToLower(hex.EncodeToString(buf))
+	}
+	ident := DeviceIdentity{
+		DeviceID:  devID,
+		Hostname:  hostname,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := writeAtomicJSON(path, ident); err != nil {
+		return DeviceIdentity{}, fmt.Errorf("保存设备身份失败: %w", err)
+	}
+	return ident, nil
+}
+
+func writeAtomicJSON(path string, v any) error {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		if wErr := os.WriteFile(path, data, 0o600); wErr != nil {
+			return wErr
+		}
+		_ = os.Remove(tmpPath)
+	}
+	return nil
+}
 
 // TaskRecord 表示可持久化的异步任务快照记录。
 type TaskRecord struct {

@@ -88,3 +88,88 @@ func TestApprovalInfiniteWaitGrantAndKillSwitch(t *testing.T) {
 		t.Fatalf("期望 KillAll 清空全部限时批量授权")
 	}
 }
+
+func TestRemoteHybridApprovalAsyncContinuationAndIdempotency(t *testing.T) {
+	broker := NewBroker(0, 30, nil)
+	broker.ConfigureRemote(1, 60, 60) // 1 秒短窗口方便快速验证超时续接
+
+	execCalls := 0
+	fp := ComputeFingerprint("cli_1", "workspace.patch", "demo", map[string]any{"path": "a.go"})
+
+	// 1. 首次远程调用：等待 1s 后无人审批 -> 不销毁审批单，返回 Pending=true
+	out1, err := broker.ExecuteWithApproval(context.Background(), Request{
+		ClientID:      "cli_1",
+		IsRemote:      true,
+		Fingerprint:   fp,
+		Tool:          "workspace.patch",
+		WorkspaceID:   "demo",
+		RiskLevel:     policy.RiskL1,
+		AllowBatchTTL: true,
+		Summary:       "修改 a.go",
+	}, func() (any, error) {
+		execCalls++
+		return map[string]any{"patched": true, "calls": execCalls}, nil
+	}, nil)
+	if err != nil {
+		t.Fatalf("远程短等待超时不应返回硬错误，应返回 Pending 状态: %v", err)
+	}
+	if !out1.Pending || out1.ApprovalID == "" {
+		t.Fatalf("期望返回 Pending=true 且携带 ApprovalID，实际: %+v", out1)
+	}
+	if len(broker.Pending()) != 1 {
+		t.Fatalf("超时后审批单必须继续留在本地控制台等待用户操作，实际 pending=%d", len(broker.Pending()))
+	}
+
+	// 2. 模拟云端超时后立即重发同指纹请求：不应创建第二个审批单
+	ctxShort, cancelShort := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancelShort()
+	outDup, _ := broker.ExecuteWithApproval(ctxShort, Request{
+		ClientID:    "cli_1",
+		IsRemote:    true,
+		Fingerprint: fp,
+		Tool:        "workspace.patch",
+		WorkspaceID: "demo",
+		RiskLevel:   policy.RiskL1,
+	}, func() (any, error) {
+		execCalls++
+		return nil, nil
+	}, nil)
+	if !outDup.ReusedIdempotent || outDup.ApprovalID != out1.ApprovalID || len(broker.Pending()) != 1 {
+		t.Fatalf("重复请求应复用同一审批单而非新建弹窗: outDup=%+v pending=%d", outDup, len(broker.Pending()))
+	}
+
+	// 3. 用户事后在本地控制台点击批准 -> 后台自动执行且仅执行一次
+	if _, err := broker.Resolve(out1.ApprovalID, true, 0, "web-console", "批准"); err != nil {
+		t.Fatalf("Resolve 失败: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	var rec Request
+	for time.Now().Before(deadline) {
+		var ok bool
+		rec, ok = broker.GetRecord(out1.ApprovalID)
+		if ok && rec.ExecStatus == "SUCCEEDED" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if rec.ExecStatus != "SUCCEEDED" || execCalls != 1 {
+		t.Fatalf("期望后台自动执行一次成功: rec=%+v execCalls=%d", rec, execCalls)
+	}
+
+	// 4. 云端再次重发同指纹请求 -> 直接返回缓存结果，execCalls 仍为 1
+	outReplay, err := broker.ExecuteWithApproval(context.Background(), Request{
+		ClientID:    "cli_1",
+		IsRemote:    true,
+		Fingerprint: fp,
+		Tool:        "workspace.patch",
+		WorkspaceID: "demo",
+		RiskLevel:   policy.RiskL1,
+	}, func() (any, error) {
+		execCalls++
+		return nil, nil
+	}, nil)
+	if err != nil || !outReplay.ReusedIdempotent || execCalls != 1 {
+		t.Fatalf("期望幂等命中缓存且不再重复执行: err=%v out=%+v execCalls=%d", err, outReplay, execCalls)
+	}
+}

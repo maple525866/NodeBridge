@@ -50,6 +50,7 @@ var (
 		regexp.MustCompile(`sk-[A-Za-z0-9_\-]{12,}`),
 		regexp.MustCompile(`AIza[0-9A-Za-z\-_]{20,}`),
 		regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`),
+		regexp.MustCompile(`nb_(?:at|rt|code|pair)_[A-Za-z0-9_\-]{8,}`),
 		regexp.MustCompile(`-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----`),
 	}
 )

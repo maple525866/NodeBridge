@@ -101,15 +101,18 @@ type PatchPreview struct {
 	UnifiedDiff string
 }
 
-// PatchResult 表示补丁应用成功后的结果。
+// PatchResult 表示补丁应用成功后的结果（或远程异步等待审批时的挂起提示）。
 type PatchResult struct {
 	Source      string `json:"source"`
 	WorkspaceID string `json:"workspace_id"`
 	Path        string `json:"path"`
 	Created     bool   `json:"created"`
 	OldSHA256   string `json:"old_sha256,omitempty"`
-	NewSHA256   string `json:"new_sha256"`
-	UnifiedDiff string `json:"unified_diff"`
+	NewSHA256   string `json:"new_sha256,omitempty"`
+	UnifiedDiff string `json:"unified_diff,omitempty"`
+	Pending     bool   `json:"pending,omitempty"`
+	ApprovalID  string `json:"approval_id,omitempty"`
+	Message     string `json:"message,omitempty"`
 }
 
 var defaultSkipDirs = map[string]struct{}{

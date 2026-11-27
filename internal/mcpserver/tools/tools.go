@@ -1,4 +1,5 @@
-// Package tools 注册阶段一全部 10 个 P0 MCP 工具，并在工具执行前统一串联策略引擎、人工审批与审计日志。
+// Package tools 注册全部 MCP 工具（10 个 P0 核心工具 + 阶段二 approval.status），
+// 并在工具执行前统一串联客户端级权限护栏、策略引擎、混合人工审批（支持远程异步续接与幂等去重）与审计日志。
 package tools
 
 import (
@@ -95,11 +96,14 @@ type TerminalStartInput struct {
 
 type TerminalStartOutput struct {
 	Source      string `json:"source"`
-	TaskID      string `json:"task_id"`
+	TaskID      string `json:"task_id,omitempty"`
 	WorkspaceID string `json:"workspace_id"`
 	Status      string `json:"status"`
 	RiskLevel   string `json:"risk_level"`
-	Cwd         string `json:"cwd"`
+	Cwd         string `json:"cwd,omitempty"`
+	Pending     bool   `json:"pending,omitempty"`
+	ApprovalID  string `json:"approval_id,omitempty"`
+	Message     string `json:"message,omitempty"`
 }
 
 type TerminalPollInput struct {
@@ -119,11 +123,30 @@ type TerminalCancelOutput struct {
 	Status string `json:"status"`
 }
 
-// RegisterAll 将全部 10 个 P0 工具注册到指定 MCP Server。
+type ApprovalStatusInput struct {
+	ApprovalID string `json:"approval_id" jsonschema:"挂起的审批单 ID（例如 apr_xxxxxxxxxxxx）"`
+}
+
+type ApprovalStatusOutput struct {
+	Source       string `json:"source"`
+	ApprovalID   string `json:"approval_id"`
+	Tool         string `json:"tool"`
+	WorkspaceID  string `json:"workspace_id"`
+	Status       string `json:"status"`
+	ExecStatus   string `json:"exec_status,omitempty"`
+	DecisionNote string `json:"decision_note,omitempty"`
+	Result       any    `json:"result,omitempty"`
+	Error        string `json:"error,omitempty"`
+	ExpiresAt    string `json:"expires_at,omitempty"`
+	Message      string `json:"message,omitempty"`
+}
+
+// RegisterAll 将全部 MCP 工具注册到指定 MCP Server。
 func RegisterAll(srv *mcp.Server, deps Deps) {
 	registerWorkspaceTools(srv, deps)
 	registerGitTools(srv, deps)
 	registerTerminalTools(srv, deps)
+	registerApprovalTools(srv, deps)
 }
 
 func registerWorkspaceTools(srv *mcp.Server, d Deps) {
@@ -133,6 +156,9 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in WorkspaceListInput) (*mcp.CallToolResult, *filesystem.ListResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("workspace.list")
+		if err := authorizePrincipal(ctx, d.Audit, "workspace.list", in.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
+			return nil, nil, err
+		}
 		res, err := d.FS.List(in.WorkspaceID, in.Path, in.MaxDepth, in.Limit)
 		recordAudit(ctx, d.Audit, "workspace.list", in.WorkspaceID, string(ev.RiskLevel), in, "AUTO_ALLOW", "", start, err)
 		return nil, res, err
@@ -144,6 +170,9 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in WorkspaceReadInput) (*mcp.CallToolResult, *filesystem.ReadResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("workspace.read")
+		if err := authorizePrincipal(ctx, d.Audit, "workspace.read", in.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
+			return nil, nil, err
+		}
 		res, err := d.FS.Read(in.WorkspaceID, in.Path, in.StartLine, in.EndLine)
 		recordAudit(ctx, d.Audit, "workspace.read", in.WorkspaceID, string(ev.RiskLevel), in, "AUTO_ALLOW", "", start, err)
 		return nil, res, err
@@ -155,6 +184,9 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in WorkspaceSearchInput) (*mcp.CallToolResult, *filesystem.SearchResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("workspace.search")
+		if err := authorizePrincipal(ctx, d.Audit, "workspace.search", in.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
+			return nil, nil, err
+		}
 		res, err := d.FS.Search(in.WorkspaceID, in.Query, in.IsRegex, in.Glob, in.MaxResults)
 		recordAudit(ctx, d.Audit, "workspace.search", in.WorkspaceID, string(ev.RiskLevel), in, "AUTO_ALLOW", "", start, err)
 		return nil, res, err
@@ -162,10 +194,14 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "workspace.patch",
-		Description: "使用 Search/Replace 结构化编辑块安全修改或新建授权工作区文件（支持 SHA256 乐观锁与人工 Diff 审批）",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in WorkspacePatchInput) (*mcp.CallToolResult, *filesystem.PatchResult, error) {
+		Description: "使用 Search/Replace 结构化编辑块安全修改或新建授权工作区文件（支持 SHA256 乐观锁、人工 Diff 审批与远程异步续接）",
+	}, func(ctx context.Context, callReq *mcp.CallToolRequest, in WorkspacePatchInput) (*mcp.CallToolResult, *filesystem.PatchResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("workspace.patch")
+		if err := authorizePrincipal(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), true, map[string]any{"path": in.Path}, start); err != nil {
+			return nil, nil, err
+		}
+
 		edits := make([]filesystem.PatchEdit, 0, len(in.Edits))
 		for _, e := range in.Edits {
 			edits = append(edits, filesystem.PatchEdit{
@@ -185,13 +221,39 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 		// 先预检并生成 Unified Diff，避免无效补丁或越权路径打扰人工审批
 		preview, err := d.FS.PreviewPatch(patchReq)
 		if err != nil {
+			// 注意：远程幂等重发可能命中已经成功应用的补丁（文件已变导致预检失败），先检查是否命中幂等缓存！
+			p := session.FromContext(ctx)
+			if p.IsRemote {
+				fp := approval.ComputeFingerprint(p.ClientID, "workspace.patch", in.WorkspaceID, in)
+				if replayOut, rErr := d.Broker.ExecuteWithApproval(ctx, approval.Request{
+					ClientID:    p.ClientID,
+					IsRemote:    true,
+					Fingerprint: fp,
+					Tool:        "workspace.patch",
+					WorkspaceID: in.WorkspaceID,
+				}, func() (any, error) { return nil, err }, nil); rErr == nil && replayOut.ReusedIdempotent {
+					if cached, ok := replayOut.Result.(*filesystem.PatchResult); ok && cached != nil {
+						recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": in.Path}, "IDEMPOTENT_REPLAY", replayOut.Decision.Approver, start, nil)
+						return nil, cached, nil
+					}
+				}
+			}
 			recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": in.Path}, "DENIED_PRECHECK", "", start, err)
 			return nil, nil, err
 		}
 
+		// 若调用方未显式传 expected_sha256，在审批等待后自动锁定预检时的旧版本，防审批期间人工编辑被覆盖
+		if patchReq.ExpectedSHA256 == "" && !preview.IsNewFile {
+			patchReq.ExpectedSHA256 = preview.OldSHA256
+		}
+
 		p := session.FromContext(ctx)
-		dec, err := d.Broker.RequestApproval(ctx, approval.Request{
+		fp := approval.ComputeFingerprint(p.ClientID, "workspace.patch", in.WorkspaceID, in)
+		outcome, err := d.Broker.ExecuteWithApproval(ctx, approval.Request{
 			SessionID:     p.SessionID,
+			ClientID:      p.ClientID,
+			IsRemote:      p.IsRemote,
+			Fingerprint:   fp,
 			Tool:          "workspace.patch",
 			WorkspaceID:   in.WorkspaceID,
 			RiskLevel:     ev.RiskLevel,
@@ -200,19 +262,29 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 			DiffPreview:   preview.UnifiedDiff,
 			Summary:       fmt.Sprintf("修改工作区 %s 中的文件 %s", in.WorkspaceID, preview.Resolved.RelPath),
 			Reason:        ev.Reason,
-		})
+		}, func() (any, error) {
+			return d.FS.ApplyPatch(patchReq)
+		}, makeProgressNotifier(ctx, callReq, "正在等待用户在本地 NodeBridge 控制台审批文件补丁..."))
+
 		if err != nil {
-			recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": preview.Resolved.RelPath}, dec.DecisionTag, dec.Approver, start, err)
+			recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": preview.Resolved.RelPath}, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, err)
 			return nil, nil, err
 		}
-
-		// 若调用方未显式传 expected_sha256，在审批等待后自动锁定预检时的旧版本，防审批期间人工编辑被覆盖
-		if patchReq.ExpectedSHA256 == "" && !preview.IsNewFile {
-			patchReq.ExpectedSHA256 = preview.OldSHA256
+		if outcome.Pending {
+			recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": preview.Resolved.RelPath, "approval_id": outcome.ApprovalID}, "APPROVAL_PENDING", "", start, nil)
+			return nil, &filesystem.PatchResult{
+				Source:      "local_workspace_file",
+				WorkspaceID: in.WorkspaceID,
+				Path:        preview.Resolved.RelPath,
+				Pending:     true,
+				ApprovalID:  outcome.ApprovalID,
+				Message:     fmt.Sprintf("审批单 %s 正在等待用户在本地 NodeBridge 控制台确认。请提示用户批准后，调用 approval.status 查询最终执行结果。", outcome.ApprovalID),
+			}, nil
 		}
-		res, err := d.FS.ApplyPatch(patchReq)
-		recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": preview.Resolved.RelPath, "created": preview.IsNewFile}, dec.DecisionTag, dec.Approver, start, err)
-		return nil, res, err
+
+		res, _ := outcome.Result.(*filesystem.PatchResult)
+		recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": preview.Resolved.RelPath, "created": preview.IsNewFile}, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, nil)
+		return nil, res, nil
 	})
 }
 
@@ -223,6 +295,9 @@ func registerGitTools(srv *mcp.Server, d Deps) {
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in GitStatusInput) (*mcp.CallToolResult, *git.StatusResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("git.status")
+		if err := authorizePrincipal(ctx, d.Audit, "git.status", in.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
+			return nil, nil, err
+		}
 		if d.Git == nil {
 			err := errors.New("当前宿主机未检测到 Git 可执行程序")
 			recordAudit(ctx, d.Audit, "git.status", in.WorkspaceID, string(ev.RiskLevel), in, "UNAVAILABLE", "", start, err)
@@ -239,6 +314,9 @@ func registerGitTools(srv *mcp.Server, d Deps) {
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in GitDiffInput) (*mcp.CallToolResult, *git.DiffResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("git.diff")
+		if err := authorizePrincipal(ctx, d.Audit, "git.diff", in.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
+			return nil, nil, err
+		}
 		if d.Git == nil {
 			err := errors.New("当前宿主机未检测到 Git 可执行程序")
 			recordAudit(ctx, d.Audit, "git.diff", in.WorkspaceID, string(ev.RiskLevel), in, "UNAVAILABLE", "", start, err)
@@ -251,10 +329,13 @@ func registerGitTools(srv *mcp.Server, d Deps) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "git.apply_patch",
-		Description: "在路径安全校验与人工审批后，向授权工作区应用标准 Unified Diff Git 补丁",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in GitApplyPatchInput) (*mcp.CallToolResult, *git.ApplyPatchResult, error) {
+		Description: "在路径安全校验与人工审批后，向授权工作区应用标准 Unified Diff Git 补丁（支持远程异步续接）",
+	}, func(ctx context.Context, callReq *mcp.CallToolRequest, in GitApplyPatchInput) (*mcp.CallToolResult, *git.ApplyPatchResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("git.apply_patch")
+		if err := authorizePrincipal(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), true, map[string]any{"workspace_id": in.WorkspaceID}, start); err != nil {
+			return nil, nil, err
+		}
 		if d.Git == nil {
 			err := errors.New("当前宿主机未检测到 Git 可执行程序")
 			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"workspace_id": in.WorkspaceID}, "UNAVAILABLE", "", start, err)
@@ -268,8 +349,12 @@ func registerGitTools(srv *mcp.Server, d Deps) {
 		}
 
 		p := session.FromContext(ctx)
-		dec, err := d.Broker.RequestApproval(ctx, approval.Request{
+		fp := approval.ComputeFingerprint(p.ClientID, "git.apply_patch", in.WorkspaceID, in)
+		outcome, err := d.Broker.ExecuteWithApproval(ctx, approval.Request{
 			SessionID:     p.SessionID,
+			ClientID:      p.ClientID,
+			IsRemote:      p.IsRemote,
+			Fingerprint:   fp,
 			Tool:          "git.apply_patch",
 			WorkspaceID:   in.WorkspaceID,
 			RiskLevel:     ev.RiskLevel,
@@ -278,47 +363,93 @@ func registerGitTools(srv *mcp.Server, d Deps) {
 			DiffPreview:   in.Patch,
 			Summary:       fmt.Sprintf("向工作区 %s 应用 Git 补丁（涉及 %d 个文件）", in.WorkspaceID, len(affected)),
 			Reason:        ev.Reason,
-		})
+		}, func() (any, error) {
+			return d.Git.ApplyPatch(context.Background(), in.WorkspaceID, in.Patch)
+		}, makeProgressNotifier(ctx, callReq, "正在等待用户在本地 NodeBridge 控制台审批 Git 补丁..."))
+
 		if err != nil {
-			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"files": affected}, dec.DecisionTag, dec.Approver, start, err)
+			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"files": affected}, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, err)
 			return nil, nil, err
 		}
+		if outcome.Pending {
+			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"files": affected, "approval_id": outcome.ApprovalID}, "APPROVAL_PENDING", "", start, nil)
+			return nil, &git.ApplyPatchResult{
+				Source:        "git_output",
+				WorkspaceID:   in.WorkspaceID,
+				AffectedFiles: affected,
+				Pending:       true,
+				ApprovalID:    outcome.ApprovalID,
+				Message:       fmt.Sprintf("审批单 %s 正在等待用户在本地控制台确认。请提示用户批准后，调用 approval.status 查询结果。", outcome.ApprovalID),
+			}, nil
+		}
 
-		res, err := d.Git.ApplyPatch(ctx, in.WorkspaceID, in.Patch)
-		recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"files": affected}, dec.DecisionTag, dec.Approver, start, err)
-		return nil, res, err
+		res, _ := outcome.Result.(*git.ApplyPatchResult)
+		recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"files": affected}, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, nil)
+		return nil, res, nil
 	})
 }
 
 func registerTerminalTools(srv *mcp.Server, d Deps) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "terminal.start",
-		Description: "在授权工作区内异步启动受分层安全策略和人工审批约束的命令行任务，立即返回 task_id",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in TerminalStartInput) (*mcp.CallToolResult, *TerminalStartOutput, error) {
+		Description: "在授权工作区内异步启动受分层安全策略和人工审批约束的命令行任务，立即返回 task_id（或远程等待审批时的 approval_id）",
+	}, func(ctx context.Context, callReq *mcp.CallToolRequest, in TerminalStartInput) (*mcp.CallToolResult, *TerminalStartOutput, error) {
 		start := time.Now()
-		// 1. 校验工作目录严格位于授权工作区内
+		// 1. 策略预估 + 客户端级工作区/只读权限校验
+		ev := d.Policy.EvaluateCommand(in.Executable, in.Args, in.UseShell)
+		requiresWrite := ev.RiskLevel != policy.RiskL0
+		if err := authorizePrincipal(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), requiresWrite, in, start); err != nil {
+			return nil, nil, err
+		}
+
+		// 2. 校验工作目录严格位于授权工作区内
 		resolvedCwd, err := d.FS.Resolve(in.WorkspaceID, in.Cwd, false)
 		if err != nil {
 			recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, "L3", in, "DENIED_PATH", "", start, err)
 			return nil, nil, err
 		}
 
-		// 2. 分层命令策略评估
-		ev := d.Policy.EvaluateCommand(in.Executable, in.Args, in.UseShell)
 		if ev.Action == policy.ActionDeny {
 			denyErr := fmt.Errorf("命令被安全策略拒绝 [%s]: %s", ev.RiskLevel, ev.Reason)
 			recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), in, "POLICY_DENY", "", start, denyErr)
 			return nil, nil, denyErr
 		}
 
-		// 3. 急停检查与按需人工审批
-		decisionTag := "AUTO_ALLOW"
-		approver := ""
-		if ev.Action == policy.ActionRequireApproval {
-			p := session.FromContext(ctx)
-			cmdPreview := formatCommandPreview(in)
-			dec, err := d.Broker.RequestApproval(ctx, approval.Request{
+		p := session.FromContext(ctx)
+		startTaskFn := func() (any, error) {
+			rec, startErr := d.Tasks.Start(task.StartRequest{
 				SessionID:      p.SessionID,
+				WorkspaceID:    in.WorkspaceID,
+				ToolName:       "terminal.start",
+				Executable:     in.Executable,
+				Args:           in.Args,
+				Cwd:            resolvedCwd.AbsPath,
+				EnvAllow:       in.EnvAllow,
+				UseShell:       in.UseShell,
+				TimeoutSeconds: in.TimeoutSeconds,
+			})
+			if startErr != nil {
+				return nil, startErr
+			}
+			return &TerminalStartOutput{
+				Source:      "terminal_task",
+				TaskID:      rec.ID,
+				WorkspaceID: rec.WorkspaceID,
+				Status:      rec.Status,
+				RiskLevel:   string(ev.RiskLevel),
+				Cwd:         resolvedCwd.RelPath,
+			}, nil
+		}
+
+		// 3. 急停检查与按需混合人工审批
+		if ev.Action == policy.ActionRequireApproval {
+			cmdPreview := formatCommandPreview(in)
+			fp := approval.ComputeFingerprint(p.ClientID, "terminal.start", in.WorkspaceID, in)
+			outcome, err := d.Broker.ExecuteWithApproval(ctx, approval.Request{
+				SessionID:      p.SessionID,
+				ClientID:       p.ClientID,
+				IsRemote:       p.IsRemote,
+				Fingerprint:    fp,
 				Tool:           "terminal.start",
 				WorkspaceID:    in.WorkspaceID,
 				RiskLevel:      ev.RiskLevel,
@@ -327,44 +458,43 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 				CommandPreview: cmdPreview,
 				Summary:        fmt.Sprintf("在工作区 %s 执行命令: %s", in.WorkspaceID, in.Executable),
 				Reason:         ev.Reason,
-			})
+			}, startTaskFn, makeProgressNotifier(ctx, callReq, "正在等待用户在本地 NodeBridge 控制台审批命令执行..."))
+
 			if err != nil {
-				recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), in, dec.DecisionTag, dec.Approver, start, err)
+				recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), in, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, err)
 				return nil, nil, err
 			}
-			decisionTag = dec.DecisionTag
-			approver = dec.Approver
-		} else if pause := d.Broker.IsPaused(); pause.Paused {
+			if outcome.Pending {
+				recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"executable": in.Executable, "approval_id": outcome.ApprovalID}, "APPROVAL_PENDING", "", start, nil)
+				return nil, &TerminalStartOutput{
+					Source:      "terminal_task",
+					WorkspaceID: in.WorkspaceID,
+					Status:      "APPROVAL_PENDING",
+					RiskLevel:   string(ev.RiskLevel),
+					Cwd:         resolvedCwd.RelPath,
+					Pending:     true,
+					ApprovalID:  outcome.ApprovalID,
+					Message:     fmt.Sprintf("命令审批单 %s 正在等待用户在本地控制台确认。请提示用户批准后，调用 approval.status 获取 task_id。", outcome.ApprovalID),
+				}, nil
+			}
+			out, _ := outcome.Result.(*TerminalStartOutput)
+			recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), in, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, nil)
+			return nil, out, nil
+		}
+
+		if pause := d.Broker.IsPaused(); pause.Paused {
 			pauseErr := fmt.Errorf("系统处于急停暂停状态，拒绝启动新命令：%s", pause.Reason)
 			recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), in, "PAUSED", "", start, pauseErr)
 			return nil, nil, pauseErr
 		}
 
-		p := session.FromContext(ctx)
-		rec, err := d.Tasks.Start(task.StartRequest{
-			SessionID:      p.SessionID,
-			WorkspaceID:    in.WorkspaceID,
-			ToolName:       "terminal.start",
-			Executable:     in.Executable,
-			Args:           in.Args,
-			Cwd:            resolvedCwd.AbsPath,
-			EnvAllow:       in.EnvAllow,
-			UseShell:       in.UseShell,
-			TimeoutSeconds: in.TimeoutSeconds,
-		})
-		recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), in, decisionTag, approver, start, err)
+		rawRes, err := startTaskFn()
+		recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), in, "AUTO_ALLOW", "", start, err)
 		if err != nil {
 			return nil, nil, err
 		}
-
-		return nil, &TerminalStartOutput{
-			Source:      "terminal_task",
-			TaskID:      rec.ID,
-			WorkspaceID: rec.WorkspaceID,
-			Status:      rec.Status,
-			RiskLevel:   string(ev.RiskLevel),
-			Cwd:         resolvedCwd.RelPath,
-		}, nil
+		out, _ := rawRes.(*TerminalStartOutput)
+		return nil, out, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -377,6 +507,9 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 		wsID := ""
 		if res != nil {
 			wsID = res.WorkspaceID
+			if authErr := authorizePrincipal(ctx, d.Audit, "terminal.poll", wsID, string(ev.RiskLevel), false, in, start); authErr != nil {
+				return nil, nil, authErr
+			}
 		}
 		recordAudit(ctx, d.Audit, "terminal.poll", wsID, string(ev.RiskLevel), in, "AUTO_ALLOW", "", start, err)
 		return nil, res, err
@@ -388,6 +521,11 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in TerminalCancelInput) (*mcp.CallToolResult, *TerminalCancelOutput, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("terminal.cancel")
+		if existing, pollErr := d.Tasks.Poll(in.TaskID, 0, 0); pollErr == nil && existing != nil {
+			if authErr := authorizePrincipal(ctx, d.Audit, "terminal.cancel", existing.WorkspaceID, string(ev.RiskLevel), true, in, start); authErr != nil {
+				return nil, nil, authErr
+			}
+		}
 		rec, err := d.Tasks.Cancel(in.TaskID, in.Reason)
 		recordAudit(ctx, d.Audit, "terminal.cancel", rec.WorkspaceID, string(ev.RiskLevel), in, "AUTO_ALLOW", "", start, err)
 		if err != nil {
@@ -399,6 +537,108 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 			Status: rec.Status,
 		}, nil
 	})
+}
+
+func registerApprovalTools(srv *mcp.Server, d Deps) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "approval.status",
+		Description: "查询挂起的远程人工审批单当前状态与批准后的异步执行结果（仅返回当前客户端所属审批单）",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in ApprovalStatusInput) (*mcp.CallToolResult, *ApprovalStatusOutput, error) {
+		start := time.Now()
+		ev := d.Policy.EvaluateTool("approval.status")
+		rec, ok := d.Broker.GetRecord(in.ApprovalID)
+		if !ok {
+			err := fmt.Errorf("未找到审批单 %q（可能不存在或已过期清理）", in.ApprovalID)
+			recordAudit(ctx, d.Audit, "approval.status", "", string(ev.RiskLevel), in, "NOT_FOUND", "", start, err)
+			return nil, nil, err
+		}
+
+		p := session.FromContext(ctx)
+		// 严格防跨客户端越权读取审批单详情与结果
+		if p.AuthMethod == "oauth2" && rec.ClientID != "" && rec.ClientID != p.ClientID {
+			err := errors.New("无权查看其他客户端发起的审批单")
+			recordAudit(ctx, d.Audit, "approval.status", rec.WorkspaceID, string(ev.RiskLevel), in, "CLIENT_APPROVAL_DENIED", "", start, err)
+			return nil, nil, err
+		}
+		if err := authorizePrincipal(ctx, d.Audit, "approval.status", rec.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
+			return nil, nil, err
+		}
+
+		out := &ApprovalStatusOutput{
+			Source:       "approval_broker",
+			ApprovalID:   rec.ID,
+			Tool:         rec.Tool,
+			WorkspaceID:  rec.WorkspaceID,
+			Status:       string(rec.Status),
+			ExecStatus:   rec.ExecStatus,
+			DecisionNote: rec.DecisionNote,
+			Result:       rec.ExecResult,
+			Error:        rec.ExecError,
+		}
+		if !rec.ExpiresAt.IsZero() {
+			out.ExpiresAt = rec.ExpiresAt.Format(time.RFC3339)
+		}
+		switch rec.Status {
+		case approval.StatusPending:
+			out.Message = "用户尚未处理该审批单，请提醒用户在本地 NodeBridge 控制台点击批准或拒绝。"
+		case approval.StatusApproved:
+			if rec.ExecStatus == "RUNNING" {
+				out.Message = "用户已批准，操作正在后台执行中，请稍后再次调用 approval.status。"
+			} else if rec.ExecStatus == "SUCCEEDED" {
+				out.Message = "用户已批准且操作已执行成功，结果见 result 字段。"
+			} else if rec.ExecStatus == "FAILED" {
+				out.Message = "用户已批准，但后台执行失败，原因见 error 字段。"
+			}
+		case approval.StatusRejected:
+			out.Message = "用户已拒绝该操作。"
+		case approval.StatusCancelled, approval.StatusTimedOut:
+			out.Message = "审批单已取消或超时过期。"
+		}
+
+		recordAudit(ctx, d.Audit, "approval.status", rec.WorkspaceID, string(ev.RiskLevel), in, "AUTO_ALLOW", "", start, nil)
+		return nil, out, nil
+	})
+}
+
+// authorizePrincipal 执行阶段二客户端级工作区子集与只读权限护栏校验。
+func authorizePrincipal(
+	ctx context.Context,
+	logger *audit.Logger,
+	toolName, workspaceID, risk string,
+	requiresWrite bool,
+	args any,
+	start time.Time,
+) error {
+	p := session.FromContext(ctx)
+	if workspaceID != "" && !p.CanAccessWorkspace(workspaceID) {
+		err := fmt.Errorf("当前远程客户端（%s）未被授权访问工作区 %q", p.ClientName, workspaceID)
+		recordAudit(ctx, logger, toolName, workspaceID, risk, args, "CLIENT_WORKSPACE_DENIED", "", start, err)
+		return err
+	}
+	if requiresWrite && !p.HasWritePermission() {
+		err := fmt.Errorf("当前远程客户端（%s）处于只读授权模式，禁止执行写入或变更类操作 %q", p.ClientName, toolName)
+		recordAudit(ctx, logger, toolName, workspaceID, risk, args, "CLIENT_READONLY_DENIED", "", start, err)
+		return err
+	}
+	return nil
+}
+
+// makeProgressNotifier 构造等待审批期间向 MCP 客户端推送保活进度的回调，降低云端代理断连概率。
+func makeProgressNotifier(ctx context.Context, callReq *mcp.CallToolRequest, msg string) func(elapsed time.Duration) {
+	if callReq == nil || callReq.Session == nil || callReq.Params == nil {
+		return nil
+	}
+	tok := callReq.Params.GetProgressToken()
+	if tok == nil {
+		return nil
+	}
+	return func(elapsed time.Duration) {
+		_ = callReq.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
+			ProgressToken: tok,
+			Progress:      elapsed.Seconds(),
+			Message:       msg,
+		})
+	}
 }
 
 func formatCommandPreview(in TerminalStartInput) string {
@@ -425,9 +665,13 @@ func recordAudit(ctx context.Context, logger *audit.Logger, tool, wsID, risk str
 		status = "FAILED"
 		errStr = err.Error()
 	}
+	clientLabel := p.ClientInfo
+	if p.ClientID != "" && p.AuthMethod == "oauth2" {
+		clientLabel = fmt.Sprintf("oauth:%s (%s)", p.ClientID, p.ClientName)
+	}
 	_ = logger.Record(audit.Event{
 		SessionID:   p.SessionID,
-		ClientInfo:  p.ClientInfo,
+		ClientInfo:  clientLabel,
 		Tool:        tool,
 		WorkspaceID: wsID,
 		RiskLevel:   risk,

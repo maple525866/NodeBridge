@@ -46,3 +46,42 @@ func TestConfigRejectsPlaceholderTokenAndWildcardListen(t *testing.T) {
 		t.Fatalf("应当拒绝隐式全网卡监听地址 :18765")
 	}
 }
+
+func TestRelayAndOAuthConfigValidation(t *testing.T) {
+	tmp := t.TempDir()
+
+	// 1. external 模式必须为 https URL
+	cfg, _ := DefaultConfig(tmp)
+	cfg.Relay.Mode = RelayModeExternal
+	cfg.Relay.PublicURL = "http://insecure.example.com"
+	cfg.ApplyDefaults(tmp)
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("应当拒绝非 HTTPS 的 relay.public_url")
+	}
+
+	cfg.Relay.PublicURL = "https://mcp.example.com/"
+	cfg.ApplyDefaults(tmp)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("合法 external 模式应校验通过: %v", err)
+	}
+	if cfg.Relay.PublicURL != "https://mcp.example.com" {
+		t.Fatalf("应去除末尾斜杠，实际: %s", cfg.Relay.PublicURL)
+	}
+	if !cfg.OAuth.Enabled {
+		t.Fatalf("开启远程通道后应自动启用内置 OAuth 2.1")
+	}
+
+	// 2. cloudflared_named 支持 env: 读取令牌
+	t.Setenv("NB_TEST_CF_TOKEN", "cf-secret-token-123")
+	cfg2, _ := DefaultConfig(tmp)
+	cfg2.Relay.Mode = RelayModeCloudflaredNamed
+	cfg2.Relay.PublicURL = "https://dev.example.com"
+	cfg2.Relay.TunnelToken = "env:NB_TEST_CF_TOKEN"
+	cfg2.ApplyDefaults(tmp)
+	if err := cfg2.Validate(); err != nil {
+		t.Fatalf("env: 令牌校验失败: %v", err)
+	}
+	if cfg2.Relay.ResolvedTunnelToken() != "cf-secret-token-123" {
+		t.Fatalf("未正确解析环境变量令牌")
+	}
+}
