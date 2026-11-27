@@ -74,6 +74,7 @@ var secretAccessPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])[a-z0-9._\\/-]+\.(?:pem|ppk|p12|pfx|jks|keystore|kdbx)(?:$|[\s"';,&|<>)\]\}` + "`" + `])`),
 	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])(?:[a-z0-9_-]+[\\/])*[a-z0-9_-]+\.key(?:$|[\s"';,&|<>)\]\}` + "`" + `])`),
 	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])nodebridge\.yaml(?:$|[\s"';,&|<>)\]\}` + "`" + `])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])service\.env(?:$|[\s"';,&|<>)\]\}` + "`" + `])`),
 }
 
 // NewEngine 根据安全配置构建策略引擎。

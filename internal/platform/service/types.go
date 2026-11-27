@@ -36,7 +36,22 @@ const (
 	LogsSubDir = "logs"
 )
 
-var serviceNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$`)
+var (
+	serviceNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$`)
+	runAsUserPattern   = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,64}$`)
+)
+
+// ValidateRunAsUser 校验 Linux/macOS 系统级服务指定的运行账号名称，防止单元/plist 注入。
+func ValidateRunAsUser(name string) (string, error) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "", nil
+	}
+	if !runAsUserPattern.MatchString(trimmed) {
+		return "", fmt.Errorf("无效的系统运行账号 %q：仅允许字母、数字、点(.)、下划线(_)与连字符(-)", name)
+	}
+	return trimmed, nil
+}
 
 // InstallOptions 定义安装开机自启动守护进程所需的完整参数。
 type InstallOptions struct {
@@ -65,6 +80,8 @@ type ControlOptions struct {
 	PurgeEnv    bool
 	// GracefulStopFn 可选注入：在停止用户级计划任务前优先通知运行中的 Daemon 优雅退出。
 	GracefulStopFn func() error
+	// WaitStoppedFn 可选注入：在停机或重启期间轮询确认本地监听端口已彻底释放。
+	WaitStoppedFn func(timeout time.Duration) bool
 }
 
 // Status 描述本机 NodeBridge 开机自启动与守护进程的综合状态。
@@ -231,9 +248,15 @@ func isTemporaryBuildPath(absPath string) bool {
 	if strings.Contains(norm, "/go-build") {
 		return true
 	}
-	tmpDir := strings.ToLower(filepath.ToSlash(filepath.Clean(os.TempDir())))
-	if tmpDir != "" && tmpDir != "/" && strings.HasPrefix(norm, tmpDir+"/") && strings.Contains(norm, "exe/") {
-		return true
+	tmpCandidates := []string{os.TempDir()}
+	if resolvedTmp, err := filepath.EvalSymlinks(os.TempDir()); err == nil && resolvedTmp != "" {
+		tmpCandidates = append(tmpCandidates, resolvedTmp)
+	}
+	for _, rawTmp := range tmpCandidates {
+		tmpDir := strings.ToLower(filepath.ToSlash(filepath.Clean(rawTmp)))
+		if tmpDir != "" && tmpDir != "/" && strings.HasPrefix(norm, tmpDir+"/") && strings.Contains(norm, "/exe/") {
+			return true
+		}
 	}
 	return false
 }
@@ -298,8 +321,8 @@ func BuildInstallHint(cfgPath string) string {
 	return fmt.Sprintf("%s service install --config %s", bin, cfg)
 }
 
-// ProbeSummary 供 Admin API 与 doctor 只读查询当前开机自启守护状态。
-func ProbeSummary(cfg *config.Config, cfgPath string) Status {
+// ProbeSummary 供 Admin API 与 doctor 只读查询当前开机自启守护状态；可选 svcNameOverride 覆盖默认服务名。
+func ProbeSummary(cfg *config.Config, cfgPath string, svcNameOverride ...string) Status {
 	svcName := DefaultServiceName
 	dataDir := ""
 	relayMode := ""
@@ -311,6 +334,9 @@ func ProbeSummary(cfg *config.Config, cfgPath string) Status {
 		dataDir = cfg.Storage.DataDir
 		relayMode = cfg.Relay.EffectiveMode()
 		publicURL = cfg.Relay.PublicURL
+	}
+	if len(svcNameOverride) > 0 && strings.TrimSpace(svcNameOverride[0]) != "" {
+		svcName = strings.TrimSpace(svcNameOverride[0])
 	}
 	st, err := QueryStatus(ControlOptions{
 		ServiceName: svcName,

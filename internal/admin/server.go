@@ -5,7 +5,9 @@ import (
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"strings"
@@ -22,6 +24,13 @@ import (
 	"nodebridge/internal/platform/filesystem"
 	"nodebridge/internal/platform/service"
 	"nodebridge/internal/transport/relay"
+)
+
+// 服务控制类型化错误哨兵，用于精确映射 Admin API HTTP 状态码（400 / 403 / 409）。
+var (
+	ErrServiceBadRequest = errors.New("invalid service control request")
+	ErrServiceForbidden  = errors.New("insufficient privilege for service control")
+	ErrServiceConflict   = errors.New("service control operation already in progress")
 )
 
 // ServiceController 抽象本地守护进程与开机自启动服务的受控运维能力（由 main 注入）。
@@ -765,22 +774,27 @@ func (s *Server) handleServiceRestart(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "当前实例未挂载守护进程控制器"})
 		return
 	}
-	st := s.svcCtrl.Status()
-	if !st.Installed {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "尚未安装开机自启动守护进程，无法从控制台执行服务重启"})
-		return
-	}
 	if err := s.svcCtrl.Restart(); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		if s.auditLog != nil {
+			_ = s.auditLog.Record(audit.Event{
+				Tool:        "admin.service.restart",
+				Decision:    "SERVICE_RESTART_FAILED",
+				Approver:    "admin",
+				Status:      "FAILED",
+				ArgsSummary: audit.RedactSummary(err.Error(), 256),
+			})
+		}
+		writeJSON(w, mapServiceErrorStatus(err), map[string]any{"error": err.Error()})
 		return
 	}
+	st := s.svcCtrl.Status()
 	if s.auditLog != nil {
 		_ = s.auditLog.Record(audit.Event{
 			Tool:        "admin.service.restart",
 			Decision:    "SERVICE_RESTARTING",
 			Approver:    "admin",
 			Status:      "SUCCEEDED",
-			ArgsSummary: fmt.Sprintf("service=%s scope=%s backend=%s", st.ServiceName, st.Scope, st.Backend),
+			ArgsSummary: audit.RedactSummary(fmt.Sprintf("service=%s scope=%s backend=%s", st.ServiceName, st.Scope, st.Backend), 256),
 		})
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
@@ -802,23 +816,36 @@ func (s *Server) handleServiceUninstall(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "当前实例未挂载守护进程控制器"})
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
 	var body struct {
 		PurgeEnv bool `json:"purge_env"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-
-	st := s.svcCtrl.Status()
-	if err := s.svcCtrl.Uninstall(body.PurgeEnv); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+	if err := decodeOptionalJSON(r.Body, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体 JSON 格式无效"})
 		return
 	}
+
+	if err := s.svcCtrl.Uninstall(body.PurgeEnv); err != nil {
+		if s.auditLog != nil {
+			_ = s.auditLog.Record(audit.Event{
+				Tool:        "admin.service.uninstall",
+				Decision:    "SERVICE_UNINSTALL_FAILED",
+				Approver:    "admin",
+				Status:      "FAILED",
+				ArgsSummary: audit.RedactSummary(err.Error(), 256),
+			})
+		}
+		writeJSON(w, mapServiceErrorStatus(err), map[string]any{"error": err.Error()})
+		return
+	}
+	st := s.svcCtrl.Status()
 	if s.auditLog != nil {
 		_ = s.auditLog.Record(audit.Event{
 			Tool:        "admin.service.uninstall",
 			Decision:    "SERVICE_UNINSTALLING",
 			Approver:    "admin",
 			Status:      "SUCCEEDED",
-			ArgsSummary: fmt.Sprintf("service=%s scope=%s purge_env=%v", st.ServiceName, st.Scope, body.PurgeEnv),
+			ArgsSummary: audit.RedactSummary(fmt.Sprintf("service=%s scope=%s purge_env=%v", st.ServiceName, st.Scope, body.PurgeEnv), 256),
 		})
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
@@ -840,10 +867,14 @@ func (s *Server) handleSystemShutdown(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "当前实例不支持远程停机信号"})
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
 	var body struct {
 		Reason string `json:"reason"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := decodeOptionalJSON(r.Body, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体 JSON 格式无效"})
+		return
+	}
 	if strings.TrimSpace(body.Reason) == "" {
 		body.Reason = "本地管理请求优雅关闭"
 	}
@@ -853,7 +884,7 @@ func (s *Server) handleSystemShutdown(w http.ResponseWriter, r *http.Request) {
 			Decision:    "SHUTTING_DOWN",
 			Approver:    "admin",
 			Status:      "SUCCEEDED",
-			ArgsSummary: body.Reason,
+			ArgsSummary: audit.RedactSummary(body.Reason, 256),
 		})
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"status": "shutting_down", "reason": body.Reason})
@@ -864,6 +895,30 @@ func (s *Server) handleSystemShutdown(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(150 * time.Millisecond)
 		s.svcCtrl.Shutdown(body.Reason)
 	}()
+}
+
+func mapServiceErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, ErrServiceBadRequest):
+		return http.StatusBadRequest
+	case errors.Is(err, ErrServiceForbidden):
+		return http.StatusForbidden
+	case errors.Is(err, ErrServiceConflict):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func decodeOptionalJSON(r io.Reader, dst any) error {
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return nil
+	}
+	return json.Unmarshal(raw, dst)
 }
 
 func (s *Server) validateAllowedWorkspaces(ids []string) error {

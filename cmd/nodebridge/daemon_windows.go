@@ -19,7 +19,8 @@ func isWindowsServiceProcess() bool {
 }
 
 // runDaemonWithPlatformHost 在 Windows 上自动检测是否由服务控制管理器 (SCM) 启动：
-// - 若为 Windows Service 进程，则注册原生 svc.Handler，汇报 Running/StopPending 并支持关机优雅退出；
+// - 若为 Windows Service 进程，则注册原生 svc.Handler，初始化期间定期上报 StartPending CheckPoint，
+//   仅在监听端口就绪（onReady）后才上报 Running，并支持 Stop/Shutdown 优雅停机；
 // - 若为普通交互/计划任务进程，则监听标准中断信号优雅退出。
 func runDaemonWithPlatformHost(serviceName string, runFn func(ctx context.Context, onReady func()) error) error {
 	if isWindowsServiceProcess() {
@@ -38,7 +39,8 @@ type windowsDaemonService struct {
 
 func (w *windowsDaemonService) Execute(_ []string, r <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
 	const accepted = svc.AcceptStop | svc.AcceptShutdown
-	status <- svc.Status{State: svc.StartPending}
+	var checkPoint uint32 = 1
+	status <- svc.Status{State: svc.StartPending, CheckPoint: checkPoint, WaitHint: 5000}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -55,21 +57,22 @@ func (w *windowsDaemonService) Execute(_ []string, r <-chan svc.ChangeRequest, s
 	}()
 
 	currentState := svc.StartPending
-	// 兜底定时器：即使初始化耗时较短或回调先触发，确保尽快向 SCM 汇报 Running
-	readyFallback := time.NewTimer(500 * time.Millisecond)
-	defer readyFallback.Stop()
+	// 初始化期间每 2 秒递增 CheckPoint 告知 SCM 正在启动，绝不在就绪前假报 Running
+	pendingTicker := time.NewTicker(2 * time.Second)
+	defer pendingTicker.Stop()
 
 	for {
 		select {
 		case <-readyCh:
 			if currentState == svc.StartPending {
 				currentState = svc.Running
+				pendingTicker.Stop()
 				status <- svc.Status{State: svc.Running, Accepts: accepted}
 			}
-		case <-readyFallback.C:
+		case <-pendingTicker.C:
 			if currentState == svc.StartPending {
-				currentState = svc.Running
-				status <- svc.Status{State: svc.Running, Accepts: accepted}
+				checkPoint++
+				status <- svc.Status{State: svc.StartPending, CheckPoint: checkPoint, WaitHint: 5000}
 			}
 		case err := <-errCh:
 			if err != nil {
@@ -81,10 +84,14 @@ func (w *windowsDaemonService) Execute(_ []string, r <-chan svc.ChangeRequest, s
 		case req := <-r:
 			switch req.Cmd {
 			case svc.Interrogate:
-				status <- svc.Status{State: currentState, Accepts: accepted}
+				if currentState == svc.Running {
+					status <- svc.Status{State: svc.Running, Accepts: accepted}
+				} else {
+					status <- svc.Status{State: currentState, CheckPoint: checkPoint, WaitHint: 5000}
+				}
 			case svc.Stop, svc.Shutdown:
 				currentState = svc.StopPending
-				status <- svc.Status{State: svc.StopPending}
+				status <- svc.Status{State: svc.StopPending, CheckPoint: 1, WaitHint: 12000}
 				cancel()
 				select {
 				case err := <-errCh:

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 // Spec 描述受策略与审批放行后的命令执行参数。
@@ -55,8 +56,36 @@ var safeBaseEnvKeys = map[string]struct{}{
 	"GOMODCACHE":    {},
 	"GOPROXY":       {},
 	"GOTOOLCHAIN":   {},
-	"NODE_ENV":      {},
+	"NODE_ENV":         {},
 	"PYTHONIOENCODING": {},
+}
+
+var (
+	protectedEnvMu   sync.RWMutex
+	protectedEnvKeys = map[string]struct{}{
+		"CLOUDFLARE_TUNNEL_TOKEN": {},
+		"TUNNEL_TOKEN":            {},
+	}
+)
+
+// ProtectEnvKeys 将指定环境变量名加入进程透传硬黑名单，禁止终端工具通过 env_allow 窃取宿主机敏感凭据。
+func ProtectEnvKeys(keys ...string) {
+	protectedEnvMu.Lock()
+	defer protectedEnvMu.Unlock()
+	for _, k := range keys {
+		upper := strings.ToUpper(strings.TrimSpace(k))
+		if upper == "" || upper == "PATH" {
+			continue
+		}
+		protectedEnvKeys[upper] = struct{}{}
+	}
+}
+
+func isProtectedEnvKey(upperKey string) bool {
+	protectedEnvMu.RLock()
+	_, blocked := protectedEnvKeys[upperKey]
+	protectedEnvMu.RUnlock()
+	return blocked
 }
 
 // BuildCommand 根据 Spec 构造受控的 *exec.Cmd（默认使用参数数组，严禁隐式 Shell 拼接）。
@@ -105,7 +134,7 @@ func buildFilteredEnv(allowList []string, extra map[string]string) []string {
 	}
 	for _, k := range allowList {
 		upper := strings.ToUpper(strings.TrimSpace(k))
-		if upper != "" {
+		if upper != "" && !isProtectedEnvKey(upper) {
 			allowed[upper] = struct{}{}
 		}
 	}
@@ -117,7 +146,11 @@ func buildFilteredEnv(allowList []string, extra map[string]string) []string {
 			continue
 		}
 		key := kv[:idx]
-		if _, ok := allowed[strings.ToUpper(key)]; ok {
+		upper := strings.ToUpper(key)
+		if isProtectedEnvKey(upper) {
+			continue
+		}
+		if _, ok := allowed[upper]; ok {
 			env = append(env, kv)
 		}
 	}

@@ -95,6 +95,9 @@ func TestFullPermissionsModeBypassesRestrictions(t *testing.T) {
 		{"cat", []string{".env"}, false},
 		{"cat", []string{"~/.docker/config.json"}, false},
 		{"cat", []string{"nodebridge.yaml"}, false},
+		{"cat", []string{"data/service/service.env"}, false},
+		{"type", []string{`C:\NodeBridge\data\service\service.env`}, false},
+		{"Get-Content data\\service\\service.env", nil, true},
 		{"powershell", []string{"-EncodedCommand", "ZQBjAGgAbwAgAGgAaQA="}, false},
 	} {
 		if ev := eng.EvaluateCommand(tc.exe, tc.args, tc.shell); ev.Action != ActionDeny {

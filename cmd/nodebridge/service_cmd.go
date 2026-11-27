@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -150,6 +151,13 @@ func runServiceUninstall(args []string) error {
 		dataDir = cfg.Storage.DataDir
 	}
 
+	envRemoved := false
+	if *purgeEnv && dataDir != "" {
+		if _, statErr := os.Stat(service.DefaultEnvFilePath(dataDir)); statErr == nil {
+			envRemoved = true
+		}
+	}
+
 	ctrlOpts := service.ControlOptions{
 		ServiceName: svcName,
 		Scope:       scope,
@@ -158,6 +166,9 @@ func runServiceUninstall(args []string) error {
 		PurgeEnv:    *purgeEnv,
 		GracefulStopFn: func() error {
 			return requestGracefulShutdown(cfg)
+		},
+		WaitStoppedFn: func(timeout time.Duration) bool {
+			return waitDaemonStopped(cfg, timeout)
 		},
 	}
 
@@ -169,7 +180,11 @@ func runServiceUninstall(args []string) error {
 
 	fmt.Printf("已卸载 NodeBridge 开机自启动守护进程（服务名: %s）。\n", svcName)
 	if *purgeEnv {
-		fmt.Println("已清理受限环境变量文件 service.env。")
+		if envRemoved {
+			fmt.Println("已清理受限环境变量文件 service.env。")
+		} else if dataDir == "" {
+			fmt.Println("提示：未能解析配置文件中的 data_dir，未自动清理 service.env。")
+		}
 	}
 	return nil
 }
@@ -234,6 +249,9 @@ func runServiceStop(args []string) error {
 		GracefulStopFn: func() error {
 			return requestGracefulShutdown(cfg)
 		},
+		WaitStoppedFn: func(timeout time.Duration) bool {
+			return waitDaemonStopped(cfg, timeout)
+		},
 	})
 	if err != nil {
 		return err
@@ -273,6 +291,9 @@ func runServiceRestart(args []string) error {
 		DataDir:     dataDir,
 		GracefulStopFn: func() error {
 			return requestGracefulShutdown(cfg)
+		},
+		WaitStoppedFn: func(timeout time.Duration) bool {
+			return waitDaemonStopped(cfg, timeout)
 		},
 	})
 	if err != nil {
@@ -400,10 +421,54 @@ func installServiceForConfig(cfg *config.Config, absCfg string, params installSe
 		return service.Status{}, nil, fmt.Errorf("创建守护日志目录失败: %w", err)
 	}
 
-	// 若当前端口已被旧实例占用，先优雅关闭旧实例再交由系统守护进程接管，避免端口冲突
-	if params.StartNow && checkDaemonHealth(cfg, 600*time.Millisecond) {
-		_ = requestGracefulShutdown(cfg)
-		waitDaemonStopped(cfg, 4*time.Second)
+	// 计算本次安装的目标作用域，并检测是否存在跨 Scope 同名守护冲突（避免系统级与用户级双守护互抢端口）
+	effectiveTargetScope := params.Scope
+	if effectiveTargetScope == "" || effectiveTargetScope == service.ScopeAuto {
+		if service.IsAdmin() {
+			effectiveTargetScope = service.ScopeSystem
+		} else {
+			effectiveTargetScope = service.ScopeUser
+		}
+	}
+	if existingSys, qErr := service.QueryStatus(service.ControlOptions{ServiceName: svcName, Scope: service.ScopeSystem, DataDir: cfg.Storage.DataDir}); qErr == nil && existingSys.Installed && effectiveTargetScope == service.ScopeUser {
+		return service.Status{}, nil, fmt.Errorf("检测到已存在同名的系统级开机自启服务（%s / %s），当前普通权限无法覆盖；请使用管理员终端执行更新，或先卸载系统级服务后再安装用户级守护", existingSys.Backend, existingSys.UnitOrTaskPath)
+	}
+	if existingUser, qErr := service.QueryStatus(service.ControlOptions{ServiceName: svcName, Scope: service.ScopeUser, DataDir: cfg.Storage.DataDir}); qErr == nil && existingUser.Installed && effectiveTargetScope == service.ScopeSystem {
+		// 升级为系统级服务时先清理已有用户级守护，防止双守护冲突
+		_ = service.Uninstall(service.ControlOptions{
+			ServiceName: svcName,
+			Scope:       service.ScopeUser,
+			ConfigPath:  absCfg,
+			DataDir:     cfg.Storage.DataDir,
+			GracefulStopFn: func() error {
+				return requestGracefulShutdown(cfg)
+			},
+			WaitStoppedFn: func(timeout time.Duration) bool {
+				return waitDaemonStopped(cfg, timeout)
+			},
+		})
+	}
+
+	// 若当前端口已被旧实例占用，优先停止已有系统守护（避免 systemd/launchd KeepAlive 抢占端口），再兜底关闭前台进程并等待 MCP+Admin 双端口彻底释放
+	if params.StartNow {
+		if curSt, qErr := service.QueryStatus(service.ControlOptions{ServiceName: svcName, Scope: effectiveTargetScope, DataDir: cfg.Storage.DataDir}); qErr == nil && curSt.Installed && curSt.Running {
+			_, _ = service.Stop(service.ControlOptions{
+				ServiceName: svcName,
+				Scope:       effectiveTargetScope,
+				ConfigPath:  absCfg,
+				DataDir:     cfg.Storage.DataDir,
+				GracefulStopFn: func() error {
+					return requestGracefulShutdown(cfg)
+				},
+				WaitStoppedFn: func(timeout time.Duration) bool {
+					return waitDaemonStopped(cfg, timeout)
+				},
+			})
+		}
+		if anyDaemonPortOpen(cfg) {
+			_ = requestGracefulShutdown(cfg)
+			_ = waitDaemonStopped(cfg, 6*time.Second)
+		}
 	}
 
 	st, err := service.Install(service.InstallOptions{
@@ -497,14 +562,38 @@ func checkDaemonHealth(cfg *config.Config, timeout time.Duration) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-func waitDaemonStopped(cfg *config.Config, timeout time.Duration) {
+func isTCPPortOpen(addr string, timeout time.Duration) bool {
+	if strings.TrimSpace(addr) == "" {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func anyDaemonPortOpen(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	return isTCPPortOpen(cfg.Server.MCPListen, 300*time.Millisecond) ||
+		isTCPPortOpen(cfg.Server.AdminListen, 300*time.Millisecond)
+}
+
+func waitDaemonStopped(cfg *config.Config, timeout time.Duration) bool {
+	if cfg == nil {
+		return true
+	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if !checkDaemonHealth(cfg, 400*time.Millisecond) {
-			return
+		if !anyDaemonPortOpen(cfg) {
+			return true
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
+	return !anyDaemonPortOpen(cfg)
 }
 
 func attachDaemonHealth(st *service.Status, cfg *config.Config, waitTimeout time.Duration) {

@@ -86,11 +86,14 @@ func ParseEnvFile(path string) (map[string]string, error) {
 	return res, nil
 }
 
-// WriteEnvFile 将环境变量映射以最小权限（0600）原子写入目标文件。
+// WriteEnvFile 将环境变量映射以最小权限（Unix 0600 / Windows 受保护 NTFS DACL）原子写入目标文件。
 func WriteEnvFile(path string, values map[string]string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("创建服务环境目录失败: %w", err)
 	}
+	_ = restrictPrivatePathACL(dir)
+
 	keys := make([]string, 0, len(values))
 	for k := range values {
 		if !isValidEnvKey(k) {
@@ -109,69 +112,93 @@ func WriteEnvFile(path string, values map[string]string) error {
 		sb.WriteByte('\n')
 	}
 
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, []byte(sb.String()), 0o600); err != nil {
+	tmpFile, err := os.CreateTemp(dir, ".service-env-*.tmp")
+	if err != nil {
+		return fmt.Errorf("创建临时环境文件失败: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	_ = tmpFile.Chmod(0o600)
+	if _, err := tmpFile.WriteString(sb.String()); err != nil {
+		_ = tmpFile.Close()
 		return fmt.Errorf("写入临时环境文件失败: %w", err)
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		// Windows 上目标文件已存在时 Rename 可能失败，兜底覆盖写入
-		_ = os.Remove(tmpPath)
-		if wErr := os.WriteFile(path, []byte(sb.String()), 0o600); wErr != nil {
-			return fmt.Errorf("写入服务环境文件失败: %w", wErr)
-		}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("刷盘临时环境文件失败: %w", err)
 	}
-	_ = os.Chmod(path, 0o600)
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("关闭临时环境文件失败: %w", err)
+	}
+	_ = restrictPrivatePathACL(tmpPath)
+
+	if err := atomicReplaceFile(tmpPath, path); err != nil {
+		return fmt.Errorf("原子替换服务环境文件失败: %w", err)
+	}
+	cleanup = false
+	if err := restrictPrivatePathACL(path); err != nil {
+		return fmt.Errorf("加固服务环境文件访问权限失败: %w", err)
+	}
 	return nil
 }
 
-// LoadIntoProcessEnv 加载受限环境文件并注入当前进程环境。
+// LoadIntoProcessEnv 加载受限环境文件并注入当前进程环境，返回本次新注入的非 PATH 变量键名列表（便于上层清理与保护）。
 // 规则：
 // 1. 普通变量仅在当前进程未设置或为空时注入（显式环境优先）。
 // 2. PATH 变量执行去重追加合并，确保后台系统服务既保留系统默认 PATH，也能找到用户安装的 cloudflared / git / go 等工具。
-func LoadIntoProcessEnv(path string) (int, error) {
+func LoadIntoProcessEnv(path string) ([]string, error) {
 	trimmed := strings.TrimSpace(path)
 	if trimmed == "" {
-		return 0, nil
+		return nil, nil
 	}
 	entries, err := ParseEnvFile(trimmed)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	loaded := 0
+	var injectedKeys []string
 	for k, v := range entries {
 		if strings.EqualFold(k, "PATH") {
 			merged := mergePathList(os.Getenv("PATH"), v)
 			if merged != os.Getenv("PATH") {
 				_ = os.Setenv("PATH", merged)
-				loaded++
 			}
 			continue
 		}
 		if strings.TrimSpace(os.Getenv(k)) == "" && v != "" {
 			if err := os.Setenv(k, v); err == nil {
-				loaded++
+				injectedKeys = append(injectedKeys, k)
 			}
 		}
 	}
-	return loaded, nil
+	sort.Strings(injectedKeys)
+	return injectedKeys, nil
 }
 
 // BuildServiceEnv 为开机自启动收集需要持久化的关键环境变量：
 // - 自动继承已有 service.env 中的历史项；
-// - 捕获 relay.tunnel_token 引用的 "env:VAR_NAME"；
+// - 捕获 relay.tunnel_token 引用的 "env:VAR_NAME"（优先级：extraEnv > 当前终端 env > 历史 service.env）；
 // - 捕获用户通过 --env 显式传入的变量；
 // - 捕获当前 PATH 及探测到的 cloudflared 所在目录，防止后台服务丢 PATH。
 func BuildServiceEnv(cfg *config.Config, existingEnvFile string, extraEnv map[string]string) (map[string]string, error) {
-	out := make(map[string]string)
+	prev := make(map[string]string)
 	if strings.TrimSpace(existingEnvFile) != "" {
-		if prev, err := ParseEnvFile(existingEnvFile); err == nil {
-			for k, v := range prev {
-				out[k] = v
-			}
+		if parsed, err := ParseEnvFile(existingEnvFile); err == nil {
+			prev = parsed
 		}
 	}
 
-	// 合并用户显式传入的 --env KEY=VALUE
+	out := make(map[string]string, len(prev)+len(extraEnv)+2)
+	for k, v := range prev {
+		out[k] = v
+	}
+
+	// 合并用户显式传入的 --env KEY=VALUE（最高优先级）
 	for k, v := range extraEnv {
 		key := strings.TrimSpace(k)
 		if !isValidEnvKey(key) {
@@ -180,7 +207,7 @@ func BuildServiceEnv(cfg *config.Config, existingEnvFile string, extraEnv map[st
 		out[key] = v
 	}
 
-	// 若配置了 env:VAR_NAME 格式的隧道 Token，优先从 extraEnv -> 当前进程 env -> 已有 service.env 解析
+	// 若配置了 env:VAR_NAME 格式的隧道 Token，严格按优先级解析：extraEnv -> 当前进程 env -> 历史 service.env
 	if cfg != nil && cfg.Relay.EffectiveMode() == config.RelayModeCloudflaredNamed {
 		rawTok := strings.TrimSpace(cfg.Relay.TunnelToken)
 		if strings.HasPrefix(rawTok, "env:") {
@@ -188,9 +215,15 @@ func BuildServiceEnv(cfg *config.Config, existingEnvFile string, extraEnv map[st
 			if envKey == "" || !isValidEnvKey(envKey) {
 				return nil, fmt.Errorf("relay.tunnel_token 中的环境变量名无效: %q", rawTok)
 			}
-			val := strings.TrimSpace(out[envKey])
+			val := ""
+			if extraEnv != nil {
+				val = strings.TrimSpace(extraEnv[envKey])
+			}
 			if val == "" {
 				val = strings.TrimSpace(os.Getenv(envKey))
+			}
+			if val == "" {
+				val = strings.TrimSpace(prev[envKey])
 			}
 			if val == "" {
 				return nil, fmt.Errorf("relay.tunnel_token 配置为 %q，但当前终端环境与历史服务环境中均未检测到该变量值；请先设置环境变量 %s 或通过 --env %s=<token> 传入后再安装自启动",

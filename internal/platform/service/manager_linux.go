@@ -35,7 +35,7 @@ func Install(opts InstallOptions) (Status, error) {
 
 	scope := opts.Scope
 	if scope == "" || scope == ScopeAuto {
-		if IsAdmin() && strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR")) == "" {
+		if IsAdmin() {
 			scope = ScopeSystem
 		} else {
 			scope = ScopeUser
@@ -51,6 +51,11 @@ func Install(opts InstallOptions) (Status, error) {
 				opts.RunAsUser = sudoUser
 			}
 		}
+		validatedUser, err := ValidateRunAsUser(opts.RunAsUser)
+		if err != nil {
+			return Status{}, err
+		}
+		opts.RunAsUser = validatedUser
 	}
 
 	unitPath, err := systemdUnitPath(name, scope)
@@ -66,20 +71,6 @@ func Install(opts InstallOptions) (Status, error) {
 		return Status{}, fmt.Errorf("写入 systemd 单元文件失败 (%s): %w", unitPath, err)
 	}
 
-	if err := runSystemctl(scope, "daemon-reload"); err != nil {
-		return Status{}, fmt.Errorf("执行 systemctl daemon-reload 失败: %w", err)
-	}
-	unitName := name + ".service"
-	if opts.StartNow {
-		if err := runSystemctl(scope, "enable", "--now", unitName); err != nil {
-			return Status{}, fmt.Errorf("启用并启动 %s 失败: %w", unitName, err)
-		}
-	} else {
-		if err := runSystemctl(scope, "enable", unitName); err != nil {
-			return Status{}, fmt.Errorf("启用开机自启 %s 失败: %w", unitName, err)
-		}
-	}
-
 	meta := Metadata{
 		ServiceName:    name,
 		Scope:          scope,
@@ -92,6 +83,36 @@ func Install(opts InstallOptions) (Status, error) {
 		InstalledAt:    time.Now().UTC(),
 	}
 	_ = SaveMetadata(opts.DataDir, meta)
+
+	// 在 sudo 系统级安装且指定了普通运行用户时，统一修正 data/service、service.env、metadata.json 与 logs 目录归属权，
+	// 防止 systemd 切换到 User=<RunAsUser> 后出现 EACCES 崩溃死循环。
+	if scope == ScopeSystem && opts.RunAsUser != "" {
+		if err := fixOwnershipForUser(
+			opts.RunAsUser,
+			opts.DataDir,
+			filepath.Join(opts.DataDir, ServiceSubDir),
+			opts.EnvFilePath,
+			MetadataPath(opts.DataDir),
+			filepath.Dir(opts.LogFilePath),
+			opts.LogFilePath,
+		); err != nil {
+			return Status{}, err
+		}
+	}
+
+	if err := runSystemctl(scope, "daemon-reload"); err != nil {
+		return Status{}, fmt.Errorf("执行 systemctl daemon-reload 失败: %w", err)
+	}
+	unitName := name + ".service"
+	if err := runSystemctl(scope, "enable", unitName); err != nil {
+		return Status{}, fmt.Errorf("启用开机自启 %s 失败: %w", unitName, err)
+	}
+	if opts.StartNow {
+		// 使用 restart 而非 enable --now，确保已处于 active 状态的旧实例也会重载新二进制与新 service.env
+		if err := runSystemctl(scope, "restart", unitName); err != nil {
+			return Status{}, fmt.Errorf("启动/重启 %s 失败: %w", unitName, err)
+		}
+	}
 
 	return QueryStatus(ControlOptions{
 		ServiceName: name,
@@ -142,6 +163,9 @@ func Start(opts ControlOptions) (Status, error) {
 	if scope == "" {
 		return Status{}, fmt.Errorf("未检测到已安装的 systemd 服务（名称: %s）", name)
 	}
+	if scope == ScopeSystem && !IsAdmin() {
+		return Status{}, errors.New("启动系统级 systemd 服务需要 root 权限（请使用 sudo 运行）")
+	}
 	if err := runSystemctl(scope, "start", name+".service"); err != nil {
 		return Status{}, err
 	}
@@ -159,6 +183,9 @@ func Stop(opts ControlOptions) (Status, error) {
 	if scope == "" {
 		return Status{}, fmt.Errorf("未检测到已安装的 systemd 服务（名称: %s）", name)
 	}
+	if scope == ScopeSystem && !IsAdmin() {
+		return Status{}, errors.New("停止系统级 systemd 服务需要 root 权限（请使用 sudo 运行）")
+	}
 	if err := runSystemctl(scope, "stop", name+".service"); err != nil {
 		return Status{}, err
 	}
@@ -175,6 +202,9 @@ func Restart(opts ControlOptions) (Status, error) {
 	scope := resolveLinuxExistingScope(opts)
 	if scope == "" {
 		return Status{}, fmt.Errorf("未检测到已安装的 systemd 服务（名称: %s）", name)
+	}
+	if scope == ScopeSystem && !IsAdmin() {
+		return Status{}, errors.New("重启系统级 systemd 服务需要 root 权限（请使用 sudo 运行）")
 	}
 	if err := runSystemctl(scope, "restart", name+".service"); err != nil {
 		return Status{}, err
@@ -194,7 +224,11 @@ func QueryStatus(opts ControlOptions) (Status, error) {
 	if scope == "" || scope == ScopeAuto {
 		scope = resolveLinuxExistingScope(ControlOptions{ServiceName: name, DataDir: opts.DataDir})
 		if scope == "" {
-			scope = ScopeUser
+			if IsAdmin() {
+				scope = ScopeSystem
+			} else {
+				scope = ScopeUser
+			}
 		}
 	}
 

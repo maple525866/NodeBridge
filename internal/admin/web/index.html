@@ -256,6 +256,7 @@ let lastOAuthPendingKey = '';
 let stateReqSeq = 0;
 let sseRefreshTimer = null;
 let securityModeBusy = false;
+let serviceOpBusy = false;
 
 function init() {
   const params = new URLSearchParams(window.location.search);
@@ -333,7 +334,7 @@ function startSSE() {
   if (eventSource) eventSource.close();
   eventSource = new EventSource('/api/events?token=' + encodeURIComponent(adminToken));
   const pill = document.getElementById('ssePill');
-  eventSource.onopen = () => { pill.textContent = 'SSE 实时连接'; pill.className = 'pill pill-ok'; };
+  eventSource.onopen = () => { pill.textContent = 'SSE 实时连接'; pill.className = 'pill pill-ok'; scheduleRefreshState(); };
   eventSource.onerror = () => { pill.textContent = 'SSE 重连中...'; pill.className = 'pill pill-l2'; };
   [
     'approval_created', 'approval_resolved', 'grants_updated', 'pause_changed',
@@ -520,7 +521,7 @@ function renderAll() {
           ${relay.mcp_endpoint ? `
             <div style="display:flex;gap:8px;align-items:center;margin-top:4px;flex-wrap:wrap;">
               <span class="code-badge">${esc(relay.mcp_endpoint)}</span>
-              <button onclick="copyText('${esc(relay.mcp_endpoint)}')">复制地址</button>
+              <button data-copy="${esc(relay.mcp_endpoint)}" onclick="copyText(this.dataset.copy)">复制地址</button>
             </div>
           ` : `<div class="empty">等待获取公网地址...</div>`}
         </div>
@@ -550,8 +551,8 @@ function renderAll() {
             ${bootBadge}
           </div>
           <div class="controls">
-            <button class="btn-warn" onclick="restartService()">重启服务</button>
-            <button class="btn-danger" onclick="uninstallService()">取消开机自启并停止守护</button>
+            <button class="btn-warn" ${serviceOpBusy ? 'disabled' : ''} onclick="restartService()">重启服务</button>
+            <button class="btn-danger" ${serviceOpBusy ? 'disabled' : ''} onclick="uninstallService()">取消开机自启并停止守护</button>
           </div>
         </div>
         <div class="meta">
@@ -574,8 +575,8 @@ function renderAll() {
             <span class="pill ${autoSt.recommended ? 'pill-l2' : 'pill-l0'}">${autoSt.recommended ? '未配置（固定域名推荐开启）' : '未配置'}</span>
           </div>
           <div class="controls">
-            <button onclick="copyText('${esc(hintCmd)}')">复制安装命令</button>
-            <button class="btn-danger" onclick="uninstallService()">停止当前进程</button>
+            <button data-copy="${esc(hintCmd)}" onclick="copyText(this.dataset.copy)">复制安装命令</button>
+            <button class="btn-danger" ${serviceOpBusy ? 'disabled' : ''} onclick="uninstallService()">停止当前进程</button>
           </div>
         </div>
         <div style="font-size:12.5px;color:var(--muted);margin-top:6px;">
@@ -732,25 +733,38 @@ async function disconnectRelay() {
   }
 }
 async function restartService() {
+  if (serviceOpBusy) return;
   if (!confirm('确认重启 NodeBridge 守护进程？重启期间本地控制台与远程隧道会短暂断开数秒并自动恢复。')) return;
+  serviceOpBusy = true;
+  renderAll();
   try {
     const res = await api('/api/service/restart', { method: 'POST' });
-    alert(res.message || '已触发守护进程重启，请等待数秒后刷新页面。');
-    setTimeout(() => refreshState().catch(() => {}), 3000);
+    alert(res.message || '已触发守护进程重启，请等待数秒后自动重连。');
+    setTimeout(() => {
+      serviceOpBusy = false;
+      refreshState().catch(() => { renderAll(); });
+    }, 3000);
   } catch (e) {
+    serviceOpBusy = false;
+    renderAll();
     alert(e.message);
   }
 }
 async function uninstallService() {
+  if (serviceOpBusy) return;
   const installed = !!(state.autostart && state.autostart.installed);
   const msg = installed
     ? '确认取消开机自启动并立即停止守护进程？\n执行后宿主机重启将不再自动拉起 NodeBridge，且当前控制台会立即断开连接。'
     : '确认立即优雅停止当前 NodeBridge 进程？停止后控制台将断开连接。';
   if (!confirm(msg)) return;
+  serviceOpBusy = true;
+  renderAll();
   try {
     const res = await api('/api/service/uninstall', { method: 'POST', body: JSON.stringify({ purge_env: false }) });
     alert(res.message || '已下发停止/卸载指令。');
   } catch (e) {
+    serviceOpBusy = false;
+    renderAll();
     alert(e.message);
   }
 }

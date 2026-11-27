@@ -43,10 +43,8 @@ func RenderSystemdUnit(opts InstallOptions, scope Scope) string {
 	sb.WriteString("RestartSec=5s\n")
 	sb.WriteString("KillMode=mixed\n")
 	sb.WriteString("TimeoutStopSec=15s\n")
-	if strings.TrimSpace(opts.LogFilePath) != "" {
-		sb.WriteString(fmt.Sprintf("StandardOutput=append:%s\n", sanitizeUnitValue(opts.LogFilePath)))
-		sb.WriteString(fmt.Sprintf("StandardError=append:%s\n", sanitizeUnitValue(opts.LogFilePath)))
-	}
+	// 常规日志由进程内 RotatingLogWriter 独立写入 opts.LogFilePath 并轮转；
+	// 不再将 StandardOutput/StandardError 指向同一 daemon.log，避免双写、旧版 systemd 兼容性及轮转后旧 fd 泄漏。
 	sb.WriteString("\n[Install]\n")
 	sb.WriteString(fmt.Sprintf("WantedBy=%s\n", wantedBy))
 	return sb.String()
@@ -94,10 +92,12 @@ func RenderLaunchdPlist(opts InstallOptions, scope Scope) string {
 	sb.WriteString("  <integer>5</integer>\n")
 
 	if strings.TrimSpace(opts.LogFilePath) != "" {
+		// 进程内 RotatingLogWriter 负责 daemon.log 轮转写入；launchd 标准输出仅写入独立的早期崩溃兜底文件，避免双写与轮转 fd 泄漏
+		crashLog := strings.TrimSuffix(opts.LogFilePath, ".log") + ".launchd.log"
 		sb.WriteString("  <key>StandardOutPath</key>\n")
-		sb.WriteString("  <string>" + xmlEscape(opts.LogFilePath) + "</string>\n")
+		sb.WriteString("  <string>" + xmlEscape(crashLog) + "</string>\n")
 		sb.WriteString("  <key>StandardErrorPath</key>\n")
-		sb.WriteString("  <string>" + xmlEscape(opts.LogFilePath) + "</string>\n")
+		sb.WriteString("  <string>" + xmlEscape(crashLog) + "</string>\n")
 	}
 
 	sb.WriteString("</dict>\n")
@@ -191,10 +191,11 @@ func RenderWindowsTaskXML(opts InstallOptions, userID string, conhostPath string
 
 func quoteSystemdArg(arg string) string {
 	cleaned := sanitizeUnitValue(arg)
-	// systemd ExecStart 对包含空格、引号、反斜杠或 % 的参数使用双引号与转义
+	// systemd ExecStart 对包含空格、引号、反斜杠、% 或 $ 的参数进行严格转义（$$ 防止环境变量展开，%% 防止 specifier 展开）
 	escaped := strings.ReplaceAll(cleaned, `\`, `\\`)
 	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
 	escaped = strings.ReplaceAll(escaped, `%`, `%%`)
+	escaped = strings.ReplaceAll(escaped, `$`, `$$`)
 	if strings.ContainsAny(escaped, " \t\"'\\$") {
 		return `"` + escaped + `"`
 	}

@@ -32,6 +32,15 @@ func TestValidateServiceNameAndScope(t *testing.T) {
 	if _, err := ParseScope("global"); err == nil {
 		t.Fatalf("应拒绝非法 scope")
 	}
+
+	if u, err := ValidateRunAsUser("alice_01"); err != nil || u != "alice_01" {
+		t.Fatalf("合法 RunAsUser 校验失败: u=%q err=%v", u, err)
+	}
+	for _, badUser := range []string{"alice\nExecStart=/bin/sh", "bad user", "root;id"} {
+		if _, err := ValidateRunAsUser(badUser); err == nil {
+			t.Fatalf("应拒绝非法 RunAsUser %q", badUser)
+		}
+	}
 }
 
 func TestValidateRelayModeForAutostart(t *testing.T) {
@@ -113,10 +122,11 @@ func TestEnvFileWriteParseBuildAndLoad(t *testing.T) {
 		t.Fatalf("解析结果与写入不一致: %+v", parsed)
 	}
 
-	// 验证 LoadIntoProcessEnv 不覆盖当前进程已有变量，仅填充空变量
+	// 验证 LoadIntoProcessEnv 返回新注入的键名列表，且不覆盖当前进程已有变量
 	t.Setenv("NB_TEST_TUNNEL_TOK", "explicit-override")
 	t.Setenv("CUSTOM_FLAG", "")
-	if _, err := LoadIntoProcessEnv(envPath); err != nil {
+	injected, err := LoadIntoProcessEnv(envPath)
+	if err != nil {
 		t.Fatalf("LoadIntoProcessEnv 失败: %v", err)
 	}
 	if os.Getenv("NB_TEST_TUNNEL_TOK") != "explicit-override" {
@@ -124,6 +134,27 @@ func TestEnvFileWriteParseBuildAndLoad(t *testing.T) {
 	}
 	if os.Getenv("CUSTOM_FLAG") != "hello world" {
 		t.Fatalf("应填充未设置的环境变量，实际: %q", os.Getenv("CUSTOM_FLAG"))
+	}
+	if len(injected) != 1 || injected[0] != "CUSTOM_FLAG" {
+		t.Fatalf("期望返回新注入的非 PATH 键名 [CUSTOM_FLAG]，实际: %v", injected)
+	}
+
+	// 回归测试（P1-3）：终端轮换新 Token 后重装，必须优先采纳当前终端环境变量而非旧 service.env 中的失效值
+	t.Setenv("NB_TEST_TUNNEL_TOK", "rotated-new-token-999")
+	rotatedMap, err := BuildServiceEnv(cfg, envPath, nil)
+	if err != nil {
+		t.Fatalf("轮换后 BuildServiceEnv 失败: %v", err)
+	}
+	if rotatedMap["NB_TEST_TUNNEL_TOK"] != "rotated-new-token-999" {
+		t.Fatalf("当前终端新 Token 必须覆盖旧 service.env 值，实际: %q", rotatedMap["NB_TEST_TUNNEL_TOK"])
+	}
+	// extraEnv 优先级高于当前终端环境变量
+	overrideMap, err := BuildServiceEnv(cfg, envPath, map[string]string{"NB_TEST_TUNNEL_TOK": "extra-override-token"})
+	if err != nil {
+		t.Fatalf("extraEnv 覆盖 BuildServiceEnv 失败: %v", err)
+	}
+	if overrideMap["NB_TEST_TUNNEL_TOK"] != "extra-override-token" {
+		t.Fatalf("extraEnv 必须拥有最高优先级，实际: %q", overrideMap["NB_TEST_TUNNEL_TOK"])
 	}
 
 	// 验证缺失 env: 变量时明确报错
@@ -218,8 +249,10 @@ func TestRenderTemplatesCrossPlatform(t *testing.T) {
 		RunAsUser:      "alice",
 	}
 
-	// 1. Linux systemd system unit
-	unit := RenderSystemdUnit(opts, ScopeSystem)
+	// 1. Linux systemd system unit（验证 $ -> $$ 与 % -> %% 转义，且不与 RotatingLogWriter 共享 StandardOutput）
+	optsWithSpecial := opts
+	optsWithSpecial.ConfigPath = `/home/alice/$100%dir/nodebridge.yaml`
+	unit := RenderSystemdUnit(optsWithSpecial, ScopeSystem)
 	for _, must := range []string{
 		"After=network-online.target",
 		"User=alice",
@@ -227,14 +260,18 @@ func TestRenderTemplatesCrossPlatform(t *testing.T) {
 		"RestartSec=5s",
 		"--managed",
 		`"/opt/my apps/nodebridge"`,
+		`$$100%%dir`,
 		"WantedBy=multi-user.target",
 	} {
 		if !strings.Contains(unit, must) {
 			t.Fatalf("systemd unit 缺少关键字段 %q:\n%s", must, unit)
 		}
 	}
+	if strings.Contains(unit, "StandardOutput=append:") {
+		t.Fatalf("systemd unit 不应将 StandardOutput=append 指向 daemon.log 导致双写与 fd 泄漏:\n%s", unit)
+	}
 
-	// 2. macOS launchd plist
+	// 2. macOS launchd plist（验证独立崩溃兜底日志 .launchd.log）
 	plist := RenderLaunchdPlist(opts, ScopeSystem)
 	for _, must := range []string{
 		"<string>io.nodebridge.nodebridge</string>",
@@ -243,6 +280,7 @@ func TestRenderTemplatesCrossPlatform(t *testing.T) {
 		"<string>--managed</string>",
 		"<key>RunAtLoad</key>",
 		"<key>KeepAlive</key>",
+		"daemon.launchd.log",
 		"<true/>",
 	} {
 		if !strings.Contains(plist, must) {

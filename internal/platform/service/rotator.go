@@ -11,9 +11,10 @@ import (
 
 // RotatingLogWriter 实现线程安全的按单文件大小自动轮转的守护进程日志写入器。
 type RotatingLogWriter struct {
-	path       string
-	maxBytes   int64
-	maxBackups int
+	path               string
+	maxBytes           int64
+	rotateBackoffUntil int64
+	maxBackups         int
 
 	mu   sync.Mutex
 	file *os.File
@@ -66,7 +67,11 @@ func (w *RotatingLogWriter) Write(p []byte) (int, error) {
 			return 0, err
 		}
 	}
-	if w.size+int64(len(p)) > w.maxBytes && w.size > 0 {
+	threshold := w.maxBytes
+	if w.rotateBackoffUntil > threshold {
+		threshold = w.rotateBackoffUntil
+	}
+	if w.size+int64(len(p)) > threshold && w.size > 0 {
 		if err := w.rotateLocked(); err != nil {
 			return 0, err
 		}
@@ -81,6 +86,7 @@ func (w *RotatingLogWriter) rotateLocked() error {
 		_ = w.file.Close()
 		w.file = nil
 	}
+	rotated := true
 	for i := w.maxBackups; i >= 1; i-- {
 		src := w.path
 		if i > 1 {
@@ -89,10 +95,21 @@ func (w *RotatingLogWriter) rotateLocked() error {
 		dst := fmt.Sprintf("%s.%d", w.path, i)
 		if _, err := os.Stat(src); err == nil {
 			_ = os.Remove(dst)
-			_ = os.Rename(src, dst)
+			if err := os.Rename(src, dst); err != nil && i == 1 {
+				// Windows 上若当前日志文件正被外部工具占用导致重命名失败，避免后续每次 Write 反复开关文件
+				rotated = false
+			}
 		}
 	}
-	return w.openLocked()
+	if err := w.openLocked(); err != nil {
+		return err
+	}
+	if rotated {
+		w.rotateBackoffUntil = 0
+	} else {
+		w.rotateBackoffUntil = w.size + w.maxBytes
+	}
+	return nil
 }
 
 // Close 关闭底层日志文件句柄。
@@ -111,6 +128,9 @@ func (w *RotatingLogWriter) Close() error {
 func TailFile(path string, maxLines int) ([]string, error) {
 	if maxLines <= 0 {
 		maxLines = 100
+	}
+	if maxLines > 10000 {
+		maxLines = 10000
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -134,17 +154,25 @@ func TailFile(path string, maxLines int) ([]string, error) {
 func scanTailLines(r io.Reader, maxLines int) ([]string, error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 16*1024), 512*1024)
-	ring := make([]string, 0, maxLines)
+	ring := make([]string, maxLines)
+	head := 0
+	count := 0
 	for sc.Scan() {
-		if len(ring) < maxLines {
-			ring = append(ring, sc.Text())
-		} else {
-			copy(ring, ring[1:])
-			ring[maxLines-1] = sc.Text()
+		ring[head] = sc.Text()
+		head = (head + 1) % maxLines
+		if count < maxLines {
+			count++
 		}
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
-	return ring, nil
+	out := make([]string, 0, count)
+	if count < maxLines {
+		out = append(out, ring[:count]...)
+	} else {
+		out = append(out, ring[head:]...)
+		out = append(out, ring[:head]...)
+	}
+	return out, nil
 }
