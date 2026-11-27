@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,7 @@ type Config struct {
 	Security   SecurityConfig    `yaml:"security"`
 	Workspaces []WorkspaceConfig `yaml:"workspaces"`
 	Relay      RelayConfig       `yaml:"relay"`
+	OAuth      OAuthConfig       `yaml:"oauth"`
 }
 
 // ServerConfig 定义本地 MCP 服务与管理控制台监听配置。
@@ -41,11 +43,18 @@ type StorageConfig struct {
 	AuditMaxBackups int    `yaml:"audit_max_backups"`
 }
 
-// ApprovalConfig 定义人工审批等待与限时授权策略。
+// ApprovalConfig 定义人工审批等待、远程短窗口与限时授权策略。
 type ApprovalConfig struct {
-	// TimeoutSeconds 为审批等待超时秒数。0 表示无限等待用户批准或拒绝。
-	TimeoutSeconds  int `yaml:"timeout_seconds"`
+	// TimeoutSeconds 为本地审批等待超时秒数。0 表示无限等待用户批准或拒绝。
+	TimeoutSeconds int `yaml:"timeout_seconds"`
+	// MaxGrantMinutes 为 L1 限时批量授权允许的最大时长（分钟）。
 	MaxGrantMinutes int `yaml:"max_grant_minutes"`
+	// RemoteWaitSeconds 为远程客户端同步等待审批的短窗口秒数（超时后转为异步续接，不销毁审批单）。
+	RemoteWaitSeconds int `yaml:"remote_wait_seconds"`
+	// PendingTTLSeconds 为远程异步续接审批单在本地控制台保留的最大秒数。
+	PendingTTLSeconds int `yaml:"pending_ttl_seconds"`
+	// IdempotencyTTLSeconds 为远程调用指纹幂等缓存窗口（秒），防止断线重发重复执行。
+	IdempotencyTTLSeconds int `yaml:"idempotency_ttl_seconds"`
 }
 
 // TasksConfig 定义异步终端任务并发、超时与输出截断上限。
@@ -85,12 +94,78 @@ type WorkspaceConfig struct {
 	DenyGlobs []string `yaml:"deny_globs"`
 }
 
-// RelayConfig 预留阶段二远程隧道/Relay 接入配置。
+const (
+	RelayModeDisabled         = "disabled"
+	RelayModeCloudflaredQuick = "cloudflared_quick"
+	RelayModeCloudflaredNamed = "cloudflared_named"
+	RelayModeExternal         = "external"
+)
+
+// RelayConfig 定义阶段二远程隧道与公网反代接入配置。
 type RelayConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	Provider string `yaml:"provider"`
-	Endpoint string `yaml:"endpoint"`
-	DeviceID string `yaml:"device_id"`
+	// Mode 指定远程接入模式：disabled / cloudflared_quick / cloudflared_named / external。
+	Mode string `yaml:"mode"`
+	// Enabled 为阶段一兼容字段；当 Mode 为空且 Enabled=true 时自动按 Provider 推导。
+	Enabled bool `yaml:"enabled,omitempty"`
+	// Provider 为阶段一兼容字段。
+	Provider string `yaml:"provider,omitempty"`
+	// Endpoint 为阶段一兼容字段。
+	Endpoint string `yaml:"endpoint,omitempty"`
+	// PublicURL 为对外暴露的可信 HTTPS 公网基地址（cloudflared_named / external 必填；quick 模式自动发现）。
+	PublicURL string `yaml:"public_url,omitempty"`
+	// TunnelToken 为 Cloudflare Named Tunnel 令牌，支持 "env:VAR_NAME" 从环境变量读取。
+	TunnelToken string `yaml:"tunnel_token,omitempty"`
+	// CloudflaredBin 指定本机 cloudflared 可执行文件路径（为空时自动从 PATH 查找）。
+	CloudflaredBin string `yaml:"cloudflared_bin,omitempty"`
+	// KillAllDisconnectTunnel 为 true 时，触发 Kill All 一键急停将同时强制断开远程隧道。
+	KillAllDisconnectTunnel bool `yaml:"kill_all_disconnect_tunnel,omitempty"`
+	// DeviceID 为可选手动指定的设备标识；为空时自动生成并持久化到 data_dir/device.json。
+	DeviceID string `yaml:"device_id,omitempty"`
+}
+
+// EffectiveMode 返回规范化后的远程接入模式（向后兼容阶段一配置）。
+func (r RelayConfig) EffectiveMode() string {
+	m := strings.ToLower(strings.TrimSpace(r.Mode))
+	if m != "" {
+		return m
+	}
+	if !r.Enabled {
+		return RelayModeDisabled
+	}
+	switch strings.ToLower(strings.TrimSpace(r.Provider)) {
+	case "cloudflared_named", "named":
+		return RelayModeCloudflaredNamed
+	case "external":
+		return RelayModeExternal
+	case "cloudflared", "cloudflared_quick", "quick", "":
+		return RelayModeCloudflaredQuick
+	default:
+		return strings.ToLower(strings.TrimSpace(r.Provider))
+	}
+}
+
+// ResolvedTunnelToken 解析 TunnelToken，支持 "env:ENV_VAR" 语法避免在配置文件中明文存储。
+func (r RelayConfig) ResolvedTunnelToken() string {
+	raw := strings.TrimSpace(r.TunnelToken)
+	if strings.HasPrefix(raw, "env:") {
+		key := strings.TrimSpace(strings.TrimPrefix(raw, "env:"))
+		if key == "" {
+			return ""
+		}
+		return strings.TrimSpace(os.Getenv(key))
+	}
+	return raw
+}
+
+// OAuthConfig 定义内置单用户 OAuth 2.1 授权服务器配置。
+type OAuthConfig struct {
+	Enabled                  bool     `yaml:"enabled"`
+	AccessTokenTTLSeconds    int      `yaml:"access_token_ttl_seconds"`
+	RefreshTokenTTLSeconds   int      `yaml:"refresh_token_ttl_seconds"`
+	PairingCodeTTLSeconds    int      `yaml:"pairing_code_ttl_seconds"`
+	AllowDynamicRegistration bool     `yaml:"allow_dynamic_registration"`
+	AllowedRedirectURIs      []string `yaml:"allowed_redirect_uris,omitempty"`
+	RateLimitPerMinute       int      `yaml:"rate_limit_per_minute"`
 }
 
 // DefaultGlobalDenyGlobs 返回默认禁止访问的敏感文件通配符列表。
@@ -149,8 +224,11 @@ func DefaultConfig(workspaceRoot string) (*Config, error) {
 			AuditMaxBackups: 10,
 		},
 		Approval: ApprovalConfig{
-			TimeoutSeconds:  0,
-			MaxGrantMinutes: 60,
+			TimeoutSeconds:        0,
+			MaxGrantMinutes:       60,
+			RemoteWaitSeconds:     45,
+			PendingTTLSeconds:     900,
+			IdempotencyTTLSeconds: 300,
 		},
 		Tasks: TasksConfig{
 			MaxConcurrent:         4,
@@ -190,7 +268,16 @@ func DefaultConfig(workspaceRoot string) (*Config, error) {
 			},
 		},
 		Relay: RelayConfig{
+			Mode:    RelayModeDisabled,
 			Enabled: false,
+		},
+		OAuth: OAuthConfig{
+			Enabled:                  false,
+			AccessTokenTTLSeconds:    3600,
+			RefreshTokenTTLSeconds:   604800,
+			PairingCodeTTLSeconds:    300,
+			AllowDynamicRegistration: true,
+			RateLimitPerMinute:       20,
 		},
 	}, nil
 }
@@ -263,6 +350,37 @@ func (c *Config) ApplyDefaults(baseDir string) {
 	if c.Approval.MaxGrantMinutes <= 0 {
 		c.Approval.MaxGrantMinutes = 60
 	}
+	if c.Approval.RemoteWaitSeconds <= 0 {
+		c.Approval.RemoteWaitSeconds = 45
+	}
+	if c.Approval.PendingTTLSeconds <= 0 {
+		c.Approval.PendingTTLSeconds = 900
+	}
+	if c.Approval.IdempotencyTTLSeconds <= 0 {
+		c.Approval.IdempotencyTTLSeconds = 300
+	}
+	c.Relay.Mode = c.Relay.EffectiveMode()
+	c.Relay.PublicURL = strings.TrimRight(strings.TrimSpace(c.Relay.PublicURL), "/")
+	if c.Relay.Mode != RelayModeDisabled && !c.OAuth.Enabled {
+		// 启用远程通道时默认开启内置 OAuth 2.1 以兼容云端网页端 MCP 客户端
+		c.OAuth.Enabled = true
+	}
+	if c.OAuth.AccessTokenTTLSeconds <= 0 {
+		c.OAuth.AccessTokenTTLSeconds = 3600
+	}
+	if c.OAuth.RefreshTokenTTLSeconds <= 0 {
+		c.OAuth.RefreshTokenTTLSeconds = 604800
+	}
+	if c.OAuth.PairingCodeTTLSeconds <= 0 {
+		c.OAuth.PairingCodeTTLSeconds = 300
+	}
+	if c.OAuth.RateLimitPerMinute <= 0 {
+		c.OAuth.RateLimitPerMinute = 20
+	}
+	if c.OAuth.Enabled && !c.OAuth.AllowDynamicRegistration && len(c.OAuth.AllowedRedirectURIs) == 0 {
+		// 兼容旧配置文件未显式设置 allow_dynamic_registration 时的默认开启
+		c.OAuth.AllowDynamicRegistration = true
+	}
 	if c.Tasks.MaxConcurrent <= 0 {
 		c.Tasks.MaxConcurrent = 4
 	}
@@ -322,6 +440,49 @@ func (c *Config) Validate() error {
 		if strings.TrimSpace(ws.Root) == "" {
 			return fmt.Errorf("工作区 %s 的 root 路径不能为空", ws.ID)
 		}
+	}
+
+	// 校验阶段二远程通道配置
+	switch mode := c.Relay.EffectiveMode(); mode {
+	case RelayModeDisabled:
+		// 未启用远程通道，无需额外校验
+	case RelayModeCloudflaredQuick:
+		if c.Relay.PublicURL != "" {
+			if err := validateHTTPSURL("relay.public_url", c.Relay.PublicURL); err != nil {
+				return err
+			}
+		}
+	case RelayModeCloudflaredNamed:
+		if err := validateHTTPSURL("relay.public_url", c.Relay.PublicURL); err != nil {
+			return err
+		}
+		if c.Relay.ResolvedTunnelToken() == "" {
+			return errors.New("relay.mode=cloudflared_named 时必须配置 relay.tunnel_token（支持 env:VAR_NAME）")
+		}
+	case RelayModeExternal:
+		if err := validateHTTPSURL("relay.public_url", c.Relay.PublicURL); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("不支持的 relay.mode: %q（可选值: disabled / cloudflared_quick / cloudflared_named / external）", mode)
+	}
+	return nil
+}
+
+func validateHTTPSURL(field, raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fmt.Errorf("%s 不能为空", field)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s URL 格式无效: %w", field, err)
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return fmt.Errorf("%s 必须使用 https:// 协议（禁止明文公网传输）", field)
+	}
+	if strings.TrimSpace(u.Host) == "" {
+		return fmt.Errorf("%s 缺少主机名", field)
 	}
 	return nil
 }

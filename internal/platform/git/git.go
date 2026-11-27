@@ -44,12 +44,14 @@ type DiffResult struct {
 	Diff        string `json:"diff"`
 }
 
-// ApplyPatchResult 表示 git.apply_patch 的执行结果。
+// ApplyPatchResult 表示 git.apply_patch 的执行结果（或远程异步等待审批时的挂起提示）。
 type ApplyPatchResult struct {
 	Source        string   `json:"source"`
 	WorkspaceID   string   `json:"workspace_id"`
 	AffectedFiles []string `json:"affected_files"`
 	Message       string   `json:"message"`
+	Pending       bool     `json:"pending,omitempty"`
+	ApprovalID    string   `json:"approval_id,omitempty"`
 }
 
 // NewAdapter 创建受控 Git 适配器。

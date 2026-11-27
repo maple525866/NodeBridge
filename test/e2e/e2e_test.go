@@ -177,13 +177,13 @@ func TestStageOneEndToEndMCPWorkflow(t *testing.T) {
 	}
 	defer cs.Close()
 
-	// 验证全部 10 个 P0 工具均已暴露
+	// 验证全部 11 个工具（10 个 P0 工具 + 阶段二 approval.status）均已暴露
 	listToolsRes, err := cs.ListTools(ctx, &mcp.ListToolsParams{})
 	if err != nil {
 		t.Fatalf("ListTools 失败: %v", err)
 	}
-	if len(listToolsRes.Tools) != 10 {
-		t.Fatalf("期望暴露 10 个 P0 工具，实际 %d", len(listToolsRes.Tools))
+	if len(listToolsRes.Tools) != 11 {
+		t.Fatalf("期望暴露 11 个 MCP 工具，实际 %d", len(listToolsRes.Tools))
 	}
 
 	// 辅助函数：调用本地管理 API
