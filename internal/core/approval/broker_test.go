@@ -173,3 +173,82 @@ func TestRemoteHybridApprovalAsyncContinuationAndIdempotency(t *testing.T) {
 		t.Fatalf("期望幂等命中缓存且不再重复执行: err=%v out=%+v execCalls=%d", err, outReplay, execCalls)
 	}
 }
+
+func TestFullPermissionsAutoApproveAndRespectsPause(t *testing.T) {
+	broker := NewBroker(0, 30, nil)
+
+	// 1. 先挂起一条 L2 待审批请求
+	pendingDone := make(chan Decision, 1)
+	go func() {
+		dec, err := broker.RequestApproval(context.Background(), Request{
+			Tool:        "terminal.start",
+			WorkspaceID: "demo",
+			RiskLevel:   policy.RiskL2,
+		})
+		if err != nil {
+			t.Errorf("开启全权限自动放行时不应报错: %v", err)
+		}
+		pendingDone <- dec
+	}()
+	for i := 0; i < 40 && len(broker.Pending()) == 0; i++ {
+		time.Sleep(15 * time.Millisecond)
+	}
+	if len(broker.Pending()) != 1 {
+		t.Fatalf("期望存在 1 条挂起审批单")
+	}
+
+	// 2. 开启全权限模式 -> 自动批准当前挂起队列
+	autoApproved := broker.SetFullPermissions(true)
+	if autoApproved != 1 {
+		t.Fatalf("期望自动批准 1 条挂起审批，实际 %d", autoApproved)
+	}
+	dec := <-pendingDone
+	if !dec.Approved || dec.DecisionTag != "AUTO_ALLOW_FULL_PERMISSIONS" {
+		t.Fatalf("期望挂起审批单被全权限自动放行，实际: %+v", dec)
+	}
+
+	// 3. 远程 L3 操作也直接免审批执行，不进入等待队列
+	out, err := broker.ExecuteWithApproval(context.Background(), Request{
+		ClientID:    "cli_remote",
+		IsRemote:    true,
+		Fingerprint: ComputeFingerprint("cli_remote", "terminal.start", "demo", "cmd"),
+		Tool:        "terminal.start",
+		WorkspaceID: "demo",
+		RiskLevel:   policy.RiskL3,
+	}, func() (any, error) {
+		return "executed", nil
+	}, nil)
+	if err != nil || out.Pending || out.Result != "executed" || out.Decision.DecisionTag != "AUTO_ALLOW_FULL_PERMISSIONS" {
+		t.Fatalf("全权限模式下远程调用应直接放行执行: err=%v out=%+v", err, out)
+	}
+
+	// 4. 急停暂停仍然高于全权限模式
+	broker.Pause("紧急暂停")
+	if _, err := broker.RequestApproval(context.Background(), Request{Tool: "workspace.patch", RiskLevel: policy.RiskL1}); err == nil {
+		t.Fatalf("急停暂停状态必须仍然拦截请求")
+	}
+
+	// 5. 已过期的历史待审批单在开启全权限时绝不能被误批执行
+	broker2 := NewBroker(0, 30, nil)
+	broker2.ConfigureRemote(1, 1, 60)
+	executed := false
+	_, _ = broker2.ExecuteWithApproval(context.Background(), Request{
+		ClientID:    "cli_expire",
+		IsRemote:    true,
+		Fingerprint: "fp_expire",
+		Tool:        "workspace.patch",
+		WorkspaceID: "demo",
+		RiskLevel:   policy.RiskL1,
+	}, func() (any, error) {
+		executed = true
+		return "should-not-run", nil
+	}, nil)
+	time.Sleep(1100 * time.Millisecond)
+	if n := broker2.SetFullPermissions(true); n != 0 {
+		t.Fatalf("已过期审批单不应被 SetFullPermissions 自动批准，实际 n=%d", n)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if executed {
+		t.Fatalf("已过期审批单的回调绝不能被执行")
+	}
+}

@@ -75,6 +75,8 @@ func main() {
 		err = runTunnel(args)
 	case "clients":
 		err = runClients(args)
+	case "mode":
+		err = runMode(args)
 	case "doctor":
 		err = runDoctor(args)
 	case "version", "-v", "--version":
@@ -107,6 +109,7 @@ func printUsage() {
   pair       生成 5 分钟一次性 OAuth 2.1 配对码（支持 --readonly 与 --workspaces 限定范围）
   tunnel     查看、启动或一键断开远程公网隧道（status | connect | disconnect）
   clients    管理已绑定的远程 OAuth 2.1 客户端（list | revoke <client_id> | revoke-all）
+  mode       查看或切换“全部权限（免审批）”与“默认全部目录”运行模式
   doctor     全面自检本地 Daemon、cloudflared、公网 HTTPS 隧道及 OAuth 2.1 发现元数据
   approve    在命令行批准指定审批单（支持 --grant-minutes 授予 L1 限时批量授权）
   reject     在命令行拒绝指定审批单
@@ -199,9 +202,22 @@ func runDaemon(args []string) error {
 		return err
 	}
 
+	secMode, err := store.LoadSecurityMode(cfg.Storage.DataDir, cfg.Security.FullPermissions, cfg.Security.AllowAllDirs)
+	if err != nil {
+		log.Printf("[警告] 读取历史安全模式失败，将使用配置文件默认值: %v", err)
+	} else if store.SecurityModeExists(cfg.Storage.DataDir) &&
+		(secMode.FullPermissions != cfg.Security.FullPermissions || secMode.AllowAllDirs != cfg.Security.AllowAllDirs) {
+		log.Printf("[注意] 已从 %s/security_mode.json 加载上次控制台保存的安全模式（full_permissions=%v, allow_all_dirs=%v），覆盖了 YAML 中的默认配置",
+			cfg.Storage.DataDir, secMode.FullPermissions, secMode.AllowAllDirs)
+	}
+	fsMgr.SetFullPermissions(secMode.FullPermissions)
+	fsMgr.SetAllowAllDirs(secMode.AllowAllDirs)
+
 	policyEng := policy.NewEngine(cfg.Security)
+	policyEng.SetFullPermissions(secMode.FullPermissions)
 	broker := approval.NewBroker(cfg.Approval.TimeoutSeconds, cfg.Approval.MaxGrantMinutes, taskMgr.CancelAll)
 	broker.ConfigureRemote(cfg.Approval.RemoteWaitSeconds, cfg.Approval.PendingTTLSeconds, cfg.Approval.IdempotencyTTLSeconds)
+	broker.SetFullPermissions(secMode.FullPermissions)
 
 	relayConn, err := relay.NewConnector(cfg.Relay, cfg.Server.MCPListen, deviceIdent.DeviceID)
 	if err != nil {
@@ -255,6 +271,7 @@ func runDaemon(args []string) error {
 		relayConn,
 	)
 	adminSrv.AttachRemoteGovernance(deviceIdent.DeviceID, oauthSrv, cfg.Relay.KillAllDisconnectTunnel)
+	adminSrv.AttachSecurityControl(policyEng, cfg.Storage.DataDir, secMode)
 
 	mcpHTTP := &http.Server{
 		Addr:              cfg.Server.MCPListen,
@@ -283,9 +300,9 @@ func runDaemon(args []string) error {
 	}()
 	go func() {
 		log.Printf("[NodeBridge] 本地安全审批控制台已启动: http://%s/", cfg.Server.AdminListen)
-		log.Printf("[NodeBridge] 设备 ID=%s | %s/%s | Git=%v | Shell=%s | 工作区=%d | Relay=%s | OAuth2.1=%v",
+		log.Printf("[NodeBridge] 设备 ID=%s | %s/%s | Git=%v | Shell=%s | 工作区=%d | 全部权限=%v | 全部目录=%v | Relay=%s | OAuth2.1=%v",
 			deviceIdent.DeviceID, capInfo.OS, capInfo.Arch, capInfo.GitAvailable, capInfo.DefaultShell,
-			len(cfg.Workspaces), cfg.Relay.EffectiveMode(), oauthSrv != nil)
+			len(cfg.Workspaces), secMode.FullPermissions, secMode.AllowAllDirs, cfg.Relay.EffectiveMode(), oauthSrv != nil)
 		if err := adminHTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("Admin Web 服务异常退出: %w", err)
 		}
@@ -514,6 +531,55 @@ func runClients(args []string) error {
 	default:
 		return errors.New("用法: nodebridge clients [list|revoke <client_id>|revoke-all] [--config nodebridge.yaml]")
 	}
+}
+
+func runMode(args []string) error {
+	fs := flag.NewFlagSet("mode", flag.ExitOnError)
+	cfgPath := fs.String("config", "nodebridge.yaml", "YAML 配置文件路径")
+	fullPerms := fs.String("full-permissions", "", "设置全部权限免审批模式: true | false")
+	allowAllDirs := fs.String("allow-all-dirs", "", "设置默认全部目录模式: true | false")
+	_ = fs.Parse(args)
+	if fs.NArg() > 0 {
+		return fmt.Errorf("不支持的位置参数 %v，用法: nodebridge mode [--config nodebridge.yaml] [--full-permissions=true|false] [--allow-all-dirs=true|false]", fs.Args())
+	}
+
+	payload := map[string]any{}
+	if v := strings.TrimSpace(*fullPerms); v != "" {
+		switch strings.ToLower(v) {
+		case "true", "1", "on":
+			payload["full_permissions"] = true
+		case "false", "0", "off":
+			payload["full_permissions"] = false
+		default:
+			return fmt.Errorf("无效的 --full-permissions 值 %q，可选 true/false", v)
+		}
+	}
+	if v := strings.TrimSpace(*allowAllDirs); v != "" {
+		switch strings.ToLower(v) {
+		case "true", "1", "on":
+			payload["allow_all_dirs"] = true
+		case "false", "0", "off":
+			payload["allow_all_dirs"] = false
+		default:
+			return fmt.Errorf("无效的 --allow-all-dirs 值 %q，可选 true/false", v)
+		}
+	}
+
+	if len(payload) == 0 {
+		raw, err := callAdminAPI(*cfgPath, http.MethodGet, "/api/security/mode", nil)
+		if err != nil {
+			return err
+		}
+		fmt.Println(prettyJSON(raw))
+		return nil
+	}
+
+	raw, err := callAdminAPI(*cfgPath, http.MethodPost, "/api/security/mode", payload)
+	if err != nil {
+		return err
+	}
+	fmt.Println(prettyJSON(raw))
+	return nil
 }
 
 func runDoctor(args []string) error {

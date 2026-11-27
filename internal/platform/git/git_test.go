@@ -98,4 +98,29 @@ func TestGitAdapterStatusDiffAndApplyPatchSecurity(t *testing.T) {
 	if !errors.Is(err, filesystem.ErrAccessDenied) {
 		t.Fatalf("期望路径穿越补丁被 ErrAccessDenied 拦截，实际 err=%v", err)
 	}
+
+	// 3. 拦截 C-style 引号转义路径补丁（防止绕过敏感路径匹配）
+	quotedEscapePatch := "diff --git \"a/server.\\160em\" \"b/server.\\160em\"\n" +
+		"new file mode 100644\n" +
+		"--- /dev/null\n" +
+		"+++ \"b/server.\\160em\"\n" +
+		"@@ -0,0 +1 @@\n" +
+		"+FAKE\n"
+	_, err = adapter.ApplyPatch(ctx, "repo", quotedEscapePatch)
+	if !errors.Is(err, filesystem.ErrAccessDenied) {
+		t.Fatalf("期望 C-style 转义路径补丁被 ErrAccessDenied 拦截，实际 err=%v", err)
+	}
+
+	// 4. 拦截创建符号链接（new file mode 120000）补丁
+	symlinkPatch := `diff --git a/innocent_link b/innocent_link
+new file mode 120000
+--- /dev/null
++++ b/innocent_link
+@@ -0,0 +1 @@
++.env
+`
+	_, err = adapter.ApplyPatch(ctx, "repo", symlinkPatch)
+	if !errors.Is(err, filesystem.ErrAccessDenied) {
+		t.Fatalf("期望符号链接补丁 (mode 120000) 被 ErrAccessDenied 拦截，实际 err=%v", err)
+	}
 }

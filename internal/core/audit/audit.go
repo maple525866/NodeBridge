@@ -43,15 +43,37 @@ type Logger struct {
 }
 
 var (
-	// 匹配常见敏感凭据模式（Bearer Token、OpenAI/Anthropic/Google/GitHub Key、私钥块等）
+	// 匹配常见敏感凭据模式（Bearer Token、OpenAI/Anthropic/Google/GitHub/GitLab/AWS/Age Key、私钥块等，供审计日志脱敏）
 	secretPatterns = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)(bearer\s+)[a-z0-9._\-]{8,}`),
 		regexp.MustCompile(`(?i)((?:api[_-]?key|token|secret|password|passwd|cookie|authorization)["']?\s*[:=]\s*["']?)[^\s"',;]{4,}`),
 		regexp.MustCompile(`sk-[A-Za-z0-9_\-]{12,}`),
 		regexp.MustCompile(`AIza[0-9A-Za-z\-_]{20,}`),
 		regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`),
+		regexp.MustCompile(`glpat-[A-Za-z0-9_\-]{20,}`),
+		regexp.MustCompile(`AGE-SECRET-KEY-1[0-9A-Z]{20,}`),
+		regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
 		regexp.MustCompile(`nb_(?:at|rt|code|pair)_[A-Za-z0-9_\-]{8,}`),
-		regexp.MustCompile(`-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----`),
+		regexp.MustCompile(`(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----`),
+		regexp.MustCompile(`(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----[\s\S]*`),
+		regexp.MustCompile(`PuTTY-User-Key-File-\d+:[\s\S]*?(?:Private-MAC:\s*[0-9a-fA-F]+|\z)`),
+	}
+
+	// privateKeyOutputPatterns 专用于终端 stdout/stderr 实时脱敏兜底：
+	// 精确拦截完整或截断的 SSH/PEM/PGP/PuTTY 私钥块及明确格式的云端密钥，避免误伤正常代码与测试日志。
+	privateKeyOutputPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----`),
+		regexp.MustCompile(`(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----[\s\S]*`),
+		regexp.MustCompile(`PuTTY-User-Key-File-\d+:[\s\S]*?(?:Private-MAC:\s*[0-9a-fA-F]+|\z)`),
+	}
+	highConfidenceTokenPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`sk-[A-Za-z0-9_\-]{20,}`),
+		regexp.MustCompile(`AIza[0-9A-Za-z\-_]{20,}`),
+		regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`),
+		regexp.MustCompile(`glpat-[A-Za-z0-9_\-]{20,}`),
+		regexp.MustCompile(`AGE-SECRET-KEY-1[0-9A-Z]{20,}`),
+		regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		regexp.MustCompile(`nb_(?:at|rt|code|pair)_[A-Za-z0-9_\-]{8,}`),
 	}
 )
 
@@ -86,6 +108,37 @@ func Redact(input string) string {
 		default:
 			out = re.ReplaceAllString(out, "[REDACTED]")
 		}
+	}
+	return out
+}
+
+// RedactPrivateSecrets 面向终端输出与摘要的私钥/高敏密钥实时脱敏兜底，
+// 强制抹除 PEM/OpenSSH/PGP/PuTTY 私钥块（含未闭合分片）及明确格式密钥令牌。
+func RedactPrivateSecrets(input string) string {
+	if input == "" {
+		return input
+	}
+	out := input
+	upper := strings.ToUpper(out)
+	if strings.Contains(upper, "PRIVATE KEY") || strings.Contains(out, "PuTTY-User-Key-File") {
+		for _, re := range privateKeyOutputPatterns {
+			out = re.ReplaceAllString(out, "[REDACTED_PRIVATE_KEY]")
+		}
+	}
+	for _, re := range highConfidenceTokenPatterns {
+		out = re.ReplaceAllString(out, "[REDACTED_SECRET]")
+	}
+	return out
+}
+
+// RedactHighConfidenceTokens 仅脱敏单行内的明确格式高敏密钥令牌（供流式行缓冲逐行脱敏使用）。
+func RedactHighConfidenceTokens(line string) string {
+	if line == "" {
+		return line
+	}
+	out := line
+	for _, re := range highConfidenceTokenPatterns {
+		out = re.ReplaceAllString(out, "[REDACTED_SECRET]")
 	}
 	return out
 }

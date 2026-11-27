@@ -2,14 +2,18 @@
 package task
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	"nodebridge/internal/core/audit"
 	"nodebridge/internal/core/store"
 	"nodebridge/internal/platform/process"
 )
@@ -67,12 +71,27 @@ type PollResult struct {
 	ElapsedMs       int64  `json:"elapsed_ms"`
 }
 
-// cappedBuffer 为单任务提供线程安全、带容量上限与增量偏移读取的输出缓冲区。
+var (
+	rePEMBegin   = regexp.MustCompile(`(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----`)
+	rePEMEnd     = regexp.MustCompile(`(?i)-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----`)
+	rePuTTYBegin = regexp.MustCompile(`^PuTTY-User-Key-File-\d+:`)
+	rePuTTYEnd   = regexp.MustCompile(`^Private-MAC:\s*[0-9a-fA-F]+`)
+	reBase64Line = regexp.MustCompile(`^[A-Za-z0-9+/=_,:.\s\-]+$`)
+)
+
+const maxPrivateKeyBlockLines = 256
+
+// cappedBuffer 为单任务提供线程安全、带容量上限、单调递增流式私钥脱敏与增量偏移读取的输出缓冲区。
+// 通过行缓冲 + 私钥块状态机，在写入端单调追加至 buf，彻底避免分片明文泄露、偏移收缩丢数据、UTF-8 截断与 O(N^2) 重复扫描。
 type cappedBuffer struct {
-	mu        sync.Mutex
-	maxBytes  int
-	buf       []byte
-	truncated bool
+	mu                sync.Mutex
+	maxBytes          int
+	buf               []byte // 已脱敏确认安全且单调只增的输出缓冲区
+	pending           []byte // 当前尚未收到换行符的行尾待定缓冲
+	truncated         bool
+	inPEMKeyBlock     bool
+	inPuTTYKeyBlock   bool
+	keyBlockLineCount int
 }
 
 func newCappedBuffer(maxBytes int) *cappedBuffer {
@@ -86,18 +105,140 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if len(p) == 0 {
+		return 0, nil
+	}
+	b.pending = append(b.pending, p...)
+	for {
+		idx := bytes.IndexByte(b.pending, '\n')
+		if idx < 0 {
+			break
+		}
+		line := string(b.pending[:idx+1])
+		b.pending = b.pending[idx+1:]
+		b.processLineLocked(line)
+	}
+	// 防止超长无换行输出撑爆 pending 内存（保留末尾 64 字节跨分片敏感前缀检测窗口）
+	const maxPendingLine = 16 * 1024
+	if len(b.pending) > maxPendingLine {
+		cut := len(b.pending) - 64
+		// 对齐到 UTF-8 字符边界，避免切碎多字节中文
+		for cut > 0 && !utf8.RuneStart(b.pending[cut]) {
+			cut--
+		}
+		if cut > 0 {
+			chunk := string(b.pending[:cut])
+			b.pending = b.pending[cut:]
+			b.processLineLocked(chunk)
+		}
+	}
+	return len(p), nil
+}
+
+// Flush 在任务结束时冲刷最后一行无换行符的残余输出（确保经过完整脱敏）。
+func (b *cappedBuffer) Flush() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.pending) == 0 {
+		return
+	}
+	line := string(b.pending)
+	b.pending = nil
+	b.processLineLocked(line)
+}
+
+func (b *cappedBuffer) processLineLocked(line string) {
+	trimmed := strings.TrimSpace(line)
+
+	// 1. 若正处于 PEM / OpenSSH / PGP 私钥块内部
+	if b.inPEMKeyBlock {
+		b.keyBlockLineCount++
+		if rePEMEnd.MatchString(trimmed) {
+			b.inPEMKeyBlock = false
+			b.keyBlockLineCount = 0
+			return
+		}
+		// 防止未闭合私钥头吞噬后续全部正常日志：遇到明显非 Base64/Header 正文或超过上限自动退出块状态
+		if b.keyBlockLineCount > maxPrivateKeyBlockLines || (trimmed != "" && !reBase64Line.MatchString(trimmed)) {
+			b.inPEMKeyBlock = false
+			b.keyBlockLineCount = 0
+			// 当前行已是正常日志，继续向下脱敏并输出
+		} else {
+			return
+		}
+	}
+
+	// 2. 若正处于 PuTTY 私钥块内部
+	if b.inPuTTYKeyBlock {
+		b.keyBlockLineCount++
+		if rePuTTYEnd.MatchString(trimmed) {
+			b.inPuTTYKeyBlock = false
+			b.keyBlockLineCount = 0
+			return
+		}
+		if b.keyBlockLineCount > maxPrivateKeyBlockLines || (trimmed != "" && !reBase64Line.MatchString(trimmed)) {
+			b.inPuTTYKeyBlock = false
+			b.keyBlockLineCount = 0
+		} else {
+			return
+		}
+	}
+
+	// 3. 检测新进入私钥块
+	if rePEMBegin.MatchString(line) {
+		if rePEMEnd.MatchString(line) {
+			b.appendSanitizedLocked(audit.RedactPrivateSecrets(line))
+			return
+		}
+		b.inPEMKeyBlock = true
+		b.keyBlockLineCount = 0
+		loc := rePEMBegin.FindStringIndex(line)
+		prefix := ""
+		if loc != nil && loc[0] > 0 {
+			prefix = audit.RedactHighConfidenceTokens(line[:loc[0]])
+		}
+		suffix := ""
+		if strings.HasSuffix(line, "\n") {
+			suffix = "\n"
+		}
+		b.appendSanitizedLocked(prefix + "[REDACTED_PRIVATE_KEY]" + suffix)
+		return
+	}
+	if rePuTTYBegin.MatchString(trimmed) {
+		b.inPuTTYKeyBlock = true
+		b.keyBlockLineCount = 0
+		suffix := ""
+		if strings.HasSuffix(line, "\n") {
+			suffix = "\n"
+		}
+		b.appendSanitizedLocked("[REDACTED_PRIVATE_KEY]" + suffix)
+		return
+	}
+
+	// 4. 普通行：仅做高置信度 Token 脱敏后追加
+	b.appendSanitizedLocked(audit.RedactHighConfidenceTokens(line))
+}
+
+func (b *cappedBuffer) appendSanitizedLocked(s string) {
+	if s == "" {
+		return
+	}
 	rem := b.maxBytes - len(b.buf)
 	if rem <= 0 {
 		b.truncated = true
-		return len(p), nil
+		return
 	}
-	if len(p) > rem {
-		b.buf = append(b.buf, p[:rem]...)
+	if len(s) > rem {
+		// 按 UTF-8 字符边界截断，防止多字节字符乱码
+		cut := rem
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		b.buf = append(b.buf, s[:cut]...)
 		b.truncated = true
-	} else {
-		b.buf = append(b.buf, p...)
+		return
 	}
-	return len(p), nil
+	b.buf = append(b.buf, s...)
 }
 
 func (b *cappedBuffer) ReadFrom(offset int) (chunk string, nextOffset int, truncated bool) {
@@ -113,6 +254,12 @@ func (b *cappedBuffer) ReadFrom(offset int) (chunk string, nextOffset int, trunc
 	return string(b.buf[offset:]), len(b.buf), b.truncated
 }
 
+func (b *cappedBuffer) Truncated() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.truncated
+}
+
 func (b *cappedBuffer) Summary(maxChars int) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -121,7 +268,11 @@ func (b *cappedBuffer) Summary(maxChars int) string {
 	}
 	s := string(b.buf)
 	if len(s) > maxChars {
-		return s[len(s)-maxChars:]
+		start := len(s) - maxChars
+		for start < len(s) && !utf8.RuneStart(s[start]) {
+			start++
+		}
+		return s[start:]
 	}
 	return s
 }
@@ -346,15 +497,16 @@ func (m *Manager) runTask(mt *managedTask) {
 }
 
 func (m *Manager) finishTask(mt *managedTask, st Status, exitCode *int, errMsg string) {
+	mt.stdout.Flush()
+	mt.stderr.Flush()
+
 	mt.mu.Lock()
 	mt.record.Status = string(st)
 	mt.record.ExitCode = exitCode
 	mt.record.ErrorMessage = errMsg
 	mt.record.FinishedAt = time.Now().UTC()
-	_, _, stdoutTrunc := mt.stdout.ReadFrom(0)
-	_, _, stderrTrunc := mt.stderr.ReadFrom(0)
-	mt.record.StdoutTruncated = stdoutTrunc
-	mt.record.StderrTruncated = stderrTrunc
+	mt.record.StdoutTruncated = mt.stdout.Truncated()
+	mt.record.StderrTruncated = mt.stderr.Truncated()
 	summary := mt.stdout.Summary(512)
 	if summary == "" {
 		summary = mt.stderr.Summary(512)

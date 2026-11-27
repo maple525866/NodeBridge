@@ -463,3 +463,286 @@ func decodeToolJSON(t *testing.T, res *mcp.CallToolResult, target any) {
 		t.Fatalf("反序列化工具 JSON 输出失败: %v\nraw=%s", err, tc.Text)
 	}
 }
+
+func TestSecurityModeFullPermissionsAndAllDirsE2E(t *testing.T) {
+	wsDir := t.TempDir()
+	outsideDir := t.TempDir()
+	dataDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(wsDir, "inside.txt"), []byte("inside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(outsideDir, "outside.txt")
+	if err := os.WriteFile(outsideFile, []byte("outside-initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outsideSSHDir := filepath.Join(outsideDir, ".ssh")
+	if err := os.MkdirAll(outsideSSHDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outsideSSHKey := filepath.Join(outsideSSHDir, "id_rsa")
+	if err := os.WriteFile(outsideSSHKey, []byte("-----BEGIN OPENSSH PRIVATE KEY-----\nTOP_SECRET_SSH_KEY_MATERIAL\n-----END OPENSSH PRIVATE KEY-----\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.DefaultConfig(wsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Storage.DataDir = dataDir
+
+	taskStore, _ := store.NewJSONFileTaskStore(dataDir)
+	auditLog, _ := audit.NewLogger(dataDir, 10, 5)
+	fsMgr, err := filesystem.NewManager(cfg.Workspaces, cfg.Security.GlobalDenyGlobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitAdapter, _ := git.NewAdapter(fsMgr)
+	taskMgr, _ := task.NewManager(taskStore, task.Options{
+		MaxConcurrent:  2,
+		DefaultTimeout: 20 * time.Second,
+		MaxTimeout:     30 * time.Second,
+		MaxOutputBytes: 128 * 1024,
+	})
+	policyEng := policy.NewEngine(cfg.Security)
+	broker := approval.NewBroker(0, 60, taskMgr.CancelAll)
+
+	mcpSrv := mcpserver.NewMCPServer("0.2.0-e2e", tools.Deps{
+		FS:     fsMgr,
+		Git:    gitAdapter,
+		Tasks:  taskMgr,
+		Policy: policyEng,
+		Broker: broker,
+		Audit:  auditLog,
+	})
+	mcpHandler := mcpserver.NewHTTPHandler(mcpSrv, mcpserver.GatewayConfig{
+		AuthProvider:   session.NewBearerTokenAuthProvider(cfg.Server.MCPToken),
+		AllowedOrigins: cfg.Server.AllowedOrigins,
+	})
+	adminSrv := admin.NewServer(
+		cfg.Server.AdminToken,
+		"127.0.0.1:0",
+		broker,
+		taskMgr,
+		auditLog,
+		fsMgr,
+		capability.Detect(),
+		relay.DisabledConnector{},
+	)
+	adminSrv.AttachSecurityControl(policyEng, dataDir, store.SecurityMode{})
+
+	mcpTS := httptest.NewServer(mcpHandler)
+	defer mcpTS.Close()
+	adminTS := httptest.NewServer(adminSrv.Handler())
+	defer adminTS.Close()
+
+	adminCall := func(method, path string, body any) []byte {
+		t.Helper()
+		var r io.Reader
+		if body != nil {
+			b, _ := json.Marshal(body)
+			r = bytes.NewReader(b)
+		}
+		req, _ := http.NewRequest(method, adminTS.URL+path, r)
+		req.Header.Set("Authorization", "Bearer "+cfg.Server.AdminToken)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Admin API %s %s 失败: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= 400 {
+			t.Fatalf("Admin API %s %s 返回 HTTP %d: %s", method, path, resp.StatusCode, string(out))
+		}
+		return out
+	}
+
+	ctx := context.Background()
+	mcpClient := mcp.NewClient(&mcp.Implementation{Name: "e2e-mode-client", Version: "1.0.0"}, nil)
+	cs, err := mcpClient.Connect(ctx, &mcp.StreamableClientTransport{
+		Endpoint: mcpTS.URL + "/mcp",
+		HTTPClient: &http.Client{
+			Transport: &authTransport{base: http.DefaultTransport, token: cfg.Server.MCPToken},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("连接 MCP 失败: %v", err)
+	}
+	defer cs.Close()
+
+	// 1. 默认关闭时，无法读取工作区外文件
+	deniedRes, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "workspace.read",
+		Arguments: map[string]any{"workspace_id": "default", "path": outsideFile},
+	})
+	if deniedRes == nil || !deniedRes.IsError {
+		t.Fatalf("默认未勾选全部目录时应拒绝访问工作区外文件")
+	}
+
+	// 2. 通过管理后台 API 勾选「全部权限」与「默认全部目录」
+	adminCall(http.MethodPost, "/api/security/mode", map[string]any{
+		"full_permissions": true,
+		"allow_all_dirs":   true,
+	})
+
+	// 校验持久化文件与 /api/state 返回一致
+	loadedMode, err := store.LoadSecurityMode(dataDir, false, false)
+	if err != nil || !loadedMode.FullPermissions || !loadedMode.AllowAllDirs {
+		t.Fatalf("期望安全模式已持久化为双开，实际: err=%v mode=%+v", err, loadedMode)
+	}
+
+	// 3. 免审批读取并直接修改工作区外文件
+	readRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "workspace.read",
+		Arguments: map[string]any{"workspace_id": "", "path": outsideFile},
+	})
+	if err != nil || readRes.IsError {
+		t.Fatalf("全部目录模式下读取工作区外文件失败: err=%v res=%+v", err, readRes)
+	}
+	var readOut filesystem.ReadResult
+	decodeToolJSON(t, readRes, &readOut)
+
+	patchRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "workspace.patch",
+		Arguments: map[string]any{
+			"workspace_id":    "",
+			"path":            outsideFile,
+			"expected_sha256": readOut.SHA256,
+			"edits":           []map[string]any{{"old_text": "outside-initial", "new_text": "outside-patched-no-approval"}},
+		},
+	})
+	if err != nil || patchRes.IsError {
+		t.Fatalf("全权限+全目录模式下应无需审批直接修改工作区外文件: err=%v res=%+v", err, patchRes)
+	}
+	if len(broker.Pending()) != 0 {
+		t.Fatalf("全权限模式下不应产生待审批单")
+	}
+
+	// 4. 在工作区外目录直接免审批执行显式 Shell 命令
+	echoCmd := "echo full-perm-ok"
+	startRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "terminal.start",
+		Arguments: map[string]any{
+			"workspace_id": "",
+			"cwd":          outsideDir,
+			"executable":   echoCmd,
+			"use_shell":    true,
+		},
+	})
+	if err != nil || startRes.IsError {
+		t.Fatalf("全权限+全目录模式下执行显式 Shell 命令失败: err=%v res=%+v", err, startRes)
+	}
+	var startOut tools.TerminalStartOutput
+	decodeToolJSON(t, startRes, &startOut)
+
+	var pollOut task.PollResult
+	for i := 0; i < 60; i++ {
+		pr, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name:      "terminal.poll",
+			Arguments: map[string]any{"task_id": startOut.TaskID},
+		})
+		decodeToolJSON(t, pr, &pollOut)
+		if pollOut.Status.IsTerminal() {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if pollOut.Status != task.StatusSucceeded || !strings.Contains(pollOut.StdoutChunk, "full-perm-ok") {
+		t.Fatalf("期望显式 Shell 命令免审批执行成功，实际: %+v", pollOut)
+	}
+
+	// 4.5 验证 SSH 密钥目录硬保护与终端输出私钥脱敏（即使双开全部权限 + 全部目录也不可绕过）
+	listOutsideRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "workspace.list",
+		Arguments: map[string]any{"workspace_id": "", "path": outsideDir},
+	})
+	if err != nil || listOutsideRes.IsError {
+		t.Fatalf("列出外部普通目录失败: err=%v res=%+v", err, listOutsideRes)
+	}
+	var listOutside filesystem.ListResult
+	decodeToolJSON(t, listOutsideRes, &listOutside)
+	for _, e := range listOutside.Entries {
+		if strings.Contains(e.Path, ".ssh") || strings.Contains(e.Path, "id_rsa") {
+			t.Fatalf("列出目录时绝不能暴露 .ssh 目录或私钥文件: %+v", e)
+		}
+	}
+
+	sshListDenied, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "workspace.list",
+		Arguments: map[string]any{"workspace_id": "", "path": outsideSSHDir},
+	})
+	if sshListDenied == nil || !sshListDenied.IsError {
+		t.Fatalf("即使双开全权限与全目录，也必须禁止查看 .ssh 目录")
+	}
+	sshReadDenied, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "workspace.read",
+		Arguments: map[string]any{"workspace_id": "", "path": outsideSSHKey},
+	})
+	if sshReadDenied == nil || !sshReadDenied.IsError {
+		t.Fatalf("即使双开全权限与全目录，也必须禁止读取 SSH 私钥文件")
+	}
+	sshCmdDenied, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "terminal.start",
+		Arguments: map[string]any{
+			"workspace_id": "",
+			"cwd":          outsideDir,
+			"executable":   "cat " + outsideSSHKey,
+			"use_shell":    true,
+		},
+	})
+	if sshCmdDenied == nil || !sshCmdDenied.IsError {
+		t.Fatalf("即使双开全权限与全目录，也必须禁止通过终端命令读取 .ssh/id_rsa")
+	}
+
+	// 即使间接命令往 stdout 打印私钥块，返回给模型时也必须被实时脱敏
+	leakCmd := `printf 'prefix\n-----BEGIN OPENSSH PRIVATE KEY-----\nSUPER_SECRET_KEY_BODY\n-----END OPENSSH PRIVATE KEY-----\nsuffix\n'`
+	if runtime.GOOS == "windows" {
+		leakCmd = `Write-Output "prefix"; Write-Output "-----BEGIN OPENSSH PRIVATE KEY-----"; Write-Output "SUPER_SECRET_KEY_BODY"; Write-Output "-----END OPENSSH PRIVATE KEY-----"; Write-Output "suffix"`
+	}
+	leakStartRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "terminal.start",
+		Arguments: map[string]any{
+			"workspace_id": "",
+			"cwd":          outsideDir,
+			"executable":   leakCmd,
+			"use_shell":    true,
+		},
+	})
+	if err != nil || leakStartRes.IsError {
+		t.Fatalf("启动脱敏测试命令失败: err=%v res=%+v", err, leakStartRes)
+	}
+	var leakStartOut tools.TerminalStartOutput
+	decodeToolJSON(t, leakStartRes, &leakStartOut)
+	var leakPoll task.PollResult
+	for i := 0; i < 60; i++ {
+		pr, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name:      "terminal.poll",
+			Arguments: map[string]any{"task_id": leakStartOut.TaskID},
+		})
+		decodeToolJSON(t, pr, &leakPoll)
+		if leakPoll.Status.IsTerminal() {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if strings.Contains(leakPoll.StdoutChunk, "SUPER_SECRET_KEY_BODY") {
+		t.Fatalf("终端输出泄露了私钥明文: %q", leakPoll.StdoutChunk)
+	}
+	if !strings.Contains(leakPoll.StdoutChunk, "[REDACTED_PRIVATE_KEY]") || !strings.Contains(leakPoll.StdoutChunk, "suffix") {
+		t.Fatalf("终端输出未正确脱敏并保留非敏感正文: %q", leakPoll.StdoutChunk)
+	}
+
+	// 5. 取消勾选两个按钮后，立即恢复目录限制
+	adminCall(http.MethodPost, "/api/security/mode", map[string]any{
+		"full_permissions": false,
+		"allow_all_dirs":   false,
+	})
+	deniedAgain, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "workspace.read",
+		Arguments: map[string]any{"workspace_id": "default", "path": outsideFile},
+	})
+	if deniedAgain == nil || !deniedAgain.IsError {
+		t.Fatalf("取消勾选全部目录后应重新拦截工作区外文件")
+	}
+}

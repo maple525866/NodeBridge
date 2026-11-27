@@ -150,6 +150,8 @@ func (m *Manager) List(workspaceID, relPath string, maxDepth, limit int) (*ListR
 	var entries []ListEntry
 	truncated := false
 	errStop := errors.New("limit reached")
+	allowAllDirs := m.AllowAllDirs()
+	inWorkspace := isWithinRoot(resolved.Workspace.RealRoot, resolved.AbsPath)
 
 	walkErr := filepath.WalkDir(resolved.AbsPath, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -174,21 +176,39 @@ func (m *Manager) List(workspaceID, relPath string, maxDepth, limit int) (*ListR
 			return nil
 		}
 
-		relToWS, err := filepath.Rel(resolved.Workspace.RealRoot, p)
-		if err != nil {
-			return nil
+		var entryPOSIX string
+		if inWorkspace {
+			relToWS, relErr := filepath.Rel(resolved.Workspace.RealRoot, p)
+			if relErr != nil {
+				return nil
+			}
+			entryPOSIX = filepath.ToSlash(relToWS)
+		} else {
+			entryPOSIX = filepath.ToSlash(p)
 		}
-		relPOSIX := filepath.ToSlash(relToWS)
-		if m.IsSensitive(resolved.Workspace, relPOSIX) {
+		if m.IsSensitive(resolved.Workspace, entryPOSIX) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		// 跳过指向工作区外的符号链接
+		// 对符号链接必须解析真实目标并执行边界与敏感路径双重检查，防止通过工作区内符号链接泄露敏感目录/私钥
 		if d.Type()&os.ModeSymlink != 0 {
-			if realP, err := filepath.EvalSymlinks(p); err != nil || !isWithinRoot(resolved.Workspace.RealRoot, realP) {
+			realP, symErr := filepath.EvalSymlinks(p)
+			if symErr != nil {
+				return nil
+			}
+			if !allowAllDirs && !isWithinRoot(resolved.Workspace.RealRoot, realP) {
+				return nil
+			}
+			realCheckPath := filepath.ToSlash(realP)
+			if isWithinRoot(resolved.Workspace.RealRoot, realP) {
+				if relReal, relErr := filepath.Rel(resolved.Workspace.RealRoot, realP); relErr == nil {
+					realCheckPath = filepath.ToSlash(relReal)
+				}
+			}
+			if m.checkHardSecretPath(filepath.ToSlash(realP)) != nil || m.IsSensitive(resolved.Workspace, realCheckPath) {
 				return nil
 			}
 		}
@@ -205,7 +225,7 @@ func (m *Manager) List(workspaceID, relPath string, maxDepth, limit int) (*ListR
 			modTime = fi.ModTime().UTC().Format(time.RFC3339)
 		}
 		entries = append(entries, ListEntry{
-			Path:    relPOSIX,
+			Path:    entryPOSIX,
 			IsDir:   d.IsDir(),
 			Size:    size,
 			ModTime: modTime,
@@ -318,13 +338,19 @@ func (m *Manager) Read(workspaceID, relPath string, startLine, endLine int) (*Re
 
 // Search 在授权工作区内按子串或正则搜索文本文件，自动跳过敏感文件和二进制文件。
 func (m *Manager) Search(workspaceID, query string, isRegex bool, globPattern string, maxResults int) (*SearchResult, error) {
+	return m.SearchInPath(workspaceID, "", query, isRegex, globPattern, maxResults)
+}
+
+// SearchInPath 在指定目录或文件（默认工作区根目录，开启全部目录模式时可为宿主机任意路径）内搜索文本。
+func (m *Manager) SearchInPath(workspaceID, targetPath, query string, isRegex bool, globPattern string, maxResults int) (*SearchResult, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, errors.New("搜索关键词 query 不能为空")
 	}
-	ws, err := m.GetWorkspace(workspaceID)
+	resolved, err := m.Resolve(workspaceID, targetPath, false)
 	if err != nil {
 		return nil, err
 	}
+	ws := resolved.Workspace
 	if maxResults <= 0 {
 		maxResults = defaultSearchLimit
 	}
@@ -343,50 +369,78 @@ func (m *Manager) Search(workspaceID, query string, isRegex bool, globPattern st
 	var matches []SearchMatch
 	truncated := false
 	errStop := errors.New("search limit reached")
+	allowAllDirs := m.AllowAllDirs()
+	inWorkspace := isWithinRoot(ws.RealRoot, resolved.AbsPath)
 
-	walkErr := filepath.WalkDir(ws.RealRoot, func(p string, d fs.DirEntry, err error) error {
+	walkErr := filepath.WalkDir(resolved.AbsPath, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil
-		}
-		if p == ws.RealRoot {
 			return nil
 		}
 		if d.IsDir() {
+			if p == resolved.AbsPath {
+				return nil
+			}
 			if _, skip := defaultSkipDirs[d.Name()]; skip {
 				return filepath.SkipDir
 			}
-			relToWS, relErr := filepath.Rel(ws.RealRoot, p)
-			if relErr == nil && m.IsSensitive(ws, filepath.ToSlash(relToWS)) {
+			dirPOSIX := filepath.ToSlash(p)
+			if inWorkspace {
+				if relToWS, relErr := filepath.Rel(ws.RealRoot, p); relErr == nil {
+					dirPOSIX = filepath.ToSlash(relToWS)
+				}
+			}
+			if m.IsSensitive(ws, dirPOSIX) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		// 忽略指向工作区外的符号链接
+		readTarget := p
+		// 无论是否开启全部目录模式，符号链接必须先解析真实目标并执行工作区边界与敏感密钥硬红线检查
 		if d.Type()&os.ModeSymlink != 0 {
-			if realP, err := filepath.EvalSymlinks(p); err != nil || !isWithinRoot(ws.RealRoot, realP) {
+			realP, symErr := filepath.EvalSymlinks(p)
+			if symErr != nil {
 				return nil
 			}
+			if !allowAllDirs && !isWithinRoot(ws.RealRoot, realP) {
+				return nil
+			}
+			realCheckPath := filepath.ToSlash(realP)
+			if isWithinRoot(ws.RealRoot, realP) {
+				if relReal, relErr := filepath.Rel(ws.RealRoot, realP); relErr == nil {
+					realCheckPath = filepath.ToSlash(relReal)
+				}
+			}
+			if m.checkHardSecretPath(filepath.ToSlash(realP)) != nil || m.IsSensitive(ws, realCheckPath) {
+				return nil
+			}
+			readTarget = realP
 		}
 
-		relToWS, err := filepath.Rel(ws.RealRoot, p)
-		if err != nil {
+		var entryPOSIX string
+		if inWorkspace {
+			relToWS, relErr := filepath.Rel(ws.RealRoot, p)
+			if relErr != nil {
+				return nil
+			}
+			entryPOSIX = filepath.ToSlash(relToWS)
+		} else {
+			entryPOSIX = filepath.ToSlash(p)
+		}
+		if m.IsSensitive(ws, entryPOSIX) {
 			return nil
 		}
-		relPOSIX := filepath.ToSlash(relToWS)
-		if m.IsSensitive(ws, relPOSIX) {
-			return nil
-		}
-		if globPattern != "" && !matchGlob(globPattern, relPOSIX) {
+		if globPattern != "" && !matchGlob(globPattern, entryPOSIX) {
 			return nil
 		}
 
-		fi, err := d.Info()
-		if err != nil || fi.Size() > defaultReadMaxBytes {
+		// 对真实目标执行 Stat，避免符号链接 Lstat 大小绕过单文件读取上限或误读目录
+		fi, err := os.Stat(readTarget)
+		if err != nil || fi.IsDir() || fi.Size() > defaultReadMaxBytes {
 			return nil
 		}
 
-		raw, err := os.ReadFile(p)
+		raw, err := os.ReadFile(readTarget)
 		if err != nil || isBinaryContent(raw) {
 			return nil
 		}
@@ -410,7 +464,7 @@ func (m *Manager) Search(workspaceID, query string, isRegex bool, globPattern st
 				text = text[:maxSearchLineLen] + "...(truncated)"
 			}
 			matches = append(matches, SearchMatch{
-				Path:       relPOSIX,
+				Path:       entryPOSIX,
 				LineNumber: lineNo,
 				Line:       text,
 			})

@@ -33,21 +33,22 @@ type Deps struct {
 // --- 工具输入参数 Schema 定义 ---
 
 type WorkspaceListInput struct {
-	WorkspaceID string `json:"workspace_id" jsonschema:"授权工作区 ID，例如 default"`
-	Path        string `json:"path,omitempty" jsonschema:"相对于工作区根目录的子目录路径，默认根目录"`
+	WorkspaceID string `json:"workspace_id" jsonschema:"授权工作区 ID，例如 default（开启全部目录模式时可留空或直接传入任意绝对目录路径）"`
+	Path        string `json:"path,omitempty" jsonschema:"相对路径或宿主机绝对目录路径（开启全部目录模式时支持任意目录），默认工作区根目录"`
 	MaxDepth    int    `json:"max_depth,omitempty" jsonschema:"最大遍历深度，默认 3"`
 	Limit       int    `json:"limit,omitempty" jsonschema:"返回最大条目数，默认 200"`
 }
 
 type WorkspaceReadInput struct {
-	WorkspaceID string `json:"workspace_id" jsonschema:"授权工作区 ID"`
-	Path        string `json:"path" jsonschema:"相对于工作区根目录的文件路径"`
+	WorkspaceID string `json:"workspace_id" jsonschema:"授权工作区 ID，例如 default（开启全部目录模式时可留空）"`
+	Path        string `json:"path" jsonschema:"文件相对路径，或开启全部目录模式时的宿主机任意绝对路径"`
 	StartLine   int    `json:"start_line,omitempty" jsonschema:"起始行号（从 1 开始），默认 1"`
 	EndLine     int    `json:"end_line,omitempty" jsonschema:"结束行号（含），默认从起始行起读取 400 行"`
 }
 
 type WorkspaceSearchInput struct {
-	WorkspaceID string `json:"workspace_id" jsonschema:"授权工作区 ID"`
+	WorkspaceID string `json:"workspace_id" jsonschema:"授权工作区 ID，例如 default（开启全部目录模式时可留空）"`
+	Path        string `json:"path,omitempty" jsonschema:"可选：起始搜索目录或文件路径（默认工作区根目录；开启全部目录模式时可为宿主机任意绝对路径）"`
 	Query       string `json:"query" jsonschema:"搜索关键词或正则表达式"`
 	IsRegex     bool   `json:"is_regex,omitempty" jsonschema:"是否按正则表达式匹配，默认 false"`
 	Glob        string `json:"glob,omitempty" jsonschema:"限定文件通配符，例如 **/*.go"`
@@ -61,37 +62,40 @@ type PatchEditInput struct {
 }
 
 type WorkspacePatchInput struct {
-	WorkspaceID     string           `json:"workspace_id" jsonschema:"授权工作区 ID"`
-	Path            string           `json:"path" jsonschema:"目标文件相对路径"`
+	WorkspaceID     string           `json:"workspace_id" jsonschema:"授权工作区 ID，例如 default（开启全部目录模式时可留空）"`
+	Path            string           `json:"path" jsonschema:"目标文件相对路径，或开启全部目录模式时的宿主机任意绝对路径"`
 	ExpectedSHA256  string           `json:"expected_sha256,omitempty" jsonschema:"修改前通过 workspace.read 获取的 SHA256 乐观锁校验值"`
 	CreateIfMissing bool             `json:"create_if_missing,omitempty" jsonschema:"目标文件不存在时是否允许新建"`
 	Edits           []PatchEditInput `json:"edits" jsonschema:"按顺序执行的 Search/Replace 编辑块列表"`
 }
 
 type GitStatusInput struct {
-	WorkspaceID string `json:"workspace_id" jsonschema:"授权工作区 ID"`
+	WorkspaceID string `json:"workspace_id" jsonschema:"授权工作区 ID，例如 default（开启全部目录模式时可留空或直接传入仓库目录路径）"`
+	Path        string `json:"path,omitempty" jsonschema:"可选：Git 仓库目录路径（默认工作区根目录；开启全部目录模式时可为宿主机任意绝对路径）"`
 }
 
 type GitDiffInput struct {
-	WorkspaceID string   `json:"workspace_id" jsonschema:"授权工作区 ID"`
+	WorkspaceID string   `json:"workspace_id" jsonschema:"授权工作区 ID，例如 default（开启全部目录模式时可留空）"`
+	Path        string   `json:"path,omitempty" jsonschema:"可选：Git 仓库目录路径（默认工作区根目录；开启全部目录模式时可为宿主机任意绝对路径）"`
 	Staged      bool     `json:"staged,omitempty" jsonschema:"是否查看暂存区（--cached）差异"`
 	Paths       []string `json:"paths,omitempty" jsonschema:"限定查看的文件路径列表"`
 	MaxBytes    int      `json:"max_bytes,omitempty" jsonschema:"最大输出字节数，默认 262144"`
 }
 
 type GitApplyPatchInput struct {
-	WorkspaceID string `json:"workspace_id" jsonschema:"授权工作区 ID"`
+	WorkspaceID string `json:"workspace_id" jsonschema:"授权工作区 ID，例如 default（开启全部目录模式时可留空）"`
+	Path        string `json:"path,omitempty" jsonschema:"可选：Git 仓库目录路径（默认工作区根目录；开启全部目录模式时可为宿主机任意绝对路径）"`
 	Patch       string `json:"patch" jsonschema:"标准 Unified Diff / Git Patch 文本内容"`
 }
 
 type TerminalStartInput struct {
-	WorkspaceID    string   `json:"workspace_id" jsonschema:"授权工作区 ID"`
+	WorkspaceID    string   `json:"workspace_id" jsonschema:"授权工作区 ID，例如 default（开启全部目录模式时可留空）"`
 	Executable     string   `json:"executable" jsonschema:"可执行程序名或命令（默认按参数数组执行，不拼接 Shell）"`
 	Args           []string `json:"args,omitempty" jsonschema:"命令行参数数组"`
-	Cwd            string   `json:"cwd,omitempty" jsonschema:"相对于工作区根目录的工作目录，默认工作区根目录"`
+	Cwd            string   `json:"cwd,omitempty" jsonschema:"工作目录（相对路径，或开启全部目录模式时的宿主机任意绝对目录路径），默认工作区根目录"`
 	EnvAllow       []string `json:"env_allow,omitempty" jsonschema:"允许从宿主机透传的额外环境变量名列表"`
 	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"任务超时秒数"`
-	UseShell       bool     `json:"use_shell,omitempty" jsonschema:"是否显式通过系统 Shell 解释执行（强制 L2 人工审批）"`
+	UseShell       bool     `json:"use_shell,omitempty" jsonschema:"是否显式通过系统 Shell 解释执行（默认模式强制 L2 人工审批，全部权限模式自动放行）"`
 }
 
 type TerminalStartOutput struct {
@@ -152,11 +156,11 @@ func RegisterAll(srv *mcp.Server, deps Deps) {
 func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "workspace.list",
-		Description: "列出授权工作区内的目录和源码文件（自动过滤敏感文件与忽略目录）",
+		Description: "列出工作区或指定目录的目录结构和文件（开启全部目录模式时支持任意宿主机路径）",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in WorkspaceListInput) (*mcp.CallToolResult, *filesystem.ListResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("workspace.list")
-		if err := authorizePrincipal(ctx, d.Audit, "workspace.list", in.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
+		if err := authorizePrincipal(ctx, d, "workspace.list", in.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
 			return nil, nil, err
 		}
 		res, err := d.FS.List(in.WorkspaceID, in.Path, in.MaxDepth, in.Limit)
@@ -166,11 +170,11 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "workspace.read",
-		Description: "读取授权工作区内的文本文件内容，同时返回整文件 sha256 供 workspace.patch 乐观锁校验",
+		Description: "读取工作区或指定路径的文本文件内容，同时返回整文件 sha256 供 workspace.patch 乐观锁校验",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in WorkspaceReadInput) (*mcp.CallToolResult, *filesystem.ReadResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("workspace.read")
-		if err := authorizePrincipal(ctx, d.Audit, "workspace.read", in.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
+		if err := authorizePrincipal(ctx, d, "workspace.read", in.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
 			return nil, nil, err
 		}
 		res, err := d.FS.Read(in.WorkspaceID, in.Path, in.StartLine, in.EndLine)
@@ -180,25 +184,25 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "workspace.search",
-		Description: "在授权工作区内按文本或正则表达式搜索代码（自动跳过敏感与二进制文件）",
+		Description: "在工作区或指定目录内按文本或正则表达式搜索代码（开启全部目录模式时可传任意绝对路径）",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in WorkspaceSearchInput) (*mcp.CallToolResult, *filesystem.SearchResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("workspace.search")
-		if err := authorizePrincipal(ctx, d.Audit, "workspace.search", in.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
+		if err := authorizePrincipal(ctx, d, "workspace.search", in.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
 			return nil, nil, err
 		}
-		res, err := d.FS.Search(in.WorkspaceID, in.Query, in.IsRegex, in.Glob, in.MaxResults)
+		res, err := d.FS.SearchInPath(in.WorkspaceID, in.Path, in.Query, in.IsRegex, in.Glob, in.MaxResults)
 		recordAudit(ctx, d.Audit, "workspace.search", in.WorkspaceID, string(ev.RiskLevel), in, "AUTO_ALLOW", "", start, err)
 		return nil, res, err
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "workspace.patch",
-		Description: "使用 Search/Replace 结构化编辑块安全修改或新建授权工作区文件（支持 SHA256 乐观锁、人工 Diff 审批与远程异步续接）",
+		Description: "使用 Search/Replace 结构化编辑块安全修改或新建文件（支持 SHA256 乐观锁、人工 Diff 审批/全权限免审批与远程异步续接）",
 	}, func(ctx context.Context, callReq *mcp.CallToolRequest, in WorkspacePatchInput) (*mcp.CallToolResult, *filesystem.PatchResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("workspace.patch")
-		if err := authorizePrincipal(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), true, map[string]any{"path": in.Path}, start); err != nil {
+		if err := authorizePrincipal(ctx, d, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), true, map[string]any{"path": in.Path}, start); err != nil {
 			return nil, nil, err
 		}
 
@@ -285,11 +289,11 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 func registerGitTools(srv *mcp.Server, d Deps) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "git.status",
-		Description: "查看授权工作区的 Git 分支及变更状态",
+		Description: "查看工作区或指定 Git 仓库目录的分支及变更状态",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in GitStatusInput) (*mcp.CallToolResult, *git.StatusResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("git.status")
-		if err := authorizePrincipal(ctx, d.Audit, "git.status", in.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
+		if err := authorizePrincipal(ctx, d, "git.status", in.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
 			return nil, nil, err
 		}
 		if d.Git == nil {
@@ -297,18 +301,18 @@ func registerGitTools(srv *mcp.Server, d Deps) {
 			recordAudit(ctx, d.Audit, "git.status", in.WorkspaceID, string(ev.RiskLevel), in, "UNAVAILABLE", "", start, err)
 			return nil, nil, err
 		}
-		res, err := d.Git.Status(ctx, in.WorkspaceID)
+		res, err := d.Git.StatusAt(ctx, in.WorkspaceID, in.Path)
 		recordAudit(ctx, d.Audit, "git.status", in.WorkspaceID, string(ev.RiskLevel), in, "AUTO_ALLOW", "", start, err)
 		return nil, res, err
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "git.diff",
-		Description: "查看授权工作区或暂存区的 Git 变更差异",
+		Description: "查看工作区或指定 Git 仓库目录的变更差异",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in GitDiffInput) (*mcp.CallToolResult, *git.DiffResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("git.diff")
-		if err := authorizePrincipal(ctx, d.Audit, "git.diff", in.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
+		if err := authorizePrincipal(ctx, d, "git.diff", in.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
 			return nil, nil, err
 		}
 		if d.Git == nil {
@@ -316,39 +320,39 @@ func registerGitTools(srv *mcp.Server, d Deps) {
 			recordAudit(ctx, d.Audit, "git.diff", in.WorkspaceID, string(ev.RiskLevel), in, "UNAVAILABLE", "", start, err)
 			return nil, nil, err
 		}
-		res, err := d.Git.Diff(ctx, in.WorkspaceID, in.Staged, in.Paths, in.MaxBytes)
+		res, err := d.Git.DiffAt(ctx, in.WorkspaceID, in.Path, in.Staged, in.Paths, in.MaxBytes)
 		recordAudit(ctx, d.Audit, "git.diff", in.WorkspaceID, string(ev.RiskLevel), in, "AUTO_ALLOW", "", start, err)
 		return nil, res, err
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "git.apply_patch",
-		Description: "在路径安全校验与人工审批后，向授权工作区应用标准 Unified Diff Git 补丁（支持远程异步续接）",
+		Description: "在安全校验与人工审批（或全权限模式免审批）后，向工作区或指定 Git 仓库应用标准 Unified Diff 补丁",
 	}, func(ctx context.Context, callReq *mcp.CallToolRequest, in GitApplyPatchInput) (*mcp.CallToolResult, *git.ApplyPatchResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("git.apply_patch")
-		if err := authorizePrincipal(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), true, map[string]any{"workspace_id": in.WorkspaceID}, start); err != nil {
+		if err := authorizePrincipal(ctx, d, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), true, map[string]any{"workspace_id": in.WorkspaceID, "path": in.Path}, start); err != nil {
 			return nil, nil, err
 		}
 		if d.Git == nil {
 			err := errors.New("当前宿主机未检测到 Git 可执行程序")
-			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"workspace_id": in.WorkspaceID}, "UNAVAILABLE", "", start, err)
+			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"workspace_id": in.WorkspaceID, "path": in.Path}, "UNAVAILABLE", "", start, err)
 			return nil, nil, err
 		}
 
-		affected, err := d.Git.ValidatePatch(ctx, in.WorkspaceID, in.Patch)
+		affected, err := d.Git.ValidatePatchAt(ctx, in.WorkspaceID, in.Path, in.Patch)
 		if err != nil {
 			p := session.FromContext(ctx)
 			if p.IsRemote {
 				fp := approval.ComputeFingerprint(p.ClientID, "git.apply_patch", in.WorkspaceID, in)
 				if replayOut, ok := d.Broker.LookupIdempotent(fp); ok {
 					if cached, ok := replayOut.Result.(*git.ApplyPatchResult); ok && cached != nil {
-						recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"workspace_id": in.WorkspaceID}, "IDEMPOTENT_REPLAY", replayOut.Decision.Approver, start, nil)
+						recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"workspace_id": in.WorkspaceID, "path": in.Path}, "IDEMPOTENT_REPLAY", replayOut.Decision.Approver, start, nil)
 						return nil, cached, nil
 					}
 				}
 			}
-			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"workspace_id": in.WorkspaceID}, "DENIED_PRECHECK", "", start, err)
+			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"workspace_id": in.WorkspaceID, "path": in.Path}, "DENIED_PRECHECK", "", start, err)
 			return nil, nil, err
 		}
 
@@ -368,7 +372,7 @@ func registerGitTools(srv *mcp.Server, d Deps) {
 			Summary:       fmt.Sprintf("向工作区 %s 应用 Git 补丁（涉及 %d 个文件）", in.WorkspaceID, len(affected)),
 			Reason:        ev.Reason,
 		}, func() (any, error) {
-			return d.Git.ApplyPatch(context.Background(), in.WorkspaceID, in.Patch)
+			return d.Git.ApplyPatchAt(context.Background(), in.WorkspaceID, in.Path, in.Patch)
 		}, makeProgressNotifier(ctx, callReq, "正在等待用户在本地 NodeBridge 控制台审批 Git 补丁..."))
 
 		if err != nil {
@@ -402,7 +406,7 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 		// 1. 策略预估 + 客户端级工作区/只读权限校验
 		ev := d.Policy.EvaluateCommand(in.Executable, in.Args, in.UseShell)
 		requiresWrite := ev.RiskLevel != policy.RiskL0
-		if err := authorizePrincipal(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), requiresWrite, in, start); err != nil {
+		if err := authorizePrincipal(ctx, d, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), requiresWrite, in, start); err != nil {
 			return nil, nil, err
 		}
 
@@ -445,8 +449,8 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 			}, nil
 		}
 
-		// 3. 急停检查与按需混合人工审批
-		if ev.Action == policy.ActionRequireApproval {
+		// 3. 急停检查与按需混合人工审批（远程客户端在全权限模式下同样经 Broker 复用指纹幂等去重与急停校验）
+		if ev.Action == policy.ActionRequireApproval || (p.IsRemote && ev.BypassedByFullPerms) {
 			cmdPreview := formatCommandPreview(in)
 			fp := approval.ComputeFingerprint(p.ClientID, "terminal.start", in.WorkspaceID, in)
 			outcome, err := d.Broker.ExecuteWithApproval(ctx, approval.Request{
@@ -493,7 +497,13 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 		}
 
 		rawRes, err := startTaskFn()
-		recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), in, "AUTO_ALLOW", "", start, err)
+		decisionTag := "AUTO_ALLOW"
+		approver := ""
+		if ev.BypassedByFullPerms {
+			decisionTag = "AUTO_ALLOW_FULL_PERMISSIONS"
+			approver = "full-permissions-mode"
+		}
+		recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), in, decisionTag, approver, start, err)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -511,7 +521,7 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 		wsID := ""
 		if res != nil {
 			wsID = res.WorkspaceID
-			if authErr := authorizePrincipal(ctx, d.Audit, "terminal.poll", wsID, string(ev.RiskLevel), false, in, start); authErr != nil {
+			if authErr := authorizePrincipal(ctx, d, "terminal.poll", wsID, string(ev.RiskLevel), false, in, start); authErr != nil {
 				return nil, nil, authErr
 			}
 		}
@@ -526,11 +536,11 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("terminal.cancel")
 		// 先校验只读权限，防止只读客户端借取消操作探测 task_id 存在性
-		if authErr := authorizePrincipal(ctx, d.Audit, "terminal.cancel", "", string(ev.RiskLevel), true, in, start); authErr != nil {
+		if authErr := authorizePrincipal(ctx, d, "terminal.cancel", "", string(ev.RiskLevel), true, in, start); authErr != nil {
 			return nil, nil, authErr
 		}
 		if existing, pollErr := d.Tasks.Poll(in.TaskID, 0, 0); pollErr == nil && existing != nil {
-			if authErr := authorizePrincipal(ctx, d.Audit, "terminal.cancel", existing.WorkspaceID, string(ev.RiskLevel), true, in, start); authErr != nil {
+			if authErr := authorizePrincipal(ctx, d, "terminal.cancel", existing.WorkspaceID, string(ev.RiskLevel), true, in, start); authErr != nil {
 				return nil, nil, authErr
 			}
 		}
@@ -568,7 +578,7 @@ func registerApprovalTools(srv *mcp.Server, d Deps) {
 			recordAudit(ctx, d.Audit, "approval.status", rec.WorkspaceID, string(ev.RiskLevel), in, "CLIENT_APPROVAL_DENIED", "", start, err)
 			return nil, nil, err
 		}
-		if err := authorizePrincipal(ctx, d.Audit, "approval.status", rec.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
+		if err := authorizePrincipal(ctx, d, "approval.status", rec.WorkspaceID, string(ev.RiskLevel), false, in, start); err != nil {
 			return nil, nil, err
 		}
 
@@ -609,23 +619,27 @@ func registerApprovalTools(srv *mcp.Server, d Deps) {
 }
 
 // authorizePrincipal 执行阶段二客户端级工作区子集与只读权限护栏校验。
+// 遵循最小权限原则：单个 OAuth 客户端显式绑定的只读模式始终生效，不会被全局「全部权限」静默突破；
+// 当开启「默认全部目录模式」时放开工作区白名单限制，允许可读写或只读客户端按自身读写级别访问任意普通目录。
 func authorizePrincipal(
 	ctx context.Context,
-	logger *audit.Logger,
+	d Deps,
 	toolName, workspaceID, risk string,
 	requiresWrite bool,
 	args any,
 	start time.Time,
 ) error {
 	p := session.FromContext(ctx)
-	if workspaceID != "" && !p.CanAccessWorkspace(workspaceID) {
+	allowAllDirs := d.FS != nil && d.FS.AllowAllDirs()
+
+	if !allowAllDirs && workspaceID != "" && !p.CanAccessWorkspace(workspaceID) {
 		err := fmt.Errorf("当前远程客户端（%s）未被授权访问工作区 %q", p.ClientName, workspaceID)
-		recordAudit(ctx, logger, toolName, workspaceID, risk, args, "CLIENT_WORKSPACE_DENIED", "", start, err)
+		recordAudit(ctx, d.Audit, toolName, workspaceID, risk, args, "CLIENT_WORKSPACE_DENIED", "", start, err)
 		return err
 	}
 	if requiresWrite && !p.HasWritePermission() {
 		err := fmt.Errorf("当前远程客户端（%s）处于只读授权模式，禁止执行写入或变更类操作 %q", p.ClientName, toolName)
-		recordAudit(ctx, logger, toolName, workspaceID, risk, args, "CLIENT_READONLY_DENIED", "", start, err)
+		recordAudit(ctx, d.Audit, toolName, workspaceID, risk, args, "CLIENT_READONLY_DENIED", "", start, err)
 		return err
 	}
 	return nil

@@ -9,11 +9,14 @@ import (
 	"io/fs"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"nodebridge/internal/core/approval"
 	"nodebridge/internal/core/audit"
 	"nodebridge/internal/core/oauth"
+	"nodebridge/internal/core/policy"
+	"nodebridge/internal/core/store"
 	"nodebridge/internal/core/task"
 	"nodebridge/internal/platform/capability"
 	"nodebridge/internal/platform/filesystem"
@@ -30,12 +33,17 @@ type Server struct {
 	taskMgr                 *task.Manager
 	auditLog                *audit.Logger
 	fsMgr                   *filesystem.Manager
+	policyEng               *policy.Engine
+	dataDir                 string
 	capInfo                 capability.Info
 	relayConn               relay.Connector
 	oauthSrv                *oauth.Server
 	deviceID                string
 	killAllDisconnectTunnel bool
 	mcpAddr                 string
+
+	modeMu            sync.Mutex
+	securityUpdatedAt time.Time
 }
 
 // NewServer 创建本地管理服务实例。
@@ -68,6 +76,15 @@ func (s *Server) AttachRemoteGovernance(deviceID string, oauthSrv *oauth.Server,
 	s.killAllDisconnectTunnel = killAllDisconnectTunnel
 }
 
+// AttachSecurityControl 注入策略引擎与数据目录，支持控制台实时切换“全部权限”与“默认全部目录”模式并持久化。
+func (s *Server) AttachSecurityControl(policyEng *policy.Engine, dataDir string, initial store.SecurityMode) {
+	s.modeMu.Lock()
+	defer s.modeMu.Unlock()
+	s.policyEng = policyEng
+	s.dataDir = dataDir
+	s.securityUpdatedAt = initial.UpdatedAt
+}
+
 // Handler 返回挂载了静态控制台页面、REST API 与 SSE 事件流的 HTTP Handler。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -78,6 +95,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("/api/state", s.withAuth(s.handleState))
 	mux.HandleFunc("/api/events", s.withAuth(s.handleSSE))
+	mux.HandleFunc("/api/security/mode", s.withAuth(s.handleSecurityMode))
 	mux.HandleFunc("/api/approvals/", s.withAuth(s.handleApprovalAction))
 	mux.HandleFunc("/api/grants/revoke", s.withAuth(s.handleRevokeGrants))
 	mux.HandleFunc("/api/kill-switch/pause", s.withAuth(s.handlePause))
@@ -148,12 +166,134 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		"oauth_clients": oauthClients,
 		"pairing_codes": pairingCodes,
 		"pause":         s.broker.IsPaused(),
+		"security_mode": s.currentSecurityMode(),
 		"workspaces":    s.fsMgr.Workspaces(),
 		"pending":       s.broker.Pending(),
 		"grants":        s.broker.ActiveGrants(),
 		"tasks":         s.taskMgr.List(),
 		"audit":         s.auditLog.Recent(50),
 	})
+}
+
+func (s *Server) currentSecurityMode() store.SecurityMode {
+	s.modeMu.Lock()
+	updatedAt := s.securityUpdatedAt
+	policyEng := s.policyEng
+	s.modeMu.Unlock()
+
+	fullPerms := false
+	if s.broker != nil {
+		fullPerms = s.broker.IsFullPermissions()
+	} else if policyEng != nil {
+		fullPerms = policyEng.FullPermissions()
+	}
+	allowAllDirs := false
+	if s.fsMgr != nil {
+		allowAllDirs = s.fsMgr.AllowAllDirs()
+	}
+	return store.SecurityMode{
+		FullPermissions: fullPerms,
+		AllowAllDirs:    allowAllDirs,
+		UpdatedAt:       updatedAt,
+	}
+}
+
+func (s *Server) handleSecurityMode(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.currentSecurityMode())
+	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+		var body struct {
+			FullPermissions *bool `json:"full_permissions"`
+			AllowAllDirs    *bool `json:"allow_all_dirs"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体 JSON 格式无效"})
+			return
+		}
+		if body.FullPermissions == nil && body.AllowAllDirs == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "至少需要提供 full_permissions 或 allow_all_dirs 之一"})
+			return
+		}
+
+		s.modeMu.Lock()
+		if s.policyEng == nil {
+			s.modeMu.Unlock()
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "策略引擎尚未挂载到管理服务，无法切换安全模式"})
+			return
+		}
+
+		curFull := s.policyEng.FullPermissions()
+		if s.broker != nil {
+			curFull = s.broker.IsFullPermissions()
+		}
+		curAllDirs := false
+		if s.fsMgr != nil {
+			curAllDirs = s.fsMgr.AllowAllDirs()
+		}
+
+		nextFull := curFull
+		if body.FullPermissions != nil {
+			nextFull = *body.FullPermissions
+		}
+		nextAllDirs := curAllDirs
+		if body.AllowAllDirs != nil {
+			nextAllDirs = *body.AllowAllDirs
+		}
+
+		now := time.Now().UTC()
+		mode := store.SecurityMode{
+			FullPermissions: nextFull,
+			AllowAllDirs:    nextAllDirs,
+			UpdatedAt:       now,
+		}
+
+		// 在 modeMu 临界区内先原子持久化成功，再提交内存状态切换，防止并发乱序覆盖或落盘失败导致内存与磁盘/UI 割裂
+		if s.dataDir != "" {
+			if err := store.SaveSecurityMode(s.dataDir, mode); err != nil {
+				s.modeMu.Unlock()
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+		}
+
+		s.policyEng.SetFullPermissions(nextFull)
+		if s.fsMgr != nil {
+			s.fsMgr.SetFullPermissions(nextFull)
+			s.fsMgr.SetAllowAllDirs(nextAllDirs)
+		}
+		autoApproved := 0
+		if s.broker != nil {
+			autoApproved = s.broker.SetFullPermissions(nextFull)
+		}
+		s.securityUpdatedAt = now
+		s.modeMu.Unlock()
+
+		if s.broker != nil {
+			s.broker.EmitEvent("security_mode_changed", mode)
+		}
+		if s.auditLog != nil {
+			_ = s.auditLog.Record(audit.Event{
+				Tool:     "admin.security.mode",
+				Decision: "MODE_UPDATED",
+				Approver: "admin",
+				Status:   "SUCCEEDED",
+				ArgsSummary: audit.RedactSummary(map[string]any{
+					"full_permissions": nextFull,
+					"allow_all_dirs":   nextAllDirs,
+					"auto_approved":    autoApproved,
+				}, 256),
+			})
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"security_mode": mode,
+			"auto_approved": autoApproved,
+		})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 }
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {

@@ -160,6 +160,20 @@ Gemini 会自动调用 `workspace.list`、`workspace.read`、`workspace.search`�
    - **拒绝**：立即拦截并把原因反馈给 Gemini。
 3. **超时不断链（混合审批续接）**：远程云端客户端调用默认同步等待 **45 秒**（附 MCP Progress 保活）。如果你超过 45 秒才看到弹窗，审批单不会销毁，Gemini 会收到结构化的 `APPROVAL_PENDING` 与 `approval_id`；你事后在控制台点击批准后，本地后台会自动完成执行，随后让 Gemini 调用只读工具 `approval.status` 即可取回完整结果（内置请求指纹幂等去重，不怕模型重试导致重复写入）。
 
+### 3. 快捷权限与目录控制（可选：全部权限 & 默认全部目录）
+
+在本地安全控制台（`http://127.0.0.1:18766/`）顶部 **「Agent 快捷权限与目录控制」** 面板中，提供了两个实时生效并自动持久化（保存于 `data/security_mode.json`，重启后该持久化状态优先于 `nodebridge.yaml` 中的默认值并打印启动提示）的快捷勾选开关：
+
+- **全部权限（免审批自由执行）**：勾选后免除所有常规操作的逐次人工审批（包括 `workspace.patch`、`git.apply_patch` 与 `terminal.start`），同时自动放行当前未过期的挂起审批单，让 Agent 流畅连续执行。**一键急停（暂停新任务 / 强杀全部任务）始终保持最高优先级**；通过 OAuth 绑定时显式限制为「只读」的远程客户端仍受只读护栏约束，不会被全局全权限静默突破。
+- **默认全部目录（不限单工作区）**：勾选后解除单一工作区根目录隔离，Agent 可在 `workspace.*`、`git.*`（支持可选 `path` 参数）及 `terminal.start`（`cwd`）中直接传入宿主机任意普通目录的绝对路径（支持 Windows 跨盘符），且 `workspace_id` 可留空或直接填目标目录路径。
+
+> **密钥与凭证安全保护红线与输出脱敏**  
+> 即使**同时勾选「全部权限」和「默认全部目录」**，文件系统工具（`workspace.*` / `git.*`，含符号链接解析与补丁预检）仍强制执行以下硬保护规则，**永久隐藏且禁止查看、列出、搜索、读取或修改（CRUD）**；同时终端命令层对直接访问敏感路径和 `-EncodedCommand` 执行静态拦截，并配合输出流式实时脱敏兜底（注意：在开启全权限自由执行本机任意脚本/Shell 时，无 OS 沙箱前提下命令静态拦截属纵深防御层，请仅对可信会话开启全权限）：
+> - **敏感密钥目录**：`.ssh`、`.gnupg`、`.aws`、`.kube`（目录本身及内部所有文件，列出父目录时自动隐藏）
+> - **私钥与密钥库文件**：`id_rsa*`、`id_ed25519*`、`id_ecdsa*`、`id_dsa*`、`authorized_keys`、`*.pem`、`*.key`、`*.ppk`、`*.p12`、`*.pfx`、`*.jks`、`*.keystore`、`*.kdbx`
+> - **凭证与网关自身配置**：`.env`、`.env.*`、`.docker/config.json`、`.netrc`、`_netrc`、`.git-credentials`、`.npmrc`、`.pypirc`、`credentials.json`、`nodebridge.yaml`（`*secret*` 默认通过 `global_deny_globs` 拦截）
+> - **终端输出流式实时脱敏兜底**：若任意子进程向 `stdout`/`stderr` 输出 OpenSSH / PEM / PGP / PuTTY 私钥块（含分片与截断）或明确格式的云端/平台密钥令牌，返回给 Agent 与落盘摘要前均会以单调递增流式状态机实时替换为 `[REDACTED_PRIVATE_KEY]` / `[REDACTED_SECRET]`。
+
 ---
 
 ## 四、长期稳定使用：固定域名（Named Tunnel）与自有反代
@@ -211,20 +225,20 @@ oauth:
 
 | 分类 | 工具名 | 风险级别 | 说明 |
 | :--- | :--- | :---: | :--- |
-| **文件系统** | `workspace.list` / `workspace.read` / `workspace.search` | L0 只读 | 列出目录、按行读取（附 `sha256`）与全文搜索；自动过滤敏感文件与二进制 |
-| **文件系统** | `workspace.patch` | L1 写入 | Search/Replace 编辑 + SHA256 乐观锁 + 路径锁，审批前渲染 Unified Diff |
-| **Git** | `git.status` / `git.diff` | L0 只读 | 受控 Git 只读状态与差异检查（强制输出字节上限） |
-| **Git** | `git.apply_patch` | L1 写入 | 补丁路径安全预检 + `git apply --check` + 审批后应用 |
-| **异步终端** | `terminal.start` | L1 / L2 / L3 | 默认参数数组执行（不拼接 Shell），返回 `task_id` 后台运行 |
-| **异步终端** | `terminal.poll` / `terminal.cancel` | L0 控制 | 增量拉取 stdout/stderr，或强杀完整子进程树（Win Job Objects / Unix PGID） |
+| **文件系统** | `workspace.list` / `workspace.read` / `workspace.search` | L0 只读 | 列出目录、按行读取（附 `sha256`）与全文搜索（支持可选 `path`）；自动隐藏并屏蔽敏感密钥目录与二进制 |
+| **文件系统** | `workspace.patch` | L1 写入 | Search/Replace 编辑 + SHA256 乐观锁 + 路径锁，默认审批前渲染 Unified Diff（全权限模式免审批） |
+| **Git** | `git.status` / `git.diff` | L0 只读 | 受控 Git 只读状态与差异检查（支持可选 `path` 指定仓库目录，强制输出字节上限） |
+| **Git** | `git.apply_patch` | L1 写入 | 补丁路径安全预检 + `git apply --check` + 审批后应用（支持可选 `path` 指定仓库目录） |
+| **异步终端** | `terminal.start` | L1 / L2 / L3 | 默认参数数组执行（不拼接 Shell），返回 `task_id` 后台运行；始终拦截访问 SSH/密钥目录命令 |
+| **异步终端** | `terminal.poll` / `terminal.cancel` | L0 控制 | 增量拉取经私钥实时脱敏的 stdout/stderr，或强杀完整子进程树（Win Job Objects / Unix PGID） |
 | **远程续接** | `approval.status` | L0 只读 | 按客户端隔离查询挂起审批单状态与后台续接执行结果 |
 
 ### 四层本地安全防线
 
-1. **目录与敏感文件隔离**：`EvalSymlinks` 真实路径防逃逸；Windows 拦截 UNC/设备路径/ADS/保留名；全局默认拒绝 `.env`、`.env.*`、`*.pem`、`*.key`、`id_rsa*`、`.ssh/**`、`*secret*` 等敏感路径。
-2. **分层命令策略（L0–L3）**：`git status/diff` 等 L0 只读免审；`go test`/`npm test` 等 L1 可按工作区限时批授；未知程序、包安装与显式 `use_shell=true` 强制 L2 逐次人工审批；`sudo`/`shutdown`/`diskpart`/`curl | sh` 等 L3 硬拒绝。
+1. **目录边界与不可绕过的密钥硬保护**：默认通过 `EvalSymlinks` 严格锁定授权工作区防逃逸，Windows 拦截 UNC/设备路径/ADS/保留名；可按需勾选「默认全部目录」控制任意普通目录，但 `.ssh`/`.gnupg`/`.aws`/`.kube`、`id_rsa*`/`id_ed25519*`、`*.pem`/`*.key`/`*.ppk`、`.env`、`nodebridge.yaml` 等密钥与凭据始终处于不可绕过的硬保护红线内，永久禁止查看与 CRUD。
+2. **分层命令策略（L0–L3）与全权限模式**：默认 `git status/diff` 等 L0 只读免审，`go test`/`npm test` 等 L1 可按工作区限时批授，未知程序、包安装与显式 `use_shell=true` 强制 L2 逐次人工审批，`sudo`/`shutdown`/`diskpart`/`curl | sh` 等 L3 硬拒绝；可按需在控制台勾选「全部权限」免审批自由执行，但命令层仍硬拒绝直接访问 SSH 私钥与密钥目录。
 3. **客户端最小权限隔离**：支持为每个云端 OAuth 客户端独立限定只读/读写模式与允许访问的工作区子集，公网 Host 精确白名单防止 DNS Rebinding，令牌落盘仅存 SHA-256 哈希，Refresh Token 轮换含重放检测。
-4. **脱敏审计与分层急停（Kill Switch）**：全链路脱敏轮转 JSONL 审计日志；支持一键暂停新任务、一键强杀全部子进程树、一键断开公网隧道以及单点/全量吊销远程客户端令牌。
+4. **终端私钥实时脱敏、审计与分层急停（Kill Switch）**：终端 `stdout`/`stderr` 与 JSONL 审计日志均内置私钥块及高敏凭据实时脱敏；支持一键暂停新任务、一键强杀全部子进程树、一键断开公网隧道以及单点/全量吊销远程客户端令牌。
 
 ---
 
@@ -254,6 +268,11 @@ oauth:
 # 命令行审批（可替代 Web 控制台操作）
 ./nodebridge approve --config nodebridge.yaml --grant-minutes 15 <approval_id>
 ./nodebridge reject --config nodebridge.yaml --note "不符合预期" <approval_id>
+
+# 快捷权限与目录运行模式（查看 / 切换全部权限免审批与默认全部目录）
+./nodebridge mode --config nodebridge.yaml
+./nodebridge mode --config nodebridge.yaml --full-permissions=true --allow-all-dirs=true
+./nodebridge mode --config nodebridge.yaml --full-permissions=false --allow-all-dirs=false
 
 # 一键急停（暂停新任务 + 强杀运行中子进程树 + 可选联动断开隧道）与恢复
 ./nodebridge stop-all --config nodebridge.yaml --disconnect-tunnel
