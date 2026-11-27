@@ -65,8 +65,12 @@ type TasksConfig struct {
 	MaxOutputBytes        int `yaml:"max_output_bytes"`
 }
 
-// SecurityConfig 定义全局敏感文件拒绝规则与命令分层白名单策略。
+// SecurityConfig 定义全局敏感文件拒绝规则、命令分层白名单策略与动态权限模式开关。
 type SecurityConfig struct {
+	// FullPermissions 为 true 时默认开启全部权限模式：免除一切审批并放开命令与敏感文件限制。
+	FullPermissions bool `yaml:"full_permissions,omitempty"`
+	// AllowAllDirs 为 true 时默认开启全部目录模式：允许 Agent 控制宿主机任意目录，不限于配置的工作区。
+	AllowAllDirs    bool                `yaml:"allow_all_dirs,omitempty"`
 	GlobalDenyGlobs []string            `yaml:"global_deny_globs"`
 	CommandPolicy   CommandPolicyConfig `yaml:"command_policy"`
 }
@@ -168,6 +172,39 @@ type OAuthConfig struct {
 	RateLimitPerMinute       int      `yaml:"rate_limit_per_minute"`
 }
 
+// HardSecretDenyGlobs 返回内核级强制生效的敏感密钥目录与私钥文件保护规则。
+// 即使开启「全部权限」与「默认全部目录」，命中该列表的目录与文件也永远禁止查看、列出、搜索、读取与修改。
+func HardSecretDenyGlobs() []string {
+	return []string{
+		"**/.ssh",
+		"**/.ssh/**",
+		"**/.gnupg",
+		"**/.gnupg/**",
+		"**/.aws",
+		"**/.aws/**",
+		"**/.kube",
+		"**/.kube/**",
+		"**/.docker/config.json",
+		"**/.netrc",
+		"**/_netrc",
+		"**/.git-credentials",
+		"**/id_rsa*",
+		"**/id_ed25519*",
+		"**/id_ecdsa*",
+		"**/id_dsa*",
+		"**/authorized_keys",
+		"**/*.pem",
+		"**/*.key",
+		"**/*.ppk",
+		"**/*.p12",
+		"**/*.pfx",
+		"**/*.jks",
+		"**/*.keystore",
+		"**/*.kdbx",
+		"**/nodebridge.yaml",
+	}
+}
+
 // DefaultGlobalDenyGlobs 返回默认禁止访问的敏感文件通配符列表。
 func DefaultGlobalDenyGlobs() []string {
 	return []string{
@@ -175,17 +212,34 @@ func DefaultGlobalDenyGlobs() []string {
 		"**/.env.*",
 		"**/*.pem",
 		"**/*.key",
+		"**/*.ppk",
 		"**/*.p12",
 		"**/*.pfx",
+		"**/*.jks",
+		"**/*.keystore",
+		"**/*.kdbx",
 		"**/id_rsa*",
 		"**/id_ed25519*",
+		"**/id_ecdsa*",
+		"**/id_dsa*",
+		"**/authorized_keys",
+		"**/.ssh",
 		"**/.ssh/**",
+		"**/.aws",
 		"**/.aws/**",
+		"**/.gnupg",
 		"**/.gnupg/**",
+		"**/.kube",
+		"**/.kube/**",
+		"**/.docker/config.json",
+		"**/.netrc",
+		"**/_netrc",
+		"**/.git-credentials",
 		"**/.npmrc",
 		"**/.pypirc",
 		"**/credentials.json",
 		"**/*secret*",
+		"**/nodebridge.yaml",
 	}
 }
 

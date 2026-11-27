@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -68,11 +69,17 @@ func NewAdapter(fsMgr *filesystem.Manager) (*Adapter, error) {
 
 // Status 查看授权工作区的 Git 分支与变更状态。
 func (a *Adapter) Status(ctx context.Context, workspaceID string) (*StatusResult, error) {
-	ws, err := a.fsMgr.GetWorkspace(workspaceID)
+	return a.StatusAt(ctx, workspaceID, "")
+}
+
+// StatusAt 查看指定目录（默认工作区根目录；开启全部目录模式时可为宿主机任意目录）的 Git 状态。
+func (a *Adapter) StatusAt(ctx context.Context, workspaceID, repoPath string) (*StatusResult, error) {
+	resolved, err := a.fsMgr.Resolve(workspaceID, repoPath, false)
 	if err != nil {
 		return nil, err
 	}
-	stdout, stderr, err := a.runGit(ctx, ws.RealRoot, nil, "status", "--porcelain=v2", "--branch")
+	ws := resolved.Workspace
+	stdout, stderr, err := a.runGit(ctx, resolved.AbsPath, nil, "status", "--porcelain=v2", "--branch")
 	if err != nil {
 		return nil, fmt.Errorf("git status 失败: %v (%s)", err, strings.TrimSpace(stderr))
 	}
@@ -113,7 +120,12 @@ func (a *Adapter) Status(ctx context.Context, workspaceID string) (*StatusResult
 
 // Diff 查看工作区或暂存区变更差异，严格校验指定路径并按上限截断。
 func (a *Adapter) Diff(ctx context.Context, workspaceID string, staged bool, paths []string, maxBytes int) (*DiffResult, error) {
-	ws, err := a.fsMgr.GetWorkspace(workspaceID)
+	return a.DiffAt(ctx, workspaceID, "", staged, paths, maxBytes)
+}
+
+// DiffAt 查看指定 Git 仓库目录（默认工作区根目录）的变更差异。
+func (a *Adapter) DiffAt(ctx context.Context, workspaceID, repoPath string, staged bool, paths []string, maxBytes int) (*DiffResult, error) {
+	resolvedRepo, err := a.fsMgr.Resolve(workspaceID, repoPath, false)
 	if err != nil {
 		return nil, err
 	}
@@ -128,15 +140,23 @@ func (a *Adapter) Diff(ctx context.Context, workspaceID string, staged bool, pat
 	if len(paths) > 0 {
 		args = append(args, "--")
 		for _, p := range paths {
-			resolved, err := a.fsMgr.Resolve(workspaceID, p, false)
+			target := p
+			if strings.TrimSpace(repoPath) != "" && !filepath.IsAbs(p) {
+				target = filepath.Join(resolvedRepo.AbsPath, filepath.FromSlash(p))
+			}
+			resolved, err := a.fsMgr.Resolve(workspaceID, target, false)
 			if err != nil {
 				return nil, err
 			}
-			args = append(args, resolved.RelPath)
+			gitRel := resolved.RelPath
+			if rel, relErr := filepath.Rel(resolvedRepo.AbsPath, resolved.AbsPath); relErr == nil {
+				gitRel = filepath.ToSlash(rel)
+			}
+			args = append(args, gitRel)
 		}
 	}
 
-	stdout, stderr, err := a.runGit(ctx, ws.RealRoot, nil, args...)
+	stdout, stderr, err := a.runGit(ctx, resolvedRepo.AbsPath, nil, args...)
 	if err != nil {
 		return nil, fmt.Errorf("git diff 失败: %v (%s)", err, strings.TrimSpace(stderr))
 	}
@@ -158,14 +178,20 @@ func (a *Adapter) Diff(ctx context.Context, workspaceID string, staged bool, pat
 
 // ValidatePatch 在人工审批前解析补丁涉及的全部文件路径并进行目录/敏感文件安全校验与 `git apply --check` 预检。
 func (a *Adapter) ValidatePatch(ctx context.Context, workspaceID, patchText string) ([]string, error) {
+	return a.ValidatePatchAt(ctx, workspaceID, "", patchText)
+}
+
+// ValidatePatchAt 针对指定仓库目录预检标准 Unified Diff 补丁。
+func (a *Adapter) ValidatePatchAt(ctx context.Context, workspaceID, repoPath, patchText string) ([]string, error) {
 	if strings.TrimSpace(patchText) == "" {
 		return nil, errors.New("补丁内容 patch 不能为空")
 	}
-	ws, err := a.fsMgr.GetWorkspace(workspaceID)
+	resolvedRepo, err := a.fsMgr.Resolve(workspaceID, repoPath, false)
 	if err != nil {
 		return nil, err
 	}
-	if ws.ReadOnly {
+	ws := resolvedRepo.Workspace
+	if ws.ReadOnly && !a.fsMgr.FullPermissions() {
 		return nil, fmt.Errorf("%w: 工作区 %q 为只读模式，禁止应用补丁", filesystem.ErrAccessDenied, workspaceID)
 	}
 
@@ -180,7 +206,11 @@ func (a *Adapter) ValidatePatch(ctx context.Context, workspaceID, patchText stri
 	// 逐个文件做路径穿越、符号链接逃逸和敏感文件校验
 	validated := make([]string, 0, len(files))
 	for _, f := range files {
-		resolved, err := a.fsMgr.Resolve(workspaceID, f, true)
+		target := f
+		if strings.TrimSpace(repoPath) != "" && !filepath.IsAbs(f) {
+			target = filepath.Join(resolvedRepo.AbsPath, filepath.FromSlash(f))
+		}
+		resolved, err := a.fsMgr.Resolve(workspaceID, target, true)
 		if err != nil {
 			return nil, fmt.Errorf("补丁目标路径校验失败 (%s): %w", f, err)
 		}
@@ -188,7 +218,7 @@ func (a *Adapter) ValidatePatch(ctx context.Context, workspaceID, patchText stri
 	}
 
 	// 调用 git apply --check 预检补丁能否干净应用
-	_, stderr, err := a.runGit(ctx, ws.RealRoot, []byte(patchText), "apply", "--check", "-")
+	_, stderr, err := a.runGit(ctx, resolvedRepo.AbsPath, []byte(patchText), "apply", "--check", "-")
 	if err != nil {
 		return nil, fmt.Errorf("git apply --check 预检失败: %v (%s)", err, strings.TrimSpace(stderr))
 	}
@@ -197,15 +227,20 @@ func (a *Adapter) ValidatePatch(ctx context.Context, workspaceID, patchText stri
 
 // ApplyPatch 校验后将标准 Unified Diff 补丁应用到授权工作区。
 func (a *Adapter) ApplyPatch(ctx context.Context, workspaceID, patchText string) (*ApplyPatchResult, error) {
-	files, err := a.ValidatePatch(ctx, workspaceID, patchText)
+	return a.ApplyPatchAt(ctx, workspaceID, "", patchText)
+}
+
+// ApplyPatchAt 校验后将标准 Unified Diff 补丁应用到指定仓库目录。
+func (a *Adapter) ApplyPatchAt(ctx context.Context, workspaceID, repoPath, patchText string) (*ApplyPatchResult, error) {
+	files, err := a.ValidatePatchAt(ctx, workspaceID, repoPath, patchText)
 	if err != nil {
 		return nil, err
 	}
-	ws, err := a.fsMgr.GetWorkspace(workspaceID)
+	resolvedRepo, err := a.fsMgr.Resolve(workspaceID, repoPath, false)
 	if err != nil {
 		return nil, err
 	}
-	_, stderr, err := a.runGit(ctx, ws.RealRoot, []byte(patchText), "apply", "-")
+	_, stderr, err := a.runGit(ctx, resolvedRepo.AbsPath, []byte(patchText), "apply", "-")
 	if err != nil {
 		return nil, fmt.Errorf("git apply 执行失败: %v (%s)", err, strings.TrimSpace(stderr))
 	}

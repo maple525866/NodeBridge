@@ -87,6 +87,28 @@
     display: inline-block; padding: 6px 10px; border-radius: 6px; background: #0b1220;
     border: 1px solid #3b82f6; color: #93c5fd; font-family: ui-monospace, Consolas, monospace; font-size: 13px;
   }
+  .mode-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+  .mode-toggle {
+    display: flex; align-items: flex-start; gap: 12px; padding: 14px; border-radius: 8px;
+    background: var(--panel-alt); border: 1px solid var(--border); cursor: pointer;
+    transition: border-color .15s, box-shadow .15s, background .15s;
+  }
+  .mode-toggle:hover { border-color: #475569; }
+  .mode-toggle input[type="checkbox"] {
+    width: 18px; height: 18px; margin-top: 2px; accent-color: var(--primary); cursor: pointer; flex-shrink: 0;
+  }
+  .mode-toggle.active-danger {
+    border-color: var(--red); background: rgba(239, 68, 68, 0.09);
+    box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.35);
+  }
+  .mode-toggle.active-danger input[type="checkbox"] { accent-color: var(--red); }
+  .mode-toggle.active-warn {
+    border-color: var(--yellow); background: rgba(245, 158, 11, 0.09);
+    box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.35);
+  }
+  .mode-toggle.active-warn input[type="checkbox"] { accent-color: var(--yellow); }
+  .mode-title { font-size: 14px; font-weight: 700; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .mode-desc { font-size: 12.5px; color: var(--muted); margin-top: 4px; line-height: 1.45; }
 </style>
 </head>
 <body>
@@ -103,6 +125,8 @@
     <div class="brand">
       <span>NodeBridge 安全控制台</span>
       <span id="statusPill" class="pill pill-ok">运行中</span>
+      <span id="fullPermPill" class="pill pill-l3" style="display:none;">全部权限（免审批）</span>
+      <span id="allDirsPill" class="pill pill-l2" style="display:none;">全部目录（不限工作区）</span>
       <span id="relayPill" class="pill pill-l0">远程通道未启用</span>
       <span id="ssePill" class="pill pill-l0">SSE 连接中...</span>
     </div>
@@ -115,6 +139,35 @@
   </header>
 
   <main>
+    <section>
+      <h2>
+        <span>Agent 快捷权限与目录控制</span>
+        <span style="font-size:12px;color:var(--muted);font-weight:400;">实时生效并持久化 · SSH 私钥/密钥目录永久硬保护且输出脱敏 · 一键急停始终优先</span>
+      </h2>
+      <div class="mode-grid">
+        <label id="cardFullPermissions" class="mode-toggle">
+          <input type="checkbox" id="chkFullPermissions" onchange="toggleSecurityMode('full_permissions', this.checked)">
+          <div>
+            <div class="mode-title">
+              <span>全部权限（免审批自由执行）</span>
+              <span id="badgeFullPermissions" class="pill pill-l0">未开启</span>
+            </div>
+            <div class="mode-desc">勾选后免除审批，Agent 可直接执行文件编辑、Git 补丁与终端命令；但 SSH 私钥、.ssh/.gnupg/.aws/.kube 密钥目录、*.pem/*.key/*.ppk 等仍永久禁止 CRUD 且终端输出自动脱敏。</div>
+          </div>
+        </label>
+        <label id="cardAllowAllDirs" class="mode-toggle">
+          <input type="checkbox" id="chkAllowAllDirs" onchange="toggleSecurityMode('allow_all_dirs', this.checked)">
+          <div>
+            <div class="mode-title">
+              <span>默认全部目录（不限单工作区）</span>
+              <span id="badgeAllowAllDirs" class="pill pill-l0">未开启</span>
+            </div>
+            <div class="mode-desc">勾选后解除单一工作区目录边界限制，Agent 可控制宿主机上的任意普通目录（SSH/GPG/AWS/Kube 等敏感密钥目录仍强制隐藏并禁止查看或修改）。</div>
+          </div>
+        </label>
+      </div>
+    </section>
+
     <section id="oauthPendingSection" style="display:none;">
       <h2>
         <span>待确认的云端 OAuth 客户端绑定请求 <span id="oauthPendingCount" class="pill pill-l1">0</span></span>
@@ -194,6 +247,7 @@
 let adminToken = '';
 let state = {
   pending: [], grants: [], tasks: [], audit: [], workspaces: [], pause: {},
+  security_mode: { full_permissions: false, allow_all_dirs: false },
   relay: {}, oauth_pending: [], oauth_clients: [], pairing_codes: []
 };
 let eventSource = null;
@@ -267,7 +321,7 @@ function startSSE() {
   eventSource.onerror = () => { pill.textContent = 'SSE 重连中...'; pill.className = 'pill pill-l2'; };
   [
     'approval_created', 'approval_resolved', 'grants_updated', 'pause_changed',
-    'task_updated', 'audit_recorded', 'relay_updated',
+    'security_mode_changed', 'task_updated', 'audit_recorded', 'relay_updated',
     'oauth_auth_requested', 'oauth_auth_resolved', 'oauth_clients_updated', 'oauth_pairing_created'
   ].forEach(evt => eventSource.addEventListener(evt, () => refreshState()));
 }
@@ -301,6 +355,30 @@ function renderAll() {
     sp.textContent = '运行正常';
     sp.className = 'pill pill-ok';
   }
+
+  const secMode = state.security_mode || {};
+  const fullPermOn = !!secMode.full_permissions;
+  const allDirsOn = !!secMode.allow_all_dirs;
+
+  const chkFull = document.getElementById('chkFullPermissions');
+  const cardFull = document.getElementById('cardFullPermissions');
+  const badgeFull = document.getElementById('badgeFullPermissions');
+  const pillFull = document.getElementById('fullPermPill');
+  chkFull.checked = fullPermOn;
+  cardFull.className = 'mode-toggle' + (fullPermOn ? ' active-danger' : '');
+  badgeFull.textContent = fullPermOn ? '已开启 · 免审批' : '未开启';
+  badgeFull.className = 'pill ' + (fullPermOn ? 'pill-l3' : 'pill-l0');
+  pillFull.style.display = fullPermOn ? 'inline-block' : 'none';
+
+  const chkDirs = document.getElementById('chkAllowAllDirs');
+  const cardDirs = document.getElementById('cardAllowAllDirs');
+  const badgeDirs = document.getElementById('badgeAllowAllDirs');
+  const pillDirs = document.getElementById('allDirsPill');
+  chkDirs.checked = allDirsOn;
+  cardDirs.className = 'mode-toggle' + (allDirsOn ? ' active-warn' : '');
+  badgeDirs.textContent = allDirsOn ? '已开启 · 任意目录' : '未开启';
+  badgeDirs.className = 'pill ' + (allDirsOn ? 'pill-l2' : 'pill-l0');
+  pillDirs.style.display = allDirsOn ? 'inline-block' : 'none';
 
   const relay = state.relay || {};
   const rp = document.getElementById('relayPill');
@@ -368,7 +446,9 @@ function renderAll() {
   document.getElementById('pendingCount').textContent = pending.length;
   const pEl = document.getElementById('pendingList');
   if (!pending.length) {
-    pEl.innerHTML = '<div class="empty">当前没有等待人工确认的工具操作。</div>';
+    pEl.innerHTML = fullPermOn
+      ? '<div class="empty" style="color:#fca5a5;">当前已开启「全部权限模式」，所有 Agent 操作将自动免审批放行。</div>'
+      : '<div class="empty">当前没有等待人工确认的工具操作。</div>';
   } else {
     pEl.innerHTML = pending.map(r => `
       <div class="card">
@@ -472,8 +552,11 @@ function renderAll() {
       `</table>`;
 
   // 工作区列表
-  document.getElementById('workspaceList').innerHTML = `<table><tr><th>ID</th><th>路径</th><th>模式</th></tr>` +
-    wss.map(w => `<tr><td><b>${esc(w.ID)}</b></td><td class="mono">${esc(w.RealRoot || w.Root)}</td><td>${w.ReadOnly ? '只读' : '可读写(审批)'}</td></tr>`).join('') +
+  const allDirsBanner = allDirsOn
+    ? `<div style="margin-bottom:10px;padding:8px 10px;border-radius:6px;background:rgba(245,158,11,.14);border:1px solid rgba(245,158,11,.45);color:#fcd34d;font-size:12.5px;">已开启「默认全部目录模式」：Agent 可控制宿主机任意绝对路径目录，不再局限于下方列表。</div>`
+    : '';
+  document.getElementById('workspaceList').innerHTML = allDirsBanner + `<table><tr><th>ID</th><th>路径</th><th>模式</th></tr>` +
+    wss.map(w => `<tr><td><b>${esc(w.ID)}</b></td><td class="mono">${esc(w.RealRoot || w.Root)}</td><td>${fullPermOn ? '全部权限(免审批)' : (w.ReadOnly ? '只读' : '可读写(审批)')}</td></tr>`).join('') +
     `</table>`;
 
   // 任务表
@@ -593,6 +676,27 @@ async function killAll() {
 async function resumeAll() {
   await api('/api/kill-switch/resume', { method: 'POST' });
   refreshState();
+}
+async function toggleSecurityMode(field, enabled) {
+  if (enabled) {
+    const msg = field === 'full_permissions'
+      ? '确认开启「全部权限模式」？\n开启后将免除操作审批（当前挂起的待审批操作也会立即自动放行）；SSH 私钥与密钥目录等敏感凭证仍受不可绕过的硬保护与脱敏约束。'
+      : '确认开启「默认全部目录模式」？\n开启后 Agent 将不受单个工作区目录限制，可访问并控制宿主机上的任意普通目录（.ssh/.gnupg/.aws 等密钥目录仍强制隐藏并禁止访问）。';
+    if (!confirm(msg)) {
+      renderAll();
+      return;
+    }
+  }
+  try {
+    await api('/api/security/mode', {
+      method: 'POST',
+      body: JSON.stringify({ [field]: enabled })
+    });
+    await refreshState();
+  } catch (e) {
+    alert(e.message);
+    renderAll();
+  }
 }
 async function cancelTask(id) {
   await api(`/api/tasks/${id}/cancel`, { method: 'POST' });

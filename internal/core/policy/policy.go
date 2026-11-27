@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 
 	"nodebridge/internal/config"
 )
@@ -37,13 +38,14 @@ type Evaluation struct {
 	Reason         string    `json:"reason"`
 }
 
-// Engine 封装基于配置的风险评估引擎。
+// Engine 封装基于配置的风险评估引擎，并支持运行时动态切换“全部权限模式”。
 type Engine struct {
-	cmdCfg        config.CommandPolicyConfig
-	hardDenySet   map[string]struct{}
-	l2ExecSet     map[string]struct{}
-	l0Rules       map[string][]string
-	l1Rules       map[string][]string
+	cmdCfg          config.CommandPolicyConfig
+	hardDenySet     map[string]struct{}
+	l2ExecSet       map[string]struct{}
+	l0Rules         map[string][]string
+	l1Rules         map[string][]string
+	fullPermissions atomic.Bool
 }
 
 var dangerousPatterns = []*regexp.Regexp{
@@ -52,6 +54,19 @@ var dangerousPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\b(powershell|pwsh)\b[^\n]*\s-(e|ec|enc|encodedcommand)\b`),
 	regexp.MustCompile(`(?i)\brm\s+-[a-z]*r[a-z]*f[a-z]*\s+(/|~|\$home|\*)\b`),
 	regexp.MustCompile(`(?i)\bremove-item\b[^\n]*-recurse[^\n]*-force[^\n]*([a-z]:\\|/)`),
+}
+
+// secretAccessPatterns 定义不可被「全部权限模式」绕过的密钥目录与私钥/凭证访问硬红线。
+var secretAccessPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%])\.ssh(?:$|[\\/\s"';,&|<>])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%])\.gnupg(?:$|[\\/\s"';,&|<>])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%])\.aws(?:$|[\\/\s"';,&|<>])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%])\.kube(?:$|[\\/\s"';,&|<>])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/])(id_rsa|id_ed25519|id_ecdsa|id_dsa)(?:\.[a-z0-9_-]+)?(?:$|[\s"';,&|<>])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/])authorized_keys(?:$|[\s"';,&|<>])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/])(?:\.git-credentials|\.netrc|_netrc)(?:$|[\s"';,&|<>])`),
+	regexp.MustCompile(`(?i)\.(?:pem|key|ppk|p12|pfx|jks|keystore|kdbx)(?:$|[\s"';,&|<>])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/])nodebridge\.yaml(?:$|[\s"';,&|<>])`),
 }
 
 // NewEngine 根据安全配置构建策略引擎。
@@ -63,6 +78,7 @@ func NewEngine(sec config.SecurityConfig) *Engine {
 		l0Rules:     make(map[string][]string),
 		l1Rules:     make(map[string][]string),
 	}
+	e.fullPermissions.Store(sec.FullPermissions)
 	for _, exe := range sec.CommandPolicy.HardDenyExecutables {
 		e.hardDenySet[normalizeExecName(exe)] = struct{}{}
 	}
@@ -80,8 +96,28 @@ func NewEngine(sec config.SecurityConfig) *Engine {
 	return e
 }
 
+// SetFullPermissions 动态开启或关闭“全部权限模式”。
+func (e *Engine) SetFullPermissions(enabled bool) {
+	e.fullPermissions.Store(enabled)
+}
+
+// FullPermissions 返回当前是否处于“全部权限模式”。
+func (e *Engine) FullPermissions() bool {
+	return e.fullPermissions.Load()
+}
+
 // EvaluateTool 对非终端类内置 MCP 工具给出风险评估结果。
 func (e *Engine) EvaluateTool(toolName string) Evaluation {
+	ev := e.evaluateToolBase(toolName)
+	if e.fullPermissions.Load() {
+		ev.Action = ActionAllow
+		ev.AllowBatchTTL = false
+		ev.Reason = "已开启全部权限模式，免审批直接放行"
+	}
+	return ev
+}
+
+func (e *Engine) evaluateToolBase(toolName string) Evaluation {
 	switch toolName {
 	case "workspace.list", "workspace.read", "workspace.search", "git.status", "git.diff", "terminal.poll", "approval.status":
 		return Evaluation{
@@ -124,6 +160,26 @@ func (e *Engine) EvaluateCommand(executable string, args []string, useShell bool
 			Reason:    "命令不能为空",
 		}
 	}
+	// 硬红线：任何模式（含全部权限模式）下都禁止通过命令直接查看、读取、修改或删除 SSH 私钥、密钥目录与凭证文件
+	for _, re := range secretAccessPatterns {
+		if re.MatchString(fullLine) {
+			return Evaluation{
+				RiskLevel: RiskL3,
+				Action:    ActionDeny,
+				Reason:    "命中敏感密钥/凭证硬保护红线（禁止通过命令查看、读取或修改 SSH 私钥、密钥目录等敏感凭证）",
+			}
+		}
+	}
+	ev := e.evaluateCommandBase(executable, args, useShell, fullLine)
+	if e.fullPermissions.Load() {
+		ev.Action = ActionAllow
+		ev.AllowBatchTTL = false
+		ev.Reason = "已开启全部权限模式，跳过策略拦截与人工审批直接放行"
+	}
+	return ev
+}
+
+func (e *Engine) evaluateCommandBase(executable string, args []string, useShell bool, fullLine string) Evaluation {
 
 	// 1. 检测下载并执行脚本、编码提权、根目录递归强制删除等高危模式
 	for _, re := range dangerousPatterns {

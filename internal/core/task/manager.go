@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"nodebridge/internal/core/audit"
 	"nodebridge/internal/core/store"
 	"nodebridge/internal/platform/process"
 )
@@ -104,13 +105,14 @@ func (b *cappedBuffer) ReadFrom(offset int) (chunk string, nextOffset int, trunc
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	sanitized := audit.RedactPrivateSecrets(string(b.buf))
 	if offset < 0 {
 		offset = 0
 	}
-	if offset > len(b.buf) {
-		offset = len(b.buf)
+	if offset > len(sanitized) {
+		offset = len(sanitized)
 	}
-	return string(b.buf[offset:]), len(b.buf), b.truncated
+	return sanitized[offset:], len(sanitized), b.truncated
 }
 
 func (b *cappedBuffer) Summary(maxChars int) string {
@@ -119,7 +121,7 @@ func (b *cappedBuffer) Summary(maxChars int) string {
 	if len(b.buf) == 0 {
 		return ""
 	}
-	s := string(b.buf)
+	s := audit.RedactPrivateSecrets(string(b.buf))
 	if len(s) > maxChars {
 		return s[len(s)-maxChars:]
 	}

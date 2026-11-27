@@ -132,6 +132,7 @@ type Broker struct {
 	remoteWait      time.Duration // 远程短等待窗口（超时转为异步续接）
 	pendingTTL      time.Duration // 远程异步续接审批单最大存活时间
 	idempotencyTTL  time.Duration // 远程请求指纹幂等去重窗口
+	fullPermissions bool          // 全部权限模式：免除所有操作人工审批，直接自动放行
 	pending         map[string]*pendingItem
 	pendingOrder    []string
 	records         map[string]*pendingItem // 包含待处理与近期已处理的完整记录（供 approval.status 查询）
@@ -182,6 +183,65 @@ func (b *Broker) ConfigureRemote(remoteWaitSec, pendingTTLSec, idempotencyTTLSec
 	}
 }
 
+// IsFullPermissions 返回当前是否处于全部权限（免审批）模式。
+func (b *Broker) IsFullPermissions() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.fullPermissions
+}
+
+// SetFullPermissions 动态开启或关闭全部权限（免审批）模式。
+// 开启且未处于急停暂停时，会自动批准当前队列中所有等待中的审批单并返回自动批准条数。
+func (b *Broker) SetFullPermissions(enabled bool) int {
+	b.mu.Lock()
+	b.fullPermissions = enabled
+	var asyncItems []*pendingItem
+	autoApproved := 0
+	if enabled && !b.pauseState.Paused && len(b.pendingOrder) > 0 {
+		now := time.Now().UTC()
+		for _, id := range b.pendingOrder {
+			item, ok := b.pending[id]
+			if !ok {
+				continue
+			}
+			item.req.Status = StatusApproved
+			item.req.Approver = "full-permissions-mode"
+			item.req.DecisionNote = "已开启全部权限模式，自动批准"
+			item.req.ResolvedAt = now
+			item.decision = Decision{
+				Approved:    true,
+				Approver:    "full-permissions-mode",
+				ApprovalID:  id,
+				DecisionTag: "AUTO_ALLOW_FULL_PERMISSIONS",
+				Note:        item.req.DecisionNote,
+			}
+			if item.execFn != nil {
+				item.req.ExecStatus = "RUNNING"
+				asyncItems = append(asyncItems, item)
+			}
+			b.appendHistoryLocked(item.req)
+			b.broadcastLocked(Event{Type: "approval_resolved", Payload: item.req})
+			item.closeDecision()
+			autoApproved++
+		}
+		b.pending = make(map[string]*pendingItem)
+		b.pendingOrder = nil
+	}
+	b.mu.Unlock()
+
+	for _, item := range asyncItems {
+		go b.runExecOnce(item)
+	}
+	return autoApproved
+}
+
+// EmitEvent 向所有已订阅的控制台 SSE 连接广播自定义实时事件。
+func (b *Broker) EmitEvent(eventType string, payload any) {
+	b.mu.Lock()
+	b.broadcastLocked(Event{Type: eventType, Payload: payload})
+	b.mu.Unlock()
+}
+
 // ComputeFingerprint 为工具调用计算确定性幂等指纹，避免云端网络重试导致重复弹窗或重复执行。
 func ComputeFingerprint(clientID, tool, workspaceID string, args any) string {
 	raw, _ := json.Marshal(args)
@@ -206,6 +266,17 @@ func (b *Broker) RequestApproval(ctx context.Context, req Request) (Decision, er
 			DecisionTag: "PAUSED",
 			Note:        reason,
 		}, fmt.Errorf("操作被拦截：%s", reason)
+	}
+
+	// 1.5 全部权限模式：直接免审批放行
+	if b.fullPermissions {
+		b.mu.Unlock()
+		return Decision{
+			Approved:    true,
+			Approver:    "full-permissions-mode",
+			DecisionTag: "AUTO_ALLOW_FULL_PERMISSIONS",
+			Note:        "已开启全部权限模式，免审批直接放行",
+		}, nil
 	}
 
 	// 2. 仅允许 L1 操作命中有效的工作区限时批量授权
@@ -354,6 +425,50 @@ func (b *Broker) ExecuteWithApproval(
 				}
 			}
 		}
+	}
+
+	// 2.5 全部权限模式：直接免审批执行并写入幂等缓存，不进入等待队列
+	if b.fullPermissions {
+		req.ID = newApprovalID()
+		req.Status = StatusApproved
+		req.Approver = "full-permissions-mode"
+		req.DecisionNote = "已开启全部权限模式，免审批直接放行"
+		req.CreatedAt = now
+		req.ResolvedAt = now
+		req.ExecStatus = "RUNNING"
+		dec := Decision{
+			Approved:    true,
+			Approver:    "full-permissions-mode",
+			ApprovalID:  req.ID,
+			DecisionTag: "AUTO_ALLOW_FULL_PERMISSIONS",
+			Note:        req.DecisionNote,
+		}
+		item := &pendingItem{
+			req:          req,
+			decision:     dec,
+			decisionDone: make(chan struct{}),
+			execFn:       execFn,
+			execDone:     make(chan struct{}),
+		}
+		item.closeDecision()
+		b.records[req.ID] = item
+		if req.Fingerprint != "" {
+			b.fingerprints[req.Fingerprint] = idempotencyEntry{
+				approvalID: req.ID,
+				expiresAt:  now.Add(b.idempotencyTTL),
+			}
+		}
+		b.mu.Unlock()
+
+		b.runExecOnce(item)
+		b.mu.Lock()
+		res := item.req.ExecResult
+		errStr := item.req.ExecError
+		b.mu.Unlock()
+		if errStr != "" {
+			return ExecutionOutcome{ApprovalID: req.ID, Decision: dec}, errors.New(errStr)
+		}
+		return ExecutionOutcome{ApprovalID: req.ID, Decision: dec, Result: res}, nil
 	}
 
 	// 3. 检查 L1 工作区限时批量授权（命中后同样写入幂等缓存防重复写入）

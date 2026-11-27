@@ -150,6 +150,8 @@ func (m *Manager) List(workspaceID, relPath string, maxDepth, limit int) (*ListR
 	var entries []ListEntry
 	truncated := false
 	errStop := errors.New("limit reached")
+	allowAllDirs := m.AllowAllDirs()
+	inWorkspace := isWithinRoot(resolved.Workspace.RealRoot, resolved.AbsPath)
 
 	walkErr := filepath.WalkDir(resolved.AbsPath, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -174,20 +176,25 @@ func (m *Manager) List(workspaceID, relPath string, maxDepth, limit int) (*ListR
 			return nil
 		}
 
-		relToWS, err := filepath.Rel(resolved.Workspace.RealRoot, p)
-		if err != nil {
-			return nil
+		var entryPOSIX string
+		if inWorkspace {
+			relToWS, relErr := filepath.Rel(resolved.Workspace.RealRoot, p)
+			if relErr != nil {
+				return nil
+			}
+			entryPOSIX = filepath.ToSlash(relToWS)
+		} else {
+			entryPOSIX = filepath.ToSlash(p)
 		}
-		relPOSIX := filepath.ToSlash(relToWS)
-		if m.IsSensitive(resolved.Workspace, relPOSIX) {
+		if m.IsSensitive(resolved.Workspace, entryPOSIX) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		// 跳过指向工作区外的符号链接
-		if d.Type()&os.ModeSymlink != 0 {
+		// 默认模式下跳过指向工作区外的符号链接；全部目录模式下放行
+		if !allowAllDirs && d.Type()&os.ModeSymlink != 0 {
 			if realP, err := filepath.EvalSymlinks(p); err != nil || !isWithinRoot(resolved.Workspace.RealRoot, realP) {
 				return nil
 			}
@@ -205,7 +212,7 @@ func (m *Manager) List(workspaceID, relPath string, maxDepth, limit int) (*ListR
 			modTime = fi.ModTime().UTC().Format(time.RFC3339)
 		}
 		entries = append(entries, ListEntry{
-			Path:    relPOSIX,
+			Path:    entryPOSIX,
 			IsDir:   d.IsDir(),
 			Size:    size,
 			ModTime: modTime,
@@ -318,13 +325,19 @@ func (m *Manager) Read(workspaceID, relPath string, startLine, endLine int) (*Re
 
 // Search 在授权工作区内按子串或正则搜索文本文件，自动跳过敏感文件和二进制文件。
 func (m *Manager) Search(workspaceID, query string, isRegex bool, globPattern string, maxResults int) (*SearchResult, error) {
+	return m.SearchInPath(workspaceID, "", query, isRegex, globPattern, maxResults)
+}
+
+// SearchInPath 在指定目录或文件（默认工作区根目录，开启全部目录模式时可为宿主机任意路径）内搜索文本。
+func (m *Manager) SearchInPath(workspaceID, targetPath, query string, isRegex bool, globPattern string, maxResults int) (*SearchResult, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, errors.New("搜索关键词 query 不能为空")
 	}
-	ws, err := m.GetWorkspace(workspaceID)
+	resolved, err := m.Resolve(workspaceID, targetPath, false)
 	if err != nil {
 		return nil, err
 	}
+	ws := resolved.Workspace
 	if maxResults <= 0 {
 		maxResults = defaultSearchLimit
 	}
@@ -343,41 +356,53 @@ func (m *Manager) Search(workspaceID, query string, isRegex bool, globPattern st
 	var matches []SearchMatch
 	truncated := false
 	errStop := errors.New("search limit reached")
+	allowAllDirs := m.AllowAllDirs()
+	inWorkspace := isWithinRoot(ws.RealRoot, resolved.AbsPath)
 
-	walkErr := filepath.WalkDir(ws.RealRoot, func(p string, d fs.DirEntry, err error) error {
+	walkErr := filepath.WalkDir(resolved.AbsPath, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
-		if p == ws.RealRoot {
-			return nil
-		}
 		if d.IsDir() {
+			if p == resolved.AbsPath {
+				return nil
+			}
 			if _, skip := defaultSkipDirs[d.Name()]; skip {
 				return filepath.SkipDir
 			}
-			relToWS, relErr := filepath.Rel(ws.RealRoot, p)
-			if relErr == nil && m.IsSensitive(ws, filepath.ToSlash(relToWS)) {
+			dirPOSIX := filepath.ToSlash(p)
+			if inWorkspace {
+				if relToWS, relErr := filepath.Rel(ws.RealRoot, p); relErr == nil {
+					dirPOSIX = filepath.ToSlash(relToWS)
+				}
+			}
+			if m.IsSensitive(ws, dirPOSIX) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		// 忽略指向工作区外的符号链接
-		if d.Type()&os.ModeSymlink != 0 {
+		// 默认模式下忽略指向工作区外的符号链接
+		if !allowAllDirs && d.Type()&os.ModeSymlink != 0 {
 			if realP, err := filepath.EvalSymlinks(p); err != nil || !isWithinRoot(ws.RealRoot, realP) {
 				return nil
 			}
 		}
 
-		relToWS, err := filepath.Rel(ws.RealRoot, p)
-		if err != nil {
+		var entryPOSIX string
+		if inWorkspace {
+			relToWS, relErr := filepath.Rel(ws.RealRoot, p)
+			if relErr != nil {
+				return nil
+			}
+			entryPOSIX = filepath.ToSlash(relToWS)
+		} else {
+			entryPOSIX = filepath.ToSlash(p)
+		}
+		if m.IsSensitive(ws, entryPOSIX) {
 			return nil
 		}
-		relPOSIX := filepath.ToSlash(relToWS)
-		if m.IsSensitive(ws, relPOSIX) {
-			return nil
-		}
-		if globPattern != "" && !matchGlob(globPattern, relPOSIX) {
+		if globPattern != "" && !matchGlob(globPattern, entryPOSIX) {
 			return nil
 		}
 
@@ -410,7 +435,7 @@ func (m *Manager) Search(workspaceID, query string, isRegex bool, globPattern st
 				text = text[:maxSearchLineLen] + "...(truncated)"
 			}
 			matches = append(matches, SearchMatch{
-				Path:       relPOSIX,
+				Path:       entryPOSIX,
 				LineNumber: lineNo,
 				Line:       text,
 			})
