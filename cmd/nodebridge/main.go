@@ -205,6 +205,10 @@ func runDaemon(args []string) error {
 	secMode, err := store.LoadSecurityMode(cfg.Storage.DataDir, cfg.Security.FullPermissions, cfg.Security.AllowAllDirs)
 	if err != nil {
 		log.Printf("[警告] 读取历史安全模式失败，将使用配置文件默认值: %v", err)
+	} else if store.SecurityModeExists(cfg.Storage.DataDir) &&
+		(secMode.FullPermissions != cfg.Security.FullPermissions || secMode.AllowAllDirs != cfg.Security.AllowAllDirs) {
+		log.Printf("[注意] 已从 %s/security_mode.json 加载上次控制台保存的安全模式（full_permissions=%v, allow_all_dirs=%v），覆盖了 YAML 中的默认配置",
+			cfg.Storage.DataDir, secMode.FullPermissions, secMode.AllowAllDirs)
 	}
 	fsMgr.SetFullPermissions(secMode.FullPermissions)
 	fsMgr.SetAllowAllDirs(secMode.AllowAllDirs)
@@ -535,6 +539,9 @@ func runMode(args []string) error {
 	fullPerms := fs.String("full-permissions", "", "设置全部权限免审批模式: true | false")
 	allowAllDirs := fs.String("allow-all-dirs", "", "设置默认全部目录模式: true | false")
 	_ = fs.Parse(args)
+	if fs.NArg() > 0 {
+		return fmt.Errorf("不支持的位置参数 %v，用法: nodebridge mode [--config nodebridge.yaml] [--full-permissions=true|false] [--allow-all-dirs=true|false]", fs.Args())
+	}
 
 	payload := map[string]any{}
 	if v := strings.TrimSpace(*fullPerms); v != "" {

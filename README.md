@@ -162,17 +162,17 @@ Gemini 会自动调用 `workspace.list`、`workspace.read`、`workspace.search`�
 
 ### 3. 快捷权限与目录控制（可选：全部权限 & 默认全部目录）
 
-在本地安全控制台（`http://127.0.0.1:18766/`）顶部 **「Agent 快捷权限与目录控制」** 面板中，提供了两个实时生效并自动持久化（保存于 `data/security_mode.json`，亦可在 `nodebridge.yaml` 的 `security` 段预配置）的快捷勾选开关：
+在本地安全控制台（`http://127.0.0.1:18766/`）顶部 **「Agent 快捷权限与目录控制」** 面板中，提供了两个实时生效并自动持久化（保存于 `data/security_mode.json`，重启后该持久化状态优先于 `nodebridge.yaml` 中的默认值并打印启动提示）的快捷勾选开关：
 
-- **全部权限（免审批自由执行）**：勾选后免除所有常规操作的逐次人工审批（包括 `workspace.patch`、`git.apply_patch` 与 `terminal.start`），同时自动放行当前待审批队列中的挂起请求，让 Agent 流畅连续执行。**一键急停（暂停新任务 / 强杀全部任务）始终保持最高优先级**。
+- **全部权限（免审批自由执行）**：勾选后免除所有常规操作的逐次人工审批（包括 `workspace.patch`、`git.apply_patch` 与 `terminal.start`），同时自动放行当前未过期的挂起审批单，让 Agent 流畅连续执行。**一键急停（暂停新任务 / 强杀全部任务）始终保持最高优先级**；通过 OAuth 绑定时显式限制为「只读」的远程客户端仍受只读护栏约束，不会被全局全权限静默突破。
 - **默认全部目录（不限单工作区）**：勾选后解除单一工作区根目录隔离，Agent 可在 `workspace.*`、`git.*`（支持可选 `path` 参数）及 `terminal.start`（`cwd`）中直接传入宿主机任意普通目录的绝对路径（支持 Windows 跨盘符），且 `workspace_id` 可留空或直接填目标目录路径。
 
-> **不可绕过的密钥与凭证硬保护红线**  
-> 即使**同时勾选「全部权限」和「默认全部目录」**，以下敏感目录与私钥文件仍受内核级硬红线约束，**永久隐藏且禁止任何查看、列出、搜索、读取或修改（CRUD）**，终端命令访问同样会被直接拒绝：
+> **密钥与凭证安全保护红线与输出脱敏**  
+> 即使**同时勾选「全部权限」和「默认全部目录」**，文件系统工具（`workspace.*` / `git.*`，含符号链接解析与补丁预检）仍强制执行以下硬保护规则，**永久隐藏且禁止查看、列出、搜索、读取或修改（CRUD）**；同时终端命令层对直接访问敏感路径和 `-EncodedCommand` 执行静态拦截，并配合输出流式实时脱敏兜底（注意：在开启全权限自由执行本机任意脚本/Shell 时，无 OS 沙箱前提下命令静态拦截属纵深防御层，请仅对可信会话开启全权限）：
 > - **敏感密钥目录**：`.ssh`、`.gnupg`、`.aws`、`.kube`（目录本身及内部所有文件，列出父目录时自动隐藏）
 > - **私钥与密钥库文件**：`id_rsa*`、`id_ed25519*`、`id_ecdsa*`、`id_dsa*`、`authorized_keys`、`*.pem`、`*.key`、`*.ppk`、`*.p12`、`*.pfx`、`*.jks`、`*.keystore`、`*.kdbx`
-> - **凭证与网关自身配置**：`.env`、`.env.*`、`.docker/config.json`、`.netrc`、`_netrc`、`.git-credentials`、`.npmrc`、`.pypirc`、`credentials.json`、`*secret*`、`nodebridge.yaml`
-> - **终端输出实时脱敏兜底**：若任意子进程意外向 `stdout`/`stderr` 输出 OpenSSH / PEM / PGP / PuTTY 私钥块或云端/平台密钥令牌，返回给 Agent 与落盘摘要前均会被实时替换为 `[REDACTED_PRIVATE_KEY]` / `[REDACTED_SECRET]`。
+> - **凭证与网关自身配置**：`.env`、`.env.*`、`.docker/config.json`、`.netrc`、`_netrc`、`.git-credentials`、`.npmrc`、`.pypirc`、`credentials.json`、`nodebridge.yaml`（`*secret*` 默认通过 `global_deny_globs` 拦截）
+> - **终端输出流式实时脱敏兜底**：若任意子进程向 `stdout`/`stderr` 输出 OpenSSH / PEM / PGP / PuTTY 私钥块（含分片与截断）或明确格式的云端/平台密钥令牌，返回给 Agent 与落盘摘要前均会以单调递增流式状态机实时替换为 `[REDACTED_PRIVATE_KEY]` / `[REDACTED_SECRET]`。
 
 ---
 

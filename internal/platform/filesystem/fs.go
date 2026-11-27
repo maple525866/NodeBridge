@@ -193,9 +193,22 @@ func (m *Manager) List(workspaceID, relPath string, maxDepth, limit int) (*ListR
 			return nil
 		}
 
-		// 默认模式下跳过指向工作区外的符号链接；全部目录模式下放行
-		if !allowAllDirs && d.Type()&os.ModeSymlink != 0 {
-			if realP, err := filepath.EvalSymlinks(p); err != nil || !isWithinRoot(resolved.Workspace.RealRoot, realP) {
+		// 对符号链接必须解析真实目标并执行边界与敏感路径双重检查，防止通过工作区内符号链接泄露敏感目录/私钥
+		if d.Type()&os.ModeSymlink != 0 {
+			realP, symErr := filepath.EvalSymlinks(p)
+			if symErr != nil {
+				return nil
+			}
+			if !allowAllDirs && !isWithinRoot(resolved.Workspace.RealRoot, realP) {
+				return nil
+			}
+			realCheckPath := filepath.ToSlash(realP)
+			if isWithinRoot(resolved.Workspace.RealRoot, realP) {
+				if relReal, relErr := filepath.Rel(resolved.Workspace.RealRoot, realP); relErr == nil {
+					realCheckPath = filepath.ToSlash(relReal)
+				}
+			}
+			if m.checkHardSecretPath(filepath.ToSlash(realP)) != nil || m.IsSensitive(resolved.Workspace, realCheckPath) {
 				return nil
 			}
 		}
@@ -382,11 +395,26 @@ func (m *Manager) SearchInPath(workspaceID, targetPath, query string, isRegex bo
 			return nil
 		}
 
-		// 默认模式下忽略指向工作区外的符号链接
-		if !allowAllDirs && d.Type()&os.ModeSymlink != 0 {
-			if realP, err := filepath.EvalSymlinks(p); err != nil || !isWithinRoot(ws.RealRoot, realP) {
+		readTarget := p
+		// 无论是否开启全部目录模式，符号链接必须先解析真实目标并执行工作区边界与敏感密钥硬红线检查
+		if d.Type()&os.ModeSymlink != 0 {
+			realP, symErr := filepath.EvalSymlinks(p)
+			if symErr != nil {
 				return nil
 			}
+			if !allowAllDirs && !isWithinRoot(ws.RealRoot, realP) {
+				return nil
+			}
+			realCheckPath := filepath.ToSlash(realP)
+			if isWithinRoot(ws.RealRoot, realP) {
+				if relReal, relErr := filepath.Rel(ws.RealRoot, realP); relErr == nil {
+					realCheckPath = filepath.ToSlash(relReal)
+				}
+			}
+			if m.checkHardSecretPath(filepath.ToSlash(realP)) != nil || m.IsSensitive(ws, realCheckPath) {
+				return nil
+			}
+			readTarget = realP
 		}
 
 		var entryPOSIX string
@@ -406,12 +434,13 @@ func (m *Manager) SearchInPath(workspaceID, targetPath, query string, isRegex bo
 			return nil
 		}
 
-		fi, err := d.Info()
-		if err != nil || fi.Size() > defaultReadMaxBytes {
+		// 对真实目标执行 Stat，避免符号链接 Lstat 大小绕过单文件读取上限或误读目录
+		fi, err := os.Stat(readTarget)
+		if err != nil || fi.IsDir() || fi.Size() > defaultReadMaxBytes {
 			return nil
 		}
 
-		raw, err := os.ReadFile(p)
+		raw, err := os.ReadFile(readTarget)
 		if err != nil || isBinaryContent(raw) {
 			return nil
 		}

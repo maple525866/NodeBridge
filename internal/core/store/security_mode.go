@@ -17,6 +17,15 @@ type SecurityMode struct {
 
 const securityModeFileName = "security_mode.json"
 
+// SecurityModeExists 检查 dataDir 下是否已存在持久化的安全运行模式文件。
+func SecurityModeExists(dataDir string) bool {
+	if dataDir == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(dataDir, securityModeFileName))
+	return err == nil
+}
+
 // LoadSecurityMode 从 dataDir 加载上次保存的安全模式；若尚未保存过则回退到配置文件默认值。
 func LoadSecurityMode(dataDir string, defaultFullPerms, defaultAllowAllDirs bool) (SecurityMode, error) {
 	mode := SecurityMode{
@@ -59,17 +68,33 @@ func SaveSecurityMode(dataDir string, mode SecurityMode) error {
 		return fmt.Errorf("序列化安全模式失败: %w", err)
 	}
 	target := filepath.Join(dataDir, securityModeFileName)
-	tmp := target + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	tmpFile, err := os.CreateTemp(dataDir, "security_mode.*.tmp")
+	if err != nil {
+		return fmt.Errorf("创建安全模式临时文件失败: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	if _, err := tmpFile.Write(raw); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("写入安全模式临时文件失败: %w", err)
 	}
-	if err := os.Rename(tmp, target); err != nil {
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("刷盘安全模式临时文件失败: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("关闭安全模式临时文件失败: %w", err)
+	}
+	_ = os.Chmod(tmpPath, 0o600)
+	if err := os.Rename(tmpPath, target); err != nil {
 		// Windows 目标文件偶发被短占时回退直接写入
 		if wErr := os.WriteFile(target, raw, 0o600); wErr != nil {
-			_ = os.Remove(tmp)
+			_ = os.Remove(tmpPath)
 			return fmt.Errorf("保存安全模式失败: %w", wErr)
 		}
-		_ = os.Remove(tmp)
+		_ = os.Remove(tmpPath)
 	}
 	return nil
 }

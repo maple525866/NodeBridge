@@ -178,13 +178,14 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 func (s *Server) currentSecurityMode() store.SecurityMode {
 	s.modeMu.Lock()
 	updatedAt := s.securityUpdatedAt
+	policyEng := s.policyEng
 	s.modeMu.Unlock()
 
 	fullPerms := false
 	if s.broker != nil {
 		fullPerms = s.broker.IsFullPermissions()
-	} else if s.policyEng != nil {
-		fullPerms = s.policyEng.FullPermissions()
+	} else if policyEng != nil {
+		fullPerms = policyEng.FullPermissions()
 	}
 	allowAllDirs := false
 	if s.fsMgr != nil {
@@ -202,6 +203,7 @@ func (s *Server) handleSecurityMode(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.currentSecurityMode())
 	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
 		var body struct {
 			FullPermissions *bool `json:"full_permissions"`
 			AllowAllDirs    *bool `json:"allow_all_dirs"`
@@ -210,13 +212,21 @@ func (s *Server) handleSecurityMode(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体 JSON 格式无效"})
 			return
 		}
+		if body.FullPermissions == nil && body.AllowAllDirs == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "至少需要提供 full_permissions 或 allow_all_dirs 之一"})
+			return
+		}
 
 		s.modeMu.Lock()
-		curFull := false
+		if s.policyEng == nil {
+			s.modeMu.Unlock()
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "策略引擎尚未挂载到管理服务，无法切换安全模式"})
+			return
+		}
+
+		curFull := s.policyEng.FullPermissions()
 		if s.broker != nil {
 			curFull = s.broker.IsFullPermissions()
-		} else if s.policyEng != nil {
-			curFull = s.policyEng.FullPermissions()
 		}
 		curAllDirs := false
 		if s.fsMgr != nil {
@@ -232,9 +242,23 @@ func (s *Server) handleSecurityMode(w http.ResponseWriter, r *http.Request) {
 			nextAllDirs = *body.AllowAllDirs
 		}
 
-		if s.policyEng != nil {
-			s.policyEng.SetFullPermissions(nextFull)
+		now := time.Now().UTC()
+		mode := store.SecurityMode{
+			FullPermissions: nextFull,
+			AllowAllDirs:    nextAllDirs,
+			UpdatedAt:       now,
 		}
+
+		// 在 modeMu 临界区内先原子持久化成功，再提交内存状态切换，防止并发乱序覆盖或落盘失败导致内存与磁盘/UI 割裂
+		if s.dataDir != "" {
+			if err := store.SaveSecurityMode(s.dataDir, mode); err != nil {
+				s.modeMu.Unlock()
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+		}
+
+		s.policyEng.SetFullPermissions(nextFull)
 		if s.fsMgr != nil {
 			s.fsMgr.SetFullPermissions(nextFull)
 			s.fsMgr.SetAllowAllDirs(nextAllDirs)
@@ -243,23 +267,8 @@ func (s *Server) handleSecurityMode(w http.ResponseWriter, r *http.Request) {
 		if s.broker != nil {
 			autoApproved = s.broker.SetFullPermissions(nextFull)
 		}
-
-		now := time.Now().UTC()
 		s.securityUpdatedAt = now
-		mode := store.SecurityMode{
-			FullPermissions: nextFull,
-			AllowAllDirs:    nextAllDirs,
-			UpdatedAt:       now,
-		}
-		dataDir := s.dataDir
 		s.modeMu.Unlock()
-
-		if dataDir != "" {
-			if err := store.SaveSecurityMode(dataDir, mode); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-				return
-			}
-		}
 
 		if s.broker != nil {
 			s.broker.EmitEvent("security_mode_changed", mode)

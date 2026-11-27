@@ -191,14 +191,15 @@ func (b *Broker) IsFullPermissions() bool {
 }
 
 // SetFullPermissions 动态开启或关闭全部权限（免审批）模式。
-// 开启且未处于急停暂停时，会自动批准当前队列中所有等待中的审批单并返回自动批准条数。
+// 开启且未处于急停暂停时，会先清理已过期审批单，再自动批准当前队列中所有未过期审批单并返回自动批准条数。
 func (b *Broker) SetFullPermissions(enabled bool) int {
 	b.mu.Lock()
+	now := time.Now().UTC()
+	b.expireStaleLocked(now)
 	b.fullPermissions = enabled
 	var asyncItems []*pendingItem
 	autoApproved := 0
 	if enabled && !b.pauseState.Paused && len(b.pendingOrder) > 0 {
-		now := time.Now().UTC()
 		for _, id := range b.pendingOrder {
 			item, ok := b.pending[id]
 			if !ok {
@@ -671,6 +672,19 @@ func (b *Broker) runExecOnce(item *pendingItem) {
 			return
 		}
 		b.mu.Lock()
+		// 二次检查急停状态：防止批准/开启全权限后异步启动瞬间用户触发 Pause/KillAll 导致竞态执行
+		if b.pauseState.Paused {
+			reason := b.pauseState.Reason
+			if reason == "" {
+				reason = "系统已处于急停暂停状态"
+			}
+			item.req.ExecStatus = "FAILED"
+			item.req.ExecError = "系统处于急停暂停状态，取消后台执行：" + reason
+			snapshot := item.req
+			b.broadcastLocked(Event{Type: "approval_resolved", Payload: snapshot})
+			b.mu.Unlock()
+			return
+		}
 		item.req.ExecStatus = "RUNNING"
 		b.mu.Unlock()
 

@@ -227,4 +227,28 @@ func TestFullPermissionsAutoApproveAndRespectsPause(t *testing.T) {
 	if _, err := broker.RequestApproval(context.Background(), Request{Tool: "workspace.patch", RiskLevel: policy.RiskL1}); err == nil {
 		t.Fatalf("急停暂停状态必须仍然拦截请求")
 	}
+
+	// 5. 已过期的历史待审批单在开启全权限时绝不能被误批执行
+	broker2 := NewBroker(0, 30, nil)
+	broker2.ConfigureRemote(1, 1, 60)
+	executed := false
+	_, _ = broker2.ExecuteWithApproval(context.Background(), Request{
+		ClientID:    "cli_expire",
+		IsRemote:    true,
+		Fingerprint: "fp_expire",
+		Tool:        "workspace.patch",
+		WorkspaceID: "demo",
+		RiskLevel:   policy.RiskL1,
+	}, func() (any, error) {
+		executed = true
+		return "should-not-run", nil
+	}, nil)
+	time.Sleep(1100 * time.Millisecond)
+	if n := broker2.SetFullPermissions(true); n != 0 {
+		t.Fatalf("已过期审批单不应被 SetFullPermissions 自动批准，实际 n=%d", n)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if executed {
+		t.Fatalf("已过期审批单的回调绝不能被执行")
+	}
 }

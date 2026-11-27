@@ -67,9 +67,9 @@ type TasksConfig struct {
 
 // SecurityConfig 定义全局敏感文件拒绝规则、命令分层白名单策略与动态权限模式开关。
 type SecurityConfig struct {
-	// FullPermissions 为 true 时默认开启全部权限模式：免除一切审批并放开命令与敏感文件限制。
+	// FullPermissions 为 true 时默认开启全部权限模式：免除常规操作审批并放开常规命令限制（SSH 私钥与密钥目录等硬红线仍始终生效）。
 	FullPermissions bool `yaml:"full_permissions,omitempty"`
-	// AllowAllDirs 为 true 时默认开启全部目录模式：允许 Agent 控制宿主机任意目录，不限于配置的工作区。
+	// AllowAllDirs 为 true 时默认开启全部目录模式：允许 Agent 控制宿主机任意普通目录，不限于配置的工作区（敏感密钥目录仍强制隐藏与拦截）。
 	AllowAllDirs    bool                `yaml:"allow_all_dirs,omitempty"`
 	GlobalDenyGlobs []string            `yaml:"global_deny_globs"`
 	CommandPolicy   CommandPolicyConfig `yaml:"command_policy"`
@@ -172,10 +172,13 @@ type OAuthConfig struct {
 	RateLimitPerMinute       int      `yaml:"rate_limit_per_minute"`
 }
 
-// HardSecretDenyGlobs 返回内核级强制生效的敏感密钥目录与私钥文件保护规则。
-// 即使开启「全部权限」与「默认全部目录」，命中该列表的目录与文件也永远禁止查看、列出、搜索、读取与修改。
+// HardSecretDenyGlobs 返回内核级强制生效的敏感密钥目录与私钥/凭证文件保护规则。
+// 即使开启「全部权限」与「默认全部目录」，或用户在 YAML 中自定义 global_deny_globs，
+// 命中该列表的目录与文件也永远禁止查看、列出、搜索、读取与修改。
 func HardSecretDenyGlobs() []string {
 	return []string{
+		"**/.env",
+		"**/.env.*",
 		"**/.ssh",
 		"**/.ssh/**",
 		"**/.gnupg",
@@ -188,6 +191,9 @@ func HardSecretDenyGlobs() []string {
 		"**/.netrc",
 		"**/_netrc",
 		"**/.git-credentials",
+		"**/.npmrc",
+		"**/.pypirc",
+		"**/credentials.json",
 		"**/id_rsa*",
 		"**/id_ed25519*",
 		"**/id_ecdsa*",

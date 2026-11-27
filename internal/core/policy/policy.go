@@ -32,10 +32,11 @@ const (
 
 // Evaluation 表示策略评估的详细结果。
 type Evaluation struct {
-	RiskLevel      RiskLevel `json:"risk_level"`
-	Action         Action    `json:"action"`
-	AllowBatchTTL  bool      `json:"allow_batch_ttl"` // 是否允许享受工作区限时批量授权（仅 L1 为 true）
-	Reason         string    `json:"reason"`
+	RiskLevel           RiskLevel `json:"risk_level"`
+	Action              Action    `json:"action"`
+	AllowBatchTTL       bool      `json:"allow_batch_ttl"`                  // 是否允许享受工作区限时批量授权（仅 L1 为 true）
+	BypassedByFullPerms bool      `json:"bypassed_by_full_perms,omitempty"` // 本次放行是否由「全部权限模式」触发（供审计精确记录）
+	Reason              string    `json:"reason"`
 }
 
 // Engine 封装基于配置的风险评估引擎，并支持运行时动态切换“全部权限模式”。
@@ -56,17 +57,23 @@ var dangerousPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bremove-item\b[^\n]*-recurse[^\n]*-force[^\n]*([a-z]:\\|/)`),
 }
 
+var encodedShellPattern = regexp.MustCompile(`(?i)\b(powershell|pwsh)\b[^\n]*\s-(e|ec|enc|encodedcommand)\b`)
+
 // secretAccessPatterns 定义不可被「全部权限模式」绕过的密钥目录与私钥/凭证访问硬红线。
+// 注意：结尾边界包含括号/花括号/反引号等 Shell 语法符，且对易冲突后缀（如 .key）做更精确的路径/文件名限定以减少对 jq '.key'、go test -run 等正常命令的误杀。
 var secretAccessPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%])\.ssh(?:$|[\\/\s"';,&|<>])`),
-	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%])\.gnupg(?:$|[\\/\s"';,&|<>])`),
-	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%])\.aws(?:$|[\\/\s"';,&|<>])`),
-	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%])\.kube(?:$|[\\/\s"';,&|<>])`),
-	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/])(id_rsa|id_ed25519|id_ecdsa|id_dsa)(?:\.[a-z0-9_-]+)?(?:$|[\s"';,&|<>])`),
-	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/])authorized_keys(?:$|[\s"';,&|<>])`),
-	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/])(?:\.git-credentials|\.netrc|_netrc)(?:$|[\s"';,&|<>])`),
-	regexp.MustCompile(`(?i)\.(?:pem|key|ppk|p12|pfx|jks|keystore|kdbx)(?:$|[\s"';,&|<>])`),
-	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/])nodebridge\.yaml(?:$|[\s"';,&|<>])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])\.ssh(?:$|[\\/\s"';,&|<>)\]\}` + "`" + `])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])\.gnupg(?:$|[\\/\s"';,&|<>)\]\}` + "`" + `])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])\.aws(?:$|[\\/\s"';,&|<>)\]\}` + "`" + `])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])\.kube(?:$|[\\/\s"';,&|<>)\]\}` + "`" + `])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])\.docker[\\/]config\.json(?:$|[\s"';,&|<>)\]\}` + "`" + `])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])\.env(?:\.[a-z0-9_.-]+)?(?:$|[\s"';,&|<>)\]\}` + "`" + `])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])(?:\.npmrc|\.pypirc|\.git-credentials|\.netrc|_netrc|credentials\.json)(?:$|[\s"';,&|<>)\]\}` + "`" + `])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])(id_rsa|id_ed25519|id_ecdsa|id_dsa)(?:\.[a-z0-9_-]+)?(?:$|[\s"';,&|<>)\]\}` + "`" + `])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])authorized_keys(?:$|[\s"';,&|<>)\]\}` + "`" + `])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])[a-z0-9._\\/-]+\.(?:pem|ppk|p12|pfx|jks|keystore|kdbx)(?:$|[\s"';,&|<>)\]\}` + "`" + `])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])(?:[a-z0-9_-]+[\\/])*[a-z0-9_-]+\.key(?:$|[\s"';,&|<>)\]\}` + "`" + `])`),
+	regexp.MustCompile(`(?i)(?:^|[\s"'=:\\/;,&|<>~%(\[\{` + "`" + `])nodebridge\.yaml(?:$|[\s"';,&|<>)\]\}` + "`" + `])`),
 }
 
 // NewEngine 根据安全配置构建策略引擎。
@@ -109,9 +116,10 @@ func (e *Engine) FullPermissions() bool {
 // EvaluateTool 对非终端类内置 MCP 工具给出风险评估结果。
 func (e *Engine) EvaluateTool(toolName string) Evaluation {
 	ev := e.evaluateToolBase(toolName)
-	if e.fullPermissions.Load() {
+	if e.fullPermissions.Load() && ev.Action != ActionAllow {
 		ev.Action = ActionAllow
 		ev.AllowBatchTTL = false
+		ev.BypassedByFullPerms = true
 		ev.Reason = "已开启全部权限模式，免审批直接放行"
 	}
 	return ev
@@ -160,23 +168,89 @@ func (e *Engine) EvaluateCommand(executable string, args []string, useShell bool
 			Reason:    "命令不能为空",
 		}
 	}
-	// 硬红线：任何模式（含全部权限模式）下都禁止通过命令直接查看、读取、修改或删除 SSH 私钥、密钥目录与凭证文件
-	for _, re := range secretAccessPatterns {
-		if re.MatchString(fullLine) {
-			return Evaluation{
-				RiskLevel: RiskL3,
-				Action:    ActionDeny,
-				Reason:    "命中敏感密钥/凭证硬保护红线（禁止通过命令查看、读取或修改 SSH 私钥、密钥目录等敏感凭证）",
-			}
+	// 硬红线 1：禁止编码 PowerShell 命令（防 Base64 编码绕过密钥保护与输出脱敏）
+	if encodedShellPattern.MatchString(fullLine) {
+		return Evaluation{
+			RiskLevel: RiskL3,
+			Action:    ActionDeny,
+			Reason:    "命中编码命令硬保护红线（禁止使用 PowerShell -EncodedCommand 规避安全检查）",
+		}
+	}
+	// 硬红线 2：任何模式（含全部权限模式）下都禁止通过命令直接查看、读取、修改或删除 SSH 私钥、密钥目录与凭证文件
+	if matchesSecretAccess(executable, args, useShell, fullLine) {
+		return Evaluation{
+			RiskLevel: RiskL3,
+			Action:    ActionDeny,
+			Reason:    "命中敏感密钥/凭证硬保护红线（禁止通过命令查看、读取或修改 SSH 私钥、密钥目录等敏感凭证）",
 		}
 	}
 	ev := e.evaluateCommandBase(executable, args, useShell, fullLine)
-	if e.fullPermissions.Load() {
+	if e.fullPermissions.Load() && ev.Action != ActionAllow {
 		ev.Action = ActionAllow
 		ev.AllowBatchTTL = false
+		ev.BypassedByFullPerms = true
 		ev.Reason = "已开启全部权限模式，跳过策略拦截与人工审批直接放行"
 	}
 	return ev
+}
+
+// matchesSecretAccess 精确检查命令是否访问敏感密钥/凭证路径，同时在参数数组模式下避免误杀 git commit 消息或 go test 过滤正则。
+func matchesSecretAccess(executable string, args []string, useShell bool, fullLine string) bool {
+	if useShell {
+		for _, re := range secretAccessPatterns {
+			if re.MatchString(fullLine) {
+				return true
+			}
+		}
+		return false
+	}
+
+	execName := normalizeExecName(executable)
+	// 参数数组模式逐参检查，跳过明显非文件路径的文本参数（如 git commit -m <msg>、go test -run <regex>、jq 过滤表达式）
+	for i, arg := range args {
+		if isNonFileTextArg(execName, args, i) {
+			continue
+		}
+		for _, re := range secretAccessPatterns {
+			if re.MatchString(arg) {
+				return true
+			}
+		}
+	}
+	for _, re := range secretAccessPatterns {
+		if re.MatchString(executable) {
+			return true
+		}
+	}
+	return false
+}
+
+func isNonFileTextArg(execName string, args []string, idx int) bool {
+	if idx <= 0 {
+		// jq 第一个非 flag 参数是过滤表达式（如 jq '.key' data.json）
+		if execName == "jq" && idx == 0 && !strings.HasPrefix(args[0], "-") {
+			return true
+		}
+		return false
+	}
+	prev := strings.ToLower(strings.TrimSpace(args[idx-1]))
+	switch execName {
+	case "git":
+		sub := strings.ToLower(strings.TrimSpace(args[0]))
+		if sub == "commit" && (prev == "-m" || prev == "--message") {
+			return true
+		}
+	case "go":
+		sub := strings.ToLower(strings.TrimSpace(args[0]))
+		if sub == "test" && (prev == "-run" || prev == "-bench" || prev == "-skip") {
+			return true
+		}
+	case "rg", "grep":
+		if prev == "-e" || prev == "--regexp" {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Engine) evaluateCommandBase(executable string, args []string, useShell bool, fullLine string) Evaluation {

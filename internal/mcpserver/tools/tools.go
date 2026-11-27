@@ -449,8 +449,8 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 			}, nil
 		}
 
-		// 3. 急停检查与按需混合人工审批
-		if ev.Action == policy.ActionRequireApproval {
+		// 3. 急停检查与按需混合人工审批（远程客户端在全权限模式下同样经 Broker 复用指纹幂等去重与急停校验）
+		if ev.Action == policy.ActionRequireApproval || (p.IsRemote && ev.BypassedByFullPerms) {
 			cmdPreview := formatCommandPreview(in)
 			fp := approval.ComputeFingerprint(p.ClientID, "terminal.start", in.WorkspaceID, in)
 			outcome, err := d.Broker.ExecuteWithApproval(ctx, approval.Request{
@@ -499,7 +499,7 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 		rawRes, err := startTaskFn()
 		decisionTag := "AUTO_ALLOW"
 		approver := ""
-		if d.Policy.FullPermissions() {
+		if ev.BypassedByFullPerms {
 			decisionTag = "AUTO_ALLOW_FULL_PERMISSIONS"
 			approver = "full-permissions-mode"
 		}
@@ -619,7 +619,8 @@ func registerApprovalTools(srv *mcp.Server, d Deps) {
 }
 
 // authorizePrincipal 执行阶段二客户端级工作区子集与只读权限护栏校验。
-// 当开启“默认全部目录模式”时放开工作区白名单限制；当开启“全部权限模式”时放开只读写入拦截。
+// 遵循最小权限原则：单个 OAuth 客户端显式绑定的只读模式始终生效，不会被全局「全部权限」静默突破；
+// 当开启「默认全部目录模式」时放开工作区白名单限制，允许可读写或只读客户端按自身读写级别访问任意普通目录。
 func authorizePrincipal(
 	ctx context.Context,
 	d Deps,
@@ -630,14 +631,13 @@ func authorizePrincipal(
 ) error {
 	p := session.FromContext(ctx)
 	allowAllDirs := d.FS != nil && d.FS.AllowAllDirs()
-	fullPerms := d.Policy != nil && d.Policy.FullPermissions()
 
 	if !allowAllDirs && workspaceID != "" && !p.CanAccessWorkspace(workspaceID) {
 		err := fmt.Errorf("当前远程客户端（%s）未被授权访问工作区 %q", p.ClientName, workspaceID)
 		recordAudit(ctx, d.Audit, toolName, workspaceID, risk, args, "CLIENT_WORKSPACE_DENIED", "", start, err)
 		return err
 	}
-	if !fullPerms && requiresWrite && !p.HasWritePermission() {
+	if requiresWrite && !p.HasWritePermission() {
 		err := fmt.Errorf("当前远程客户端（%s）处于只读授权模式，禁止执行写入或变更类操作 %q", p.ClientName, toolName)
 		recordAudit(ctx, d.Audit, toolName, workspaceID, risk, args, "CLIENT_READONLY_DENIED", "", start, err)
 		return err

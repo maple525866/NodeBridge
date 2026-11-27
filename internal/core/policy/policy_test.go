@@ -78,7 +78,7 @@ func TestFullPermissionsModeBypassesRestrictions(t *testing.T) {
 		t.Fatalf("空命令即使在全权限模式下也应被拒绝，实际: %+v", ev)
 	}
 
-	// 硬保护红线：即使在全部权限模式下，访问 SSH 私钥/密钥目录的命令也必须强制拒绝
+	// 硬保护红线：即使在全部权限模式下，访问 SSH 私钥/密钥目录及编码命令也必须强制拒绝
 	for _, tc := range []struct {
 		exe   string
 		args  []string
@@ -91,10 +91,28 @@ func TestFullPermissionsModeBypassesRestrictions(t *testing.T) {
 		{"rm -rf ~/.gnupg", nil, true},
 		{"cat", []string{"server.key"}, false},
 		{"cat", []string{"cert.pem"}, false},
+		{"(cat server.pem)", nil, true},
+		{"cat", []string{".env"}, false},
+		{"cat", []string{"~/.docker/config.json"}, false},
 		{"cat", []string{"nodebridge.yaml"}, false},
+		{"powershell", []string{"-EncodedCommand", "ZQBjAGgAbwAgAGgAaQA="}, false},
 	} {
 		if ev := eng.EvaluateCommand(tc.exe, tc.args, tc.shell); ev.Action != ActionDeny {
 			t.Fatalf("全权限模式下访问敏感密钥命令 %q %v 必须被硬红线拒绝，实际: %+v", tc.exe, tc.args, ev)
+		}
+	}
+
+	// 防误杀回归：正常开发命令（jq / go test -run / git commit -m）不应被密钥正则误杀
+	for _, tc := range []struct {
+		exe  string
+		args []string
+	}{
+		{"jq", []string{".key", "data.json"}},
+		{"go", []string{"test", "-run", "TestMap.Key", "./..."}},
+		{"git", []string{"commit", "-m", "fix config.key and nodebridge.yaml docs"}},
+	} {
+		if ev := eng.EvaluateCommand(tc.exe, tc.args, false); ev.Action == ActionDeny {
+			t.Fatalf("正常开发命令 %q %v 不应被密钥红线误杀: %+v", tc.exe, tc.args, ev)
 		}
 	}
 

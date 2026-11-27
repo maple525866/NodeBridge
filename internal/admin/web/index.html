@@ -252,6 +252,9 @@ let state = {
 };
 let eventSource = null;
 let lastOAuthPendingKey = '';
+let stateReqSeq = 0;
+let sseRefreshTimer = null;
+let securityModeBusy = false;
 
 function init() {
   const params = new URLSearchParams(window.location.search);
@@ -309,8 +312,20 @@ async function connect() {
 }
 
 async function refreshState() {
-  state = await api('/api/state');
+  const seq = ++stateReqSeq;
+  const nextState = await api('/api/state');
+  // 丢弃乱序晚到的旧状态响应，避免并发刷新覆盖最新界面状态
+  if (seq !== stateReqSeq) return;
+  state = nextState;
   renderAll();
+}
+
+function scheduleRefreshState() {
+  if (sseRefreshTimer) return;
+  sseRefreshTimer = setTimeout(() => {
+    sseRefreshTimer = null;
+    refreshState().catch(e => console.error(e));
+  }, 120);
 }
 
 function startSSE() {
@@ -323,7 +338,7 @@ function startSSE() {
     'approval_created', 'approval_resolved', 'grants_updated', 'pause_changed',
     'security_mode_changed', 'task_updated', 'audit_recorded', 'relay_updated',
     'oauth_auth_requested', 'oauth_auth_resolved', 'oauth_clients_updated', 'oauth_pairing_created'
-  ].forEach(evt => eventSource.addEventListener(evt, () => refreshState()));
+  ].forEach(evt => eventSource.addEventListener(evt, () => scheduleRefreshState()));
 }
 
 function esc(s) {
@@ -364,7 +379,8 @@ function renderAll() {
   const cardFull = document.getElementById('cardFullPermissions');
   const badgeFull = document.getElementById('badgeFullPermissions');
   const pillFull = document.getElementById('fullPermPill');
-  chkFull.checked = fullPermOn;
+  if (!securityModeBusy) chkFull.checked = fullPermOn;
+  chkFull.disabled = securityModeBusy;
   cardFull.className = 'mode-toggle' + (fullPermOn ? ' active-danger' : '');
   badgeFull.textContent = fullPermOn ? '已开启 · 免审批' : '未开启';
   badgeFull.className = 'pill ' + (fullPermOn ? 'pill-l3' : 'pill-l0');
@@ -374,7 +390,8 @@ function renderAll() {
   const cardDirs = document.getElementById('cardAllowAllDirs');
   const badgeDirs = document.getElementById('badgeAllowAllDirs');
   const pillDirs = document.getElementById('allDirsPill');
-  chkDirs.checked = allDirsOn;
+  if (!securityModeBusy) chkDirs.checked = allDirsOn;
+  chkDirs.disabled = securityModeBusy;
   cardDirs.className = 'mode-toggle' + (allDirsOn ? ' active-warn' : '');
   badgeDirs.textContent = allDirsOn ? '已开启 · 任意目录' : '未开启';
   badgeDirs.className = 'pill ' + (allDirsOn ? 'pill-l2' : 'pill-l0');
@@ -446,9 +463,13 @@ function renderAll() {
   document.getElementById('pendingCount').textContent = pending.length;
   const pEl = document.getElementById('pendingList');
   if (!pending.length) {
-    pEl.innerHTML = fullPermOn
-      ? '<div class="empty" style="color:#fca5a5;">当前已开启「全部权限模式」，所有 Agent 操作将自动免审批放行。</div>'
-      : '<div class="empty">当前没有等待人工确认的工具操作。</div>';
+    if (state.pause && state.pause.paused) {
+      pEl.innerHTML = '<div class="empty" style="color:#fca5a5;">当前处于「急停/暂停」状态，所有新任务与写入操作均已被拦截（优先级高于全部权限模式）。</div>';
+    } else if (fullPermOn) {
+      pEl.innerHTML = '<div class="empty" style="color:#fca5a5;">当前已开启「全部权限模式」，常规 Agent 操作将自动免审批放行（已绑定为只读的远程客户端仍仅限只读，密钥目录仍受硬保护）。</div>';
+    } else {
+      pEl.innerHTML = '<div class="empty">当前没有等待人工确认的工具操作。</div>';
+    }
   } else {
     pEl.innerHTML = pending.map(r => `
       <div class="card">
@@ -678,24 +699,36 @@ async function resumeAll() {
   refreshState();
 }
 async function toggleSecurityMode(field, enabled) {
+  if (securityModeBusy) {
+    renderAll();
+    return;
+  }
   if (enabled) {
     const msg = field === 'full_permissions'
-      ? '确认开启「全部权限模式」？\n开启后将免除操作审批（当前挂起的待审批操作也会立即自动放行）；SSH 私钥与密钥目录等敏感凭证仍受不可绕过的硬保护与脱敏约束。'
+      ? '确认开启「全部权限模式」？\n开启后将免除常规操作审批（当前挂起的待审批操作也会立即自动放行）；SSH 私钥与密钥目录等敏感凭证仍受硬保护与输出脱敏约束，显式只读客户端仍仅限只读。'
       : '确认开启「默认全部目录模式」？\n开启后 Agent 将不受单个工作区目录限制，可访问并控制宿主机上的任意普通目录（.ssh/.gnupg/.aws 等密钥目录仍强制隐藏并禁止访问）。';
     if (!confirm(msg)) {
       renderAll();
       return;
     }
   }
+  securityModeBusy = true;
+  document.getElementById('chkFullPermissions').disabled = true;
+  document.getElementById('chkAllowAllDirs').disabled = true;
   try {
     await api('/api/security/mode', {
       method: 'POST',
       body: JSON.stringify({ [field]: enabled })
     });
-    await refreshState();
   } catch (e) {
     alert(e.message);
-    renderAll();
+  } finally {
+    securityModeBusy = false;
+    try {
+      await refreshState();
+    } catch (_) {
+      renderAll();
+    }
   }
 }
 async function cancelTask(id) {

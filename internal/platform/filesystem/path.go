@@ -182,11 +182,7 @@ func (m *Manager) GetWorkspace(id string) (*Workspace, error) {
 		}, nil
 	}
 
-	// 全部目录模式下，其它未知 workspace_id 仍回退默认基准工作区，减少模型调用阻力
-	if ws, ok := m.workspaces[m.defaultWSID]; ok {
-		return ws, nil
-	}
-	return nil, fmt.Errorf("%w: 未授权的工作区 %q", ErrAccessDenied, id)
+	return nil, fmt.Errorf("%w: 未授权的工作区 %q（全部目录模式下请留空/填 default，或直接传入有效绝对目录路径）", ErrAccessDenied, id)
 }
 
 // LockPath 对指定规范化绝对路径加锁，防止同一文件并发修改冲突。
@@ -209,7 +205,8 @@ func (m *Manager) LockPath(absPath string) func() {
 
 // Resolve 将用户/模型传入的路径解析并验证安全边界。
 // 在默认模式下严格限制在授权工作区内并拦截敏感文件；
-// 开启“全部目录模式”后放开目录边界限制，开启“全部权限模式”后放开只读与敏感文件拦截。
+// 开启“全部目录模式”后放开普通目录边界限制，开启“全部权限模式”后放开工作区只读限制；
+// 敏感密钥目录与私钥文件硬保护红线在任何模式下均始终强制生效。
 func (m *Manager) Resolve(workspaceID, targetPath string, forWrite bool) (*ResolvedPath, error) {
 	allowAllDirs := m.AllowAllDirs()
 	fullPerms := m.FullPermissions()
@@ -381,11 +378,14 @@ func checkDangerousPathSyntax(raw string) error {
 		return fmt.Errorf("%w: 路径包含非法冒号或 Alternate Data Stream %q", ErrAccessDenied, raw)
 	}
 
-	// 拦截 Windows 保留设备名（跨平台统一拦截以保持策略一致）
+	// 拦截 Windows 保留设备名及尾随点号/空格（防御 Windows NTFS 自动剥离末尾 . / 空格绕过敏感文件扩展名检查）
 	norm := strings.ReplaceAll(raw, `\`, `/`)
 	for _, seg := range strings.Split(norm, "/") {
 		if seg == "" || seg == "." || seg == ".." {
 			continue
+		}
+		if strings.HasSuffix(seg, ".") || strings.HasSuffix(seg, " ") {
+			return fmt.Errorf("%w: 路径段 %q 包含非法尾随点号或空格", ErrAccessDenied, seg)
 		}
 		if isWindowsReservedName(seg) {
 			return fmt.Errorf("%w: 路径包含系统保留设备名 %q", ErrAccessDenied, seg)

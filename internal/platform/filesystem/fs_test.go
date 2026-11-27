@@ -49,6 +49,8 @@ func TestSecurityPathBlocking(t *testing.T) {
 		{"Windows设备路径", `\\.\PhysicalDrive0`},
 		{"ADS数据流", `hello.go:hidden_stream`},
 		{"Windows保留名", `sub/NUL.txt`},
+		{"Windows尾随点号绕过", `nodebridge.yaml.`},
+		{"Windows尾随空格绕过", `server.key `},
 		{"敏感文件.env", `.env`},
 		{"敏感私钥id_rsa", `sub/id_rsa`},
 		{"NUL字节注入", "hello.go\x00.txt"},
@@ -245,5 +247,52 @@ func TestAllowAllDirsAndFullPermissionsModes(t *testing.T) {
 	mgr.SetAllowAllDirs(false)
 	if _, err := mgr.Read("demo", outsideFile, 1, 10); !errors.Is(err, ErrAccessDenied) {
 		t.Fatalf("关闭全部目录模式后应恢复拦截工作区外文件，实际 err=%v", err)
+	}
+}
+
+func TestSymlinkCannotBypassSecretGuardInListAndSearch(t *testing.T) {
+	mgr, wsDir := setupTestFS(t)
+	outsideDir := t.TempDir()
+	outsideSSH := filepath.Join(outsideDir, ".ssh")
+	if err := os.MkdirAll(outsideSSH, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outsideKey := filepath.Join(outsideSSH, "id_rsa")
+	if err := os.WriteFile(outsideKey, []byte("OUTSIDE_SSH_PRIVATE_KEY_DATA\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	linkInside := filepath.Join(wsDir, "innocent_env.txt")
+	if err := os.Symlink(filepath.Join(wsDir, ".env"), linkInside); err != nil {
+		t.Skipf("当前环境无创建符号链接权限，跳过符号链接绕过测试: %v", err)
+	}
+	linkOutside := filepath.Join(wsDir, "innocent_key.txt")
+	if err := os.Symlink(outsideKey, linkOutside); err != nil {
+		t.Skipf("当前环境无创建外部符号链接权限，跳过: %v", err)
+	}
+
+	// 默认模式与双开模式下，List 和 Search 均不得泄露指向 .env 或外部 .ssh/id_rsa 的符号链接内容
+	for _, enableAll := range []bool{false, true} {
+		mgr.SetAllowAllDirs(enableAll)
+		mgr.SetFullPermissions(enableAll)
+
+		listRes, err := mgr.List("demo", ".", 3, 100)
+		if err != nil {
+			t.Fatalf("List 失败 (all=%v): %v", enableAll, err)
+		}
+		for _, e := range listRes.Entries {
+			if strings.Contains(e.Path, "innocent_env.txt") || strings.Contains(e.Path, "innocent_key.txt") {
+				t.Fatalf("List 不应暴露指向敏感文件的符号链接 (all=%v): %s", enableAll, e.Path)
+			}
+		}
+
+		s1, err := mgr.Search("demo", "super_secret_123", false, "", 50)
+		if err != nil || len(s1.Matches) != 0 {
+			t.Fatalf("Search 不得通过同工作区符号链接泄露 .env (all=%v): err=%v matches=%+v", enableAll, err, s1)
+		}
+		s2, err := mgr.Search("demo", "OUTSIDE_SSH_PRIVATE_KEY_DATA", false, "", 50)
+		if err != nil || len(s2.Matches) != 0 {
+			t.Fatalf("Search 不得通过跨目录符号链接泄露 SSH 私钥 (all=%v): err=%v matches=%+v", enableAll, err, s2)
+		}
 	}
 }
