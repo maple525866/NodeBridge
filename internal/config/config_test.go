@@ -84,4 +84,14 @@ func TestRelayAndOAuthConfigValidation(t *testing.T) {
 	if cfg2.Relay.ResolvedTunnelToken() != "cf-secret-token-123" {
 		t.Fatalf("未正确解析环境变量令牌")
 	}
+	if !cfg2.Service.AutoRegisterEnabled() {
+		t.Fatalf("默认应开启固定域名模式自动注册开机自启")
+	}
+	if cfg2.Service.Name != "nodebridge" || cfg2.Service.Scope != "auto" {
+		t.Fatalf("Service 默认值异常: %+v", cfg2.Service)
+	}
+	cfg2.Service.Scope = "invalid_scope"
+	if err := cfg2.Validate(); err == nil {
+		t.Fatalf("应拒绝非法 service.scope")
+	}
 }

@@ -215,6 +215,26 @@ oauth:
   enabled: true
 ```
 
+### 开机自启动与系统守护进程（主机重启自动拉起）
+
+在固定域名模式（`cloudflared_named` 或 `external`）下，直接运行已编译的二进制启动守护进程即可**自动注册开机自启动并交接给系统守护进程在后台运行**（无需额外安装命令，关掉终端窗口不会中断，崩溃后自动拉起，重启主机自动恢复服务与 `cloudflared` 隧道）：
+
+```powershell
+# Windows（以管理员身份运行将注册为原生 Windows Service，支持重启未登录桌面即自启；
+# 普通终端运行将免提权注册为无黑框计划任务，登录桌面后静默自启）
+.\nodebridge.exe daemon --config nodebridge.yaml
+```
+
+```bash
+# macOS / Linux（默认注册用户级 LaunchAgent / systemd --user；加 --scope system 配合 sudo 可支持未登录开机自启）
+./nodebridge daemon --config nodebridge.yaml
+```
+
+关键特性说明：
+- **环境变量重启保活**：若配置了 `tunnel_token: "env:CLOUDFLARE_TUNNEL_TOKEN"`，自动交接时会安全捕获该变量与当前 `PATH`（含 `cloudflared` 路径）并写入 `0600` 权限的 `data/service/service.env`（已纳入内核密钥硬保护红线，Agent 永远不可读取），确保主机重启后不丢 Token。
+- **日志轮转与前台调试**：后台守护进程日志自动写入 `data/logs/daemon.log`（按大小自动轮转），可通过 `nodebridge service logs --config nodebridge.yaml` 查看；如需临时留在前台终端看实时输出，附加 `--foreground` 即可（不会修改系统自启动项）。
+- **控制台与 CLI 一体化管理**：在本地控制台 `http://127.0.0.1:18766/` 的「远程安全隧道与公网 MCP 接入」卡片中可直接查看守护状态，并点击 **「重启服务」** 或 **「取消开机自启并停止守护」**；也可通过 `nodebridge service status / restart / stop / uninstall` 管理（在 `nodebridge.yaml` 中设置 `service.auto_register: false` 可关闭自动交接）。
+
 更多细节可参阅 [docs/cloud-client-setup.md](./docs/cloud-client-setup.md)。
 
 ---
@@ -277,6 +297,13 @@ oauth:
 # 一键急停（暂停新任务 + 强杀运行中子进程树 + 可选联动断开隧道）与恢复
 ./nodebridge stop-all --config nodebridge.yaml --disconnect-tunnel
 ./nodebridge resume --config nodebridge.yaml
+
+# 开机自启动与系统守护进程管理（状态 / 轮转日志 / 重启 / 停止 / 手动安装或卸载）
+./nodebridge service status --config nodebridge.yaml
+./nodebridge service logs --config nodebridge.yaml --lines 100
+./nodebridge service restart --config nodebridge.yaml
+./nodebridge service stop --config nodebridge.yaml
+./nodebridge service uninstall --config nodebridge.yaml
 ```
 
 ---

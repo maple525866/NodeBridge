@@ -194,6 +194,7 @@
           </div>
         </h2>
         <div id="relayBox"></div>
+        <div id="autostartBox" style="margin-top:12px;"></div>
       </section>
 
       <section>
@@ -248,7 +249,7 @@ let adminToken = '';
 let state = {
   pending: [], grants: [], tasks: [], audit: [], workspaces: [], pause: {},
   security_mode: { full_permissions: false, allow_all_dirs: false },
-  relay: {}, oauth_pending: [], oauth_clients: [], pairing_codes: []
+  relay: {}, autostart: null, oauth_pending: [], oauth_clients: [], pairing_codes: []
 };
 let eventSource = null;
 let lastOAuthPendingKey = '';
@@ -528,6 +529,65 @@ function renderAll() {
     `;
   }
 
+  // 开机自启动与守护进程状态卡
+  const autoBox = document.getElementById('autostartBox');
+  const autoSt = state.autostart;
+  if (!autoSt) {
+    autoBox.innerHTML = '';
+  } else if (autoSt.installed) {
+    const bootBadge = autoSt.boot_before_login
+      ? '<span class="pill pill-ok">开机未登录即自启</span>'
+      : '<span class="pill pill-l1">登录后无黑框自启</span>';
+    const warnHtml = (autoSt.warnings && autoSt.warnings.length)
+      ? `<div style="color:#fcd34d;font-size:12px;margin-top:8px;">${autoSt.warnings.map(w => esc(w)).join('<br>')}</div>`
+      : '';
+    autoBox.innerHTML = `
+      <div class="card" style="margin-bottom:0;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <strong>开机自启动与系统守护</strong>
+            <span class="pill ${autoSt.enabled ? 'pill-ok' : 'pill-l2'}">${autoSt.enabled ? '已启用守护' : '已安装(未启用)'}</span>
+            ${bootBadge}
+          </div>
+          <div class="controls">
+            <button class="btn-warn" onclick="restartService()">重启服务</button>
+            <button class="btn-danger" onclick="uninstallService()">取消开机自启并停止守护</button>
+          </div>
+        </div>
+        <div class="meta">
+          <span>服务名: <code class="mono">${esc(autoSt.service_name)}</code></span>
+          <span>后端: <b>${esc(autoSt.backend || '-')}</b></span>
+          <span>作用域: <b>${esc(autoSt.scope || '-')}</b></span>
+          <span>状态: <b>${esc(autoSt.state || '-')}</b></span>
+        </div>
+        ${autoSt.log_file_path ? `<div style="font-size:12px;color:var(--muted);">守护日志：<code class="mono">${esc(autoSt.log_file_path)}</code></div>` : ''}
+        ${warnHtml}
+      </div>
+    `;
+  } else {
+    const hintCmd = autoSt.install_hint || 'nodebridge service install --config nodebridge.yaml';
+    autoBox.innerHTML = `
+      <div class="card" style="margin-bottom:0;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <strong>开机自启动与系统守护</strong>
+            <span class="pill ${autoSt.recommended ? 'pill-l2' : 'pill-l0'}">${autoSt.recommended ? '未配置（固定域名推荐开启）' : '未配置'}</span>
+          </div>
+          <div class="controls">
+            <button onclick="copyText('${esc(hintCmd)}')">复制安装命令</button>
+            <button class="btn-danger" onclick="uninstallService()">停止当前进程</button>
+          </div>
+        </div>
+        <div style="font-size:12.5px;color:var(--muted);margin-top:6px;">
+          ${autoSt.recommended
+            ? '固定域名模式下直接运行 <code>nodebridge daemon</code>（不带 <code>--foreground</code>）即可自动注册开机自启动并挂入系统守护进程，也可执行下方命令手动安装：'
+            : '如需宿主机重启后自动拉起守护进程，可执行下方命令安装：'}
+        </div>
+        <div style="margin-top:6px;"><span class="code-badge">${esc(hintCmd)}</span></div>
+      </div>
+    `;
+  }
+
   // 配对码工作区复选框（仅首次或工作区变化时初始化）
   const pWsEl = document.getElementById('pairWsChecks');
   if (pWsEl.dataset.wsCount !== String(wss.length)) {
@@ -667,6 +727,29 @@ async function disconnectRelay() {
   try {
     await api('/api/relay/disconnect', { method: 'POST', body: JSON.stringify({ reason: '用户在控制台一键断开隧道' }) });
     refreshState();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+async function restartService() {
+  if (!confirm('确认重启 NodeBridge 守护进程？重启期间本地控制台与远程隧道会短暂断开数秒并自动恢复。')) return;
+  try {
+    const res = await api('/api/service/restart', { method: 'POST' });
+    alert(res.message || '已触发守护进程重启，请等待数秒后刷新页面。');
+    setTimeout(() => refreshState().catch(() => {}), 3000);
+  } catch (e) {
+    alert(e.message);
+  }
+}
+async function uninstallService() {
+  const installed = !!(state.autostart && state.autostart.installed);
+  const msg = installed
+    ? '确认取消开机自启动并立即停止守护进程？\n执行后宿主机重启将不再自动拉起 NodeBridge，且当前控制台会立即断开连接。'
+    : '确认立即优雅停止当前 NodeBridge 进程？停止后控制台将断开连接。';
+  if (!confirm(msg)) return;
+  try {
+    const res = await api('/api/service/uninstall', { method: 'POST', body: JSON.stringify({ purge_env: false }) });
+    alert(res.message || '已下发停止/卸载指令。');
   } catch (e) {
     alert(e.message);
   }

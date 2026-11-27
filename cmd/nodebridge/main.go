@@ -10,12 +10,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,6 +35,7 @@ import (
 	"nodebridge/internal/platform/capability"
 	"nodebridge/internal/platform/filesystem"
 	"nodebridge/internal/platform/git"
+	"nodebridge/internal/platform/service"
 	"nodebridge/internal/transport/relay"
 )
 
@@ -77,6 +80,8 @@ func main() {
 		err = runClients(args)
 	case "mode":
 		err = runMode(args)
+	case "service":
+		err = runService(args)
 	case "doctor":
 		err = runDoctor(args)
 	case "version", "-v", "--version":
@@ -103,7 +108,8 @@ func printUsage() {
 
 子命令:
   init       生成包含随机高熵 Token 的默认配置文件 nodebridge.yaml
-  daemon     启动本地常驻守护进程（Streamable HTTP MCP + 内置 OAuth 2.1 + 安全隧道 + Web 控制台）
+  daemon     启动本地常驻守护进程（固定域名模式自动注册开机自启并交接后台守护；支持 --foreground 调试）
+  service    管理开机自启动系统守护进程（install | uninstall | start | stop | restart | status | logs）
   stdio      启动轻量 stdio 桥接模式，将 stdin/stdout MCP 请求转发到本地常驻 Daemon
   status     查看本地 Daemon 状态、远程隧道、急停状态与待审批摘要
   pair       生成 5 分钟一次性 OAuth 2.1 配对码（支持 --readonly 与 --workspaces 限定范围）
@@ -161,12 +167,96 @@ func runInit(args []string) error {
 func runDaemon(args []string) error {
 	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
 	cfgPath := fs.String("config", "nodebridge.yaml", "YAML 配置文件路径")
+	foreground := fs.Bool("foreground", false, "前台运行，不自动注册开机自启也不交接给系统守护进程（适合调试）")
+	noAutostart := fs.Bool("no-autostart", false, "跳过固定域名模式的开机自启自动注册，直接在当前终端运行")
+	managed := fs.Bool("managed", false, "内部标记：表示当前进程由系统守护管理器拉起")
+	scopeFlag := fs.String("scope", "", "覆盖自动注册开机自启的作用域: auto | user | system")
+	svcNameFlag := fs.String("service-name", "", "覆盖注册的服务名称（默认取配置 service.name）")
+	envFile := fs.String("env-file", "", "启动前加载的受限环境变量文件路径（仅填补当前环境未设置的变量）")
+	logFile := fs.String("log-file", "", "守护进程轮转日志输出文件路径")
 	_ = fs.Parse(args)
 
-	cfg, err := config.Load(*cfgPath)
+	absCfg, err := filepath.Abs(*cfgPath)
 	if err != nil {
 		return err
 	}
+
+	// 启动配置加载前先注入受限环境变量文件（如重启后的 env:CLOUDFLARE_TUNNEL_TOKEN 与工具 PATH）
+	if strings.TrimSpace(*envFile) != "" {
+		if _, err := service.LoadIntoProcessEnv(*envFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("加载服务环境变量文件失败 (%s): %w", *envFile, err)
+		}
+	} else {
+		// 若未显式传 --env-file，尝试兼容复用历史 service.env（不覆盖当前终端显式环境变量）
+		if peekEnv := service.PeekServiceEnvPath(absCfg); peekEnv != "" {
+			_, _ = service.LoadIntoProcessEnv(peekEnv)
+		}
+	}
+
+	cfg, err := config.Load(absCfg)
+	if err != nil {
+		return err
+	}
+
+	svcName := resolveServiceName(*svcNameFlag, cfg)
+	inWinSvc := isWindowsServiceProcess()
+
+	// 固定域名（cloudflared_named / external）长期稳定使用模式：
+	// 直接运行 `nodebridge daemon` 时自动注册开机自启并交接给系统守护进程后台运行（关终端不断、崩溃自动拉起、重启主机自动恢复）。
+	if !*managed && !*foreground && !*noAutostart && !inWinSvc &&
+		cfg.Service.AutoRegisterEnabled() && service.IsFixedDomainMode(cfg.Relay.EffectiveMode()) {
+		scopeVal := strings.TrimSpace(*scopeFlag)
+		if scopeVal == "" {
+			scopeVal = cfg.Service.Scope
+		}
+		scope, err := service.ParseScope(scopeVal)
+		if err != nil {
+			return err
+		}
+		st, warnings, err := installServiceForConfig(cfg, absCfg, installServiceParams{
+			ServiceName: svcName,
+			Scope:       scope,
+			StartNow:    true,
+		})
+		if err != nil {
+			return fmt.Errorf("固定域名模式自动配置开机自启守护进程失败: %w（若仅需临时前台调试，请附加 --foreground 参数）", err)
+		}
+		fmt.Println("已检测到固定域名长期运行模式，已自动注册开机自启动并交接给系统守护进程在后台运行（关闭当前终端窗口不会中断服务）。")
+		printServiceStatus(st, warnings, false)
+		fmt.Printf("本地安全控制台: http://%s/\n", cfg.Server.AdminListen)
+		fmt.Printf("常用运维: 查看日志 `%s service logs --config %s` | 前台调试请加 `--foreground`\n",
+			filepath.Base(st.ExecutablePath), absCfg)
+		return nil
+	}
+
+	// 配置守护进程轮转日志输出（Windows Service 下不写 stderr，其余模式同时输出到 stderr 与日志文件）
+	var logCloser io.Closer
+	effectiveLogPath := strings.TrimSpace(*logFile)
+	if effectiveLogPath == "" && (inWinSvc || *managed) {
+		effectiveLogPath = service.DefaultLogFilePath(cfg.Storage.DataDir, cfg.Service.LogFile)
+	}
+	if effectiveLogPath != "" {
+		rotWriter, err := service.NewRotatingLogWriter(effectiveLogPath, cfg.Service.LogMaxSizeMB, cfg.Service.LogMaxBackups)
+		if err != nil {
+			return err
+		}
+		logCloser = rotWriter
+		defer logCloser.Close()
+		if inWinSvc {
+			log.SetOutput(rotWriter)
+		} else {
+			log.SetOutput(io.MultiWriter(os.Stderr, rotWriter))
+		}
+	}
+
+	return runDaemonWithPlatformHost(svcName, func(hostCtx context.Context, onReady func()) error {
+		return executeDaemonRuntime(hostCtx, cfg, absCfg, svcName, onReady)
+	})
+}
+
+func executeDaemonRuntime(hostCtx context.Context, cfg *config.Config, absCfg, svcName string, onReady func()) error {
+	ctx, cancel := context.WithCancel(hostCtx)
+	defer cancel()
 
 	deviceIdent, err := store.LoadOrCreateDeviceIdentity(cfg.Storage.DataDir, cfg.Relay.DeviceID)
 	if err != nil {
@@ -272,6 +362,20 @@ func runDaemon(args []string) error {
 	)
 	adminSrv.AttachRemoteGovernance(deviceIdent.DeviceID, oauthSrv, cfg.Relay.KillAllDisconnectTunnel)
 	adminSrv.AttachSecurityControl(policyEng, cfg.Storage.DataDir, secMode)
+	adminSrv.AttachServiceControl(newDaemonServiceController(cfg, absCfg, svcName, func(reason string) {
+		log.Printf("[NodeBridge] 收到受控停机指令 (%s)，即将优雅退出...", reason)
+		cancel()
+	}))
+
+	mcpLn, err := net.Listen("tcp", cfg.Server.MCPListen)
+	if err != nil {
+		return fmt.Errorf("监听 MCP 地址 %s 失败（请检查是否已有另一个 NodeBridge 实例在运行）: %w", cfg.Server.MCPListen, err)
+	}
+	adminLn, err := net.Listen("tcp", cfg.Server.AdminListen)
+	if err != nil {
+		_ = mcpLn.Close()
+		return fmt.Errorf("监听 Admin 控制台地址 %s 失败（请检查是否已有另一个 NodeBridge 实例在运行）: %w", cfg.Server.AdminListen, err)
+	}
 
 	mcpHTTP := &http.Server{
 		Addr:              cfg.Server.MCPListen,
@@ -284,17 +388,20 @@ func runDaemon(args []string) error {
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	if err := relayConn.Start(ctx, mcpHandler); err != nil {
+		_ = mcpLn.Close()
+		_ = adminLn.Close()
 		return err
+	}
+
+	if onReady != nil {
+		onReady()
 	}
 
 	errCh := make(chan error, 2)
 	go func() {
 		log.Printf("[NodeBridge] MCP Streamable HTTP 已启动: http://%s/mcp", cfg.Server.MCPListen)
-		if err := mcpHTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := mcpHTTP.Serve(mcpLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("MCP HTTP 服务异常退出: %w", err)
 		}
 	}()
@@ -303,7 +410,7 @@ func runDaemon(args []string) error {
 		log.Printf("[NodeBridge] 设备 ID=%s | %s/%s | Git=%v | Shell=%s | 工作区=%d | 全部权限=%v | 全部目录=%v | Relay=%s | OAuth2.1=%v",
 			deviceIdent.DeviceID, capInfo.OS, capInfo.Arch, capInfo.GitAvailable, capInfo.DefaultShell,
 			len(cfg.Workspaces), secMode.FullPermissions, secMode.AllowAllDirs, cfg.Relay.EffectiveMode(), oauthSrv != nil)
-		if err := adminHTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := adminHTTP.Serve(adminLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("Admin Web 服务异常退出: %w", err)
 		}
 	}()
@@ -316,13 +423,118 @@ func runDaemon(args []string) error {
 	}
 
 	broker.KillAll("Daemon 正在关闭")
-	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutCancel()
 	_ = relayConn.Stop(shutCtx)
 	_ = mcpHTTP.Shutdown(shutCtx)
 	_ = adminHTTP.Shutdown(shutCtx)
 	log.Println("[NodeBridge] 已安全停止。")
 	return nil
+}
+
+type daemonServiceController struct {
+	cfg        *config.Config
+	cfgPath    string
+	svcName    string
+	exePath    string
+	shutdownFn func(reason string)
+
+	mu        sync.Mutex
+	cachedAt  time.Time
+	cachedVal service.Status
+}
+
+func newDaemonServiceController(cfg *config.Config, cfgPath, svcName string, shutdownFn func(reason string)) *daemonServiceController {
+	exe, _ := os.Executable()
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return &daemonServiceController{
+		cfg:        cfg,
+		cfgPath:    cfgPath,
+		svcName:    svcName,
+		exePath:    exe,
+		shutdownFn: shutdownFn,
+	}
+}
+
+func (d *daemonServiceController) Status() service.Status {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if time.Since(d.cachedAt) < 3*time.Second && d.cachedVal.ServiceName != "" {
+		return d.cachedVal
+	}
+	st := service.ProbeSummary(d.cfg, d.cfgPath)
+	if strings.TrimSpace(d.svcName) != "" {
+		st.ServiceName = d.svcName
+	}
+	d.cachedVal = st
+	d.cachedAt = time.Now()
+	return st
+}
+
+func (d *daemonServiceController) invalidateCache() {
+	d.mu.Lock()
+	d.cachedAt = time.Time{}
+	d.mu.Unlock()
+}
+
+func (d *daemonServiceController) Restart() error {
+	d.invalidateCache()
+	st := d.Status()
+	if !st.Installed {
+		return errors.New("当前尚未安装开机自启动守护进程")
+	}
+	if st.Scope == service.ScopeSystem && !service.IsAdmin() {
+		return errors.New("当前进程为非管理员权限，无法从 Web 控制台直接重启系统级服务；请使用管理员终端执行 `nodebridge service restart`")
+	}
+	if strings.TrimSpace(d.exePath) == "" {
+		return errors.New("无法解析当前可执行文件路径，无法执行脱离重启")
+	}
+	args := []string{
+		"service", "restart",
+		"--config", d.cfgPath,
+		"--scope", string(st.Scope),
+		"--name", st.ServiceName,
+		"--delay-ms", "400",
+	}
+	return service.LaunchDetachedCommand(d.exePath, args...)
+}
+
+func (d *daemonServiceController) Uninstall(purgeEnv bool) error {
+	d.invalidateCache()
+	st := d.Status()
+	if !st.Installed {
+		// 未注册系统开机自启时，直接优雅停止当前守护进程
+		go func() {
+			time.Sleep(250 * time.Millisecond)
+			d.Shutdown("用户在控制台停止守护进程")
+		}()
+		return nil
+	}
+	if st.Scope == service.ScopeSystem && !service.IsAdmin() {
+		return errors.New("当前进程为非管理员权限，无法从 Web 控制台直接卸载系统级服务；请使用管理员终端执行 `nodebridge service uninstall`")
+	}
+	if strings.TrimSpace(d.exePath) == "" {
+		return errors.New("无法解析当前可执行文件路径，无法执行脱离卸载")
+	}
+	args := []string{
+		"service", "uninstall",
+		"--config", d.cfgPath,
+		"--scope", string(st.Scope),
+		"--name", st.ServiceName,
+		"--delay-ms", "400",
+	}
+	if purgeEnv {
+		args = append(args, "--purge-env")
+	}
+	return service.LaunchDetachedCommand(d.exePath, args...)
+}
+
+func (d *daemonServiceController) Shutdown(reason string) {
+	if d.shutdownFn != nil {
+		d.shutdownFn(reason)
+	}
 }
 
 func runStdio(args []string) error {
@@ -598,12 +810,23 @@ func runDoctor(args []string) error {
 		fmt.Printf("%-6s %s: %s\n", icon, label, detail)
 	}
 
-	cfg, err := config.Load(*cfgPath)
+	absDoctorCfg, _ := filepath.Abs(*cfgPath)
+	cfg, err := loadConfigOptional(absDoctorCfg)
 	if err != nil {
 		check(false, "配置文件校验", err.Error())
 		return errors.New("自检未通过")
 	}
 	check(true, "配置文件校验", fmt.Sprintf("relay.mode=%s, oauth.enabled=%v, workspaces=%d", cfg.Relay.EffectiveMode(), cfg.OAuth.Enabled, len(cfg.Workspaces)))
+
+	if service.IsFixedDomainMode(cfg.Relay.EffectiveMode()) {
+		svcSt := service.ProbeSummary(cfg, absDoctorCfg)
+		if svcSt.Installed && svcSt.Enabled {
+			check(true, "开机自启守护", fmt.Sprintf("backend=%s, scope=%s, state=%s, boot_before_login=%v",
+				svcSt.Backend, svcSt.Scope, svcSt.State, svcSt.BootBeforeLogin))
+		} else {
+			fmt.Printf("[WARN] 开机自启守护: 固定域名模式尚未配置开机自启动（主机重启后不会自动拉起），请直接运行 `%s` 或不带 --foreground 启动 daemon。\n", svcSt.InstallHint)
+		}
+	}
 
 	if mode := cfg.Relay.EffectiveMode(); mode == config.RelayModeCloudflaredQuick || mode == config.RelayModeCloudflaredNamed {
 		bin := cfg.Relay.CloudflaredBin
@@ -742,7 +965,8 @@ func runKillSwitch(args []string, action string) error {
 }
 
 func callAdminAPI(cfgPath, method, path string, body any) ([]byte, error) {
-	cfg, err := config.Load(cfgPath)
+	absCfg, _ := filepath.Abs(cfgPath)
+	cfg, err := loadConfigOptional(absCfg)
 	if err != nil {
 		return nil, err
 	}
