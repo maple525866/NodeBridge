@@ -136,6 +136,35 @@ func TestCloudflaredAutoReconnectOnCrash(t *testing.T) {
 	t.Fatalf("期望崩溃后自动重连并就绪，当前状态: %+v", conn.Status())
 }
 
+func TestCloudflaredNamedCrashDoesNotFalsePositiveConnected(t *testing.T) {
+	conn := NewCloudflaredConnector(CloudflaredOptions{
+		Mode:        config.RelayModeCloudflaredNamed,
+		PublicURL:   "https://named-crash.example.com",
+		TunnelToken: "bad-token",
+		DeviceID:    "dev_named",
+		BaseBackoff: 3 * time.Second,
+		MaxBackoff:  5 * time.Second,
+		CommandFactory: func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperCloudflaredProcess", "--", "crash")
+			cmd.Env = append(os.Environ(), "GO_WANT_CLOUDFLARED_HELPER=1")
+			return cmd
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := conn.Start(ctx, nil); err != nil {
+		t.Fatalf("Start 失败: %v", err)
+	}
+	defer conn.Stop(context.Background())
+
+	// 等待超过 1.5s 假阳性定时器阈值，确认进程崩溃期间不会被误标为 Connected=true
+	time.Sleep(1800 * time.Millisecond)
+	if conn.Status().Connected {
+		t.Fatalf("进程崩溃后不应被旧定时器误标为 Connected=true: %+v", conn.Status())
+	}
+}
+
 // TestHelperCloudflaredProcess 供上方单元测试作为跨平台模拟子进程执行。
 func TestHelperCloudflaredProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_CLOUDFLARED_HELPER") != "1" {

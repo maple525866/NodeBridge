@@ -143,6 +143,17 @@ func TestOAuth21FullLifecycleAndReplayProtection(t *testing.T) {
 	if pollOut.Status != "approved" || pollOut.RedirectURL == "" {
 		t.Fatalf("poll 结果异常: %+v", pollOut)
 	}
+	// 验证 poll 一次性消费 redirect_url，第二次轮询不应再次返回含 code 的回调地址
+	pollResp2, _ := http.Get(ts.URL + "/oauth/authorize/poll?req=" + pending[0].ID)
+	var pollOut2 struct {
+		Status      string `json:"status"`
+		RedirectURL string `json:"redirect_url"`
+	}
+	_ = json.NewDecoder(pollResp2.Body).Decode(&pollOut2)
+	pollResp2.Body.Close()
+	if pollOut2.RedirectURL != "" {
+		t.Fatalf("poll 应一次性消费 redirect_url，第二次仍返回了: %s", pollOut2.RedirectURL)
+	}
 	parsedCB, _ := url.Parse(pollOut.RedirectURL)
 	code := parsedCB.Query().Get("code")
 	if code == "" || parsedCB.Query().Get("state") != "st_123" {
@@ -297,4 +308,81 @@ func TestPairingCodeOneTimeUseAndRateLimit(t *testing.T) {
 		t.Fatalf("复用已消费配对码应返回 403，实际 err=%v status=%d", err, r2.StatusCode)
 	}
 	r2.Body.Close()
+}
+
+func TestOAuthSecurityHardening(t *testing.T) {
+	srv, err := NewServer(Options{
+		Config: config.OAuthConfig{
+			Enabled:                  true,
+			AllowDynamicRegistration: true,
+			RateLimitPerMinute:       100,
+		},
+		DataDir:  t.TempDir(),
+		DeviceID: "dev_sec",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// 1. BaseURL 绝不信任伪造的 X-Forwarded-Host
+	reqMeta, _ := http.NewRequest(http.MethodGet, ts.URL+"/.well-known/oauth-authorization-server", nil)
+	reqMeta.Header.Set("X-Forwarded-Host", "evil.attacker.example")
+	respMeta, err := http.DefaultClient.Do(reqMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var asm map[string]any
+	_ = json.NewDecoder(respMeta.Body).Decode(&asm)
+	respMeta.Body.Close()
+	if strings.Contains(asm["issuer"].(string), "evil.attacker.example") {
+		t.Fatalf("BaseURL 不应信任伪造的 X-Forwarded-Host: %+v", asm)
+	}
+
+	// 2. 拒绝反射 Origin: null
+	reqNull, _ := http.NewRequest(http.MethodGet, ts.URL+"/.well-known/oauth-protected-resource", nil)
+	reqNull.Header.Set("Origin", "null")
+	respNull, err := http.DefaultClient.Do(reqNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	respNull.Body.Close()
+	if respNull.StatusCode != http.StatusForbidden {
+		t.Fatalf("Origin: null 应返回 403，实际 %d", respNull.StatusCode)
+	}
+
+	// 3. authorization_code 缺失 client_id 必须返回 400 invalid_request
+	regResp, _ := http.Post(ts.URL+"/oauth/register", "application/json", strings.NewReader(`{"client_name":"StrictClient","redirect_uris":["https://app.example/cb"]}`))
+	var regOut struct {
+		ClientID string `json:"client_id"`
+	}
+	_ = json.NewDecoder(regResp.Body).Decode(&regOut)
+	regResp.Body.Close()
+
+	verifier := "strict_client_verifier_0123456789_abcdefghijklmnop"
+	authResp, _ := http.Get(ts.URL + "/oauth/authorize?response_type=code&client_id=" + regOut.ClientID +
+		"&redirect_uri=" + url.QueryEscape("https://app.example/cb") +
+		"&code_challenge=" + makePKCE(verifier) + "&code_challenge_method=S256")
+	authResp.Body.Close()
+	pending := srv.PendingAuthRequests()
+	resolved, err := srv.ResolveAuthRequest(pending[0].ID, true, false, nil, "ok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(resolved.RedirectResult)
+	code := u.Query().Get("code")
+
+	tokResp, _ := http.PostForm(ts.URL+"/oauth/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"redirect_uri":  {"https://app.example/cb"},
+		"code_verifier": {verifier},
+	})
+	tokResp.Body.Close()
+	if tokResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("缺失 client_id 应返回 400，实际 %d", tokResp.StatusCode)
+	}
 }

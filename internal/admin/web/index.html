@@ -197,6 +197,7 @@ let state = {
   relay: {}, oauth_pending: [], oauth_clients: [], pairing_codes: []
 };
 let eventSource = null;
+let lastOAuthPendingKey = '';
 
 function init() {
   const params = new URLSearchParams(window.location.search);
@@ -323,15 +324,19 @@ function renderAll() {
 
   const wss = state.workspaces || [];
 
-  // 待确认的 OAuth 客户端绑定
+  // 待确认的 OAuth 客户端绑定（仅在待确认列表变化时重绘，避免无关 SSE 事件重置用户正在勾选的选项）
   const oPending = state.oauth_pending || [];
   const oSec = document.getElementById('oauthPendingSection');
   document.getElementById('oauthPendingCount').textContent = oPending.length;
+  const oKey = oPending.map(r => r.id).join(',') + '|' + wss.map(w => w.ID).join(',');
   if (!oPending.length) {
     oSec.style.display = 'none';
+    lastOAuthPendingKey = '';
   } else {
     oSec.style.display = 'block';
-    document.getElementById('oauthPendingList').innerHTML = oPending.map(req => `
+    if (oKey !== lastOAuthPendingKey) {
+      lastOAuthPendingKey = oKey;
+      document.getElementById('oauthPendingList').innerHTML = oPending.map(req => `
       <div class="card card-highlight">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
           <div>
@@ -355,6 +360,7 @@ function renderAll() {
         </div>
       </div>
     `).join('');
+    }
   }
 
   // 待审批工具列表
@@ -515,18 +521,29 @@ async function reject(id) {
 }
 async function resolveOAuth(reqId, approveFlag) {
   const ro = document.getElementById('ro_' + reqId)?.checked || false;
+  const allWsBoxes = document.querySelectorAll(`input[name="ws_${reqId}"]`);
   const ws = Array.from(document.querySelectorAll(`input[name="ws_${reqId}"]:checked`)).map(el => el.value);
+  if (approveFlag && allWsBoxes.length > 0 && ws.length === 0) {
+    alert('请至少勾选一个允许访问的工作区，或点击“拒绝”驳回该客户端绑定请求。');
+    return;
+  }
   const action = approveFlag ? 'approve' : 'deny';
   await api(`/api/oauth/requests/${reqId}/${action}`, {
     method: 'POST',
     body: JSON.stringify({ read_only: ro, allowed_workspaces: ws, note: approveFlag ? '控制台批准' : '控制台拒绝' })
   });
+  lastOAuthPendingKey = '';
   refreshState();
 }
 async function createPairingCode() {
   try {
     const ro = document.getElementById('pairReadOnly').checked;
+    const allWsBoxes = document.querySelectorAll('input[name="pair_ws"]');
     const ws = Array.from(document.querySelectorAll('input[name="pair_ws"]:checked')).map(el => el.value);
+    if (allWsBoxes.length > 0 && ws.length === 0) {
+      alert('请至少勾选一个允许访问的工作区再生成配对码。');
+      return;
+    }
     await api('/api/oauth/pairing-codes', { method: 'POST', body: JSON.stringify({ read_only: ro, allowed_workspaces: ws, note: 'web-console' }) });
     refreshState();
   } catch (e) {

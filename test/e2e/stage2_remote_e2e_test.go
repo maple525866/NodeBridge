@@ -222,6 +222,19 @@ func TestStageTwoRemoteOAuthAndHybridApprovalE2E(t *testing.T) {
 		t.Fatalf("CORS 预检异常: status=%d allow-origin=%q", optResp.StatusCode, optResp.Header.Get("Access-Control-Allow-Origin"))
 	}
 
+	// 验证拒绝 Origin: null
+	nullOriginReq, _ := http.NewRequest(http.MethodPost, mcpTS.URL+"/mcp", strings.NewReader(`{}`))
+	nullOriginReq.Host = "mcp.e2e.example"
+	nullOriginReq.Header.Set("Origin", "null")
+	nullOriginResp, err := http.DefaultClient.Do(nullOriginReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nullOriginResp.Body.Close()
+	if nullOriginResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("Origin: null 应返回 403，实际 %d", nullOriginResp.StatusCode)
+	}
+
 	// 辅助函数：通过完整 DCR + PKCE S256 绑定一个远程客户端
 	bindClient := func(name, redirectURI string, usePairingCode, readOnly bool, workspaces []string) (clientID, accessToken string) {
 		t.Helper()
@@ -392,10 +405,38 @@ func TestStageTwoRemoteOAuthAndHybridApprovalE2E(t *testing.T) {
 		t.Fatalf("期望拦截只读客户端写入操作")
 	}
 
+	// 只读客户端即使传入不存在的 task_id 调用 terminal.cancel 也应被前置只读拦截
+	cancelDenied, _ := csA.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "terminal.cancel",
+		Arguments: map[string]any{"task_id": "tsk_nonexistent"},
+	})
+	if cancelDenied == nil || !cancelDenied.IsError {
+		t.Fatalf("期望只读客户端调用 terminal.cancel 被前置拦截")
+	}
+	if tc, ok := cancelDenied.Content[0].(*mcp.TextContent); !ok || !strings.Contains(tc.Text, "只读") {
+		t.Fatalf("期望返回只读拒绝错误而非任务不存在: %+v", cancelDenied.Content)
+	}
+
 	// --- 验收 3：客户端 B（一次性配对码绑定，可读写 ws_alpha）混合短等待超时 -> 异步续接 -> 幂等防重 ---
 	clientBID, tokenB := bindClient("Gemini Web (RW)", "https://gemini.google.com/mcp/oauth/callback", true, false, []string{"ws_alpha"})
 	csB := connectRemoteMCP(tokenB)
 	defer csB.Close()
+
+	// 3.0 回归校验：远程无效补丁预检失败时必须立即返回错误，绝不误建空白待审批单
+	invalidPatchRes, err := csB.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "workspace.patch",
+		Arguments: map[string]any{
+			"workspace_id": "ws_alpha",
+			"path":         "main.go",
+			"edits":        []map[string]any{{"old_text": "NOT_EXIST_CONTENT_XYZ", "new_text": "anything"}},
+		},
+	})
+	if err != nil || invalidPatchRes == nil || !invalidPatchRes.IsError {
+		t.Fatalf("无效补丁应立即返回工具级错误: err=%v res=%+v", err, invalidPatchRes)
+	}
+	if len(broker.Pending()) != 0 {
+		t.Fatalf("预检失败绝不能在本地审批队列中新建空白审批单，当前 pending=%d", len(broker.Pending()))
+	}
 
 	patchArgs := map[string]any{
 		"workspace_id":    "ws_alpha",

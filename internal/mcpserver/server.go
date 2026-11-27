@@ -87,6 +87,10 @@ func NewHTTPHandler(srv *mcp.Server, cfg GatewayConfig) http.Handler {
 
 		// 1. CORS 预检与 Origin 防护
 		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if origin != "" && !isValidOriginHeader(origin) {
+			http.Error(w, `{"error":"forbidden origin"}`, http.StatusForbidden)
+			return
+		}
 		if isRemoteHost || cfg.OAuthServer != nil {
 			if origin != "" {
 				// 若经本地回环访问且携带 Origin，仍必须通过本地白名单防止恶意网页 CSRF 攻击本机
@@ -222,6 +226,18 @@ func extractHostname(rawHost string) string {
 
 func isLocalHostname(host string) bool {
 	return host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
+func isValidOriginHeader(origin string) bool {
+	if strings.EqualFold(origin, "null") {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	return (scheme == "https" || scheme == "http") && u.Hostname() != ""
 }
 
 func isOriginAllowed(origin string, allowSet map[string]struct{}) bool {

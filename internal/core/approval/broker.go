@@ -587,6 +587,35 @@ func (b *Broker) GetRecord(id string) (Request, bool) {
 	return item.req, true
 }
 
+// LookupIdempotent 只读查询指定请求指纹是否已命中近期成功执行的幂等缓存（绝不创建新审批单）。
+func (b *Broker) LookupIdempotent(fingerprint string) (ExecutionOutcome, bool) {
+	fingerprint = strings.TrimSpace(fingerprint)
+	if fingerprint == "" {
+		return ExecutionOutcome{}, false
+	}
+	now := time.Now().UTC()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.expireStaleLocked(now)
+
+	entry, ok := b.fingerprints[fingerprint]
+	if !ok || !now.Before(entry.expiresAt) {
+		return ExecutionOutcome{}, false
+	}
+	existing, exists := b.records[entry.approvalID]
+	if !exists || existing.req.Status != StatusApproved || existing.req.ExecStatus != "SUCCEEDED" {
+		return ExecutionOutcome{}, false
+	}
+	dec := existing.decision
+	dec.DecisionTag = "IDEMPOTENT_REPLAY"
+	return ExecutionOutcome{
+		ReusedIdempotent: true,
+		ApprovalID:       existing.req.ID,
+		Decision:         dec,
+		Result:           existing.req.ExecResult,
+	}, true
+}
+
 // Resolve 由 Web 控制台或 CLI 调用，完成指定审批单的批准或拒绝。
 func (b *Broker) Resolve(id string, approve bool, grantMinutes int, approver, note string) (Request, error) {
 	if strings.TrimSpace(approver) == "" {

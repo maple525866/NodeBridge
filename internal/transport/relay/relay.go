@@ -417,20 +417,28 @@ func (c *CloudflaredConnector) superviseLoop(ctx context.Context, bin string, do
 	}()
 
 	backoff := c.opts.BaseBackoff
-	attempt := 0
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		attempt++
-		err := c.runOnce(ctx, bin)
+		runStart := time.Now()
+		wasConnected, err := c.runOnce(ctx, bin)
 		if ctx.Err() != nil {
 			return
+		}
+		// 若该次运行曾成功建立连接或稳定运行超过 30 秒，则重置退避时长
+		if wasConnected || time.Since(runStart) >= 30*time.Second {
+			backoff = c.opts.BaseBackoff
 		}
 
 		c.mu.Lock()
 		c.status.Connected = false
+		if c.opts.Mode == config.RelayModeCloudflaredQuick {
+			// Quick Tunnel 每次重启域名都会变化，断线后立即清空已失效旧地址
+			c.status.PublicURL = ""
+			c.status.MCPEndpoint = ""
+		}
 		c.status.ReconnectCount++
 		if err != nil {
 			c.status.LastError = fmt.Sprintf("隧道进程已退出（第 %d 次重连）: %v", c.status.ReconnectCount, err)
@@ -457,25 +465,29 @@ func (c *CloudflaredConnector) superviseLoop(ctx context.Context, bin string, do
 	}
 }
 
-func (c *CloudflaredConnector) runOnce(ctx context.Context, bin string) error {
+func (c *CloudflaredConnector) runOnce(ctx context.Context, bin string) (bool, error) {
+	// 为本次子进程运行绑定独立 context，确保进程退出时立刻取消内部定时器，避免假阳性 markConnected 竞态
+	attemptCtx, attemptCancel := context.WithCancel(ctx)
+	defer attemptCancel()
+
 	args := c.buildArgs()
 	var cmd *exec.Cmd
 	if c.opts.CommandFactory != nil {
-		cmd = c.opts.CommandFactory(ctx, bin, args...)
+		cmd = c.opts.CommandFactory(attemptCtx, bin, args...)
 	} else {
-		cmd = exec.CommandContext(ctx, bin, args...)
+		cmd = exec.CommandContext(attemptCtx, bin, args...)
 	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return err
+		return false, err
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := cmd.Start(); err != nil {
-		return err
+		return false, err
 	}
 
 	var wg sync.WaitGroup
@@ -491,13 +503,13 @@ func (c *CloudflaredConnector) runOnce(ctx context.Context, bin string) error {
 	go scanPipe(stdout)
 	go scanPipe(stderr)
 
-	// Named 模式在进程稳定运行短时间后即可标记为 Connected（若日志尚未匹配关键词）
+	// Named 模式在进程稳定运行短时间后即可标记为 Connected（绑定 attemptCtx，进程崩溃则立即取消）
 	if c.opts.Mode == config.RelayModeCloudflaredNamed && strings.TrimSpace(c.opts.PublicURL) != "" {
 		go func() {
 			t := time.NewTimer(1500 * time.Millisecond)
 			defer t.Stop()
 			select {
-			case <-ctx.Done():
+			case <-attemptCtx.Done():
 				return
 			case <-t.C:
 				c.markConnected(strings.TrimRight(strings.TrimSpace(c.opts.PublicURL), "/"))
@@ -506,7 +518,12 @@ func (c *CloudflaredConnector) runOnce(ctx context.Context, bin string) error {
 	}
 
 	wg.Wait()
-	return cmd.Wait()
+	waitErr := cmd.Wait()
+	attemptCancel()
+	c.mu.Lock()
+	wasConnected := c.status.Connected
+	c.mu.Unlock()
+	return wasConnected, waitErr
 }
 
 func (c *CloudflaredConnector) inspectLogLine(line string) {

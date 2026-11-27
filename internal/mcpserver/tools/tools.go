@@ -221,17 +221,11 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 		// 先预检并生成 Unified Diff，避免无效补丁或越权路径打扰人工审批
 		preview, err := d.FS.PreviewPatch(patchReq)
 		if err != nil {
-			// 注意：远程幂等重发可能命中已经成功应用的补丁（文件已变导致预检失败），先检查是否命中幂等缓存！
+			// 注意：远程幂等重发可能命中已经成功应用的补丁（文件已变导致预检失败），仅做纯只读缓存查询，绝不新建审批单！
 			p := session.FromContext(ctx)
 			if p.IsRemote {
 				fp := approval.ComputeFingerprint(p.ClientID, "workspace.patch", in.WorkspaceID, in)
-				if replayOut, rErr := d.Broker.ExecuteWithApproval(ctx, approval.Request{
-					ClientID:    p.ClientID,
-					IsRemote:    true,
-					Fingerprint: fp,
-					Tool:        "workspace.patch",
-					WorkspaceID: in.WorkspaceID,
-				}, func() (any, error) { return nil, err }, nil); rErr == nil && replayOut.ReusedIdempotent {
+				if replayOut, ok := d.Broker.LookupIdempotent(fp); ok {
 					if cached, ok := replayOut.Result.(*filesystem.PatchResult); ok && cached != nil {
 						recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": in.Path}, "IDEMPOTENT_REPLAY", replayOut.Decision.Approver, start, nil)
 						return nil, cached, nil
@@ -344,6 +338,16 @@ func registerGitTools(srv *mcp.Server, d Deps) {
 
 		affected, err := d.Git.ValidatePatch(ctx, in.WorkspaceID, in.Patch)
 		if err != nil {
+			p := session.FromContext(ctx)
+			if p.IsRemote {
+				fp := approval.ComputeFingerprint(p.ClientID, "git.apply_patch", in.WorkspaceID, in)
+				if replayOut, ok := d.Broker.LookupIdempotent(fp); ok {
+					if cached, ok := replayOut.Result.(*git.ApplyPatchResult); ok && cached != nil {
+						recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"workspace_id": in.WorkspaceID}, "IDEMPOTENT_REPLAY", replayOut.Decision.Approver, start, nil)
+						return nil, cached, nil
+					}
+				}
+			}
 			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"workspace_id": in.WorkspaceID}, "DENIED_PRECHECK", "", start, err)
 			return nil, nil, err
 		}
@@ -521,6 +525,10 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in TerminalCancelInput) (*mcp.CallToolResult, *TerminalCancelOutput, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("terminal.cancel")
+		// 先校验只读权限，防止只读客户端借取消操作探测 task_id 存在性
+		if authErr := authorizePrincipal(ctx, d.Audit, "terminal.cancel", "", string(ev.RiskLevel), true, in, start); authErr != nil {
+			return nil, nil, authErr
+		}
 		if existing, pollErr := d.Tasks.Poll(in.TaskID, 0, 0); pollErr == nil && existing != nil {
 			if authErr := authorizePrincipal(ctx, d.Audit, "terminal.cancel", existing.WorkspaceID, string(ev.RiskLevel), true, in, start); authErr != nil {
 				return nil, nil, authErr

@@ -109,6 +109,7 @@ type PendingAuthRequest struct {
 	CodeChallengeMethod string    `json:"-"`
 	Status              string    `json:"status"` // pending | approved | denied | expired
 	RedirectResult      string    `json:"-"`
+	PollConsumed        bool      `json:"-"`
 	ErrorMessage        string    `json:"error_message,omitempty"`
 	CreatedAt           time.Time `json:"created_at"`
 	ExpiresAt           time.Time `json:"expires_at"`
@@ -164,6 +165,7 @@ type Server struct {
 	pairingCodes  map[string]*PairingCode
 	listeners     map[chan Event]struct{}
 	limiter       *ipRateLimiter
+	pollLimiter   *ipRateLimiter
 }
 
 // NewServer 创建并从磁盘加载 OAuth 2.1 授权服务器状态。
@@ -197,6 +199,7 @@ func NewServer(opts Options) (*Server, error) {
 		pairingCodes:      make(map[string]*PairingCode),
 		listeners:         make(map[chan Event]struct{}),
 		limiter:           newIPRateLimiter(opts.Config.RateLimitPerMinute, time.Minute),
+		pollLimiter:       newIPRateLimiter(maxInt(opts.Config.RateLimitPerMinute*3, 60), time.Minute),
 	}
 	if err := s.loadState(); err != nil {
 		return nil, err
@@ -587,6 +590,33 @@ func (s *Server) cleanupEphemeralLocked(now time.Time) {
 			delete(s.authCodes, h)
 		}
 	}
+}
+
+const maxUnboundDCRClients = 64
+
+// pruneUnboundClientsLocked 清理超过 1 小时仍未完成绑定授权的僵尸 DCR 客户端，并检查是否超过上限。
+func (s *Server) pruneUnboundClientsLocked(now time.Time) error {
+	unboundCount := 0
+	for id, cli := range s.clients {
+		if cli.AuthorizedAt.IsZero() && !cli.Revoked {
+			if now.Sub(cli.CreatedAt) > time.Hour {
+				delete(s.clients, id)
+				continue
+			}
+			unboundCount++
+		}
+	}
+	if unboundCount >= maxUnboundDCRClients {
+		return errors.New("未完成授权的动态注册客户端数量已达上限，请先清理或稍后再试")
+	}
+	return nil
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (s *Server) loadState() error {

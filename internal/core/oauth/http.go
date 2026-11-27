@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -41,10 +42,8 @@ func (s *Server) BaseURL(r *http.Request) string {
 	if r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https") {
 		scheme = "https"
 	}
-	host := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
-	if host == "" {
-		host = strings.TrimSpace(r.Host)
-	}
+	// 仅信任已经过外层网关 Host 白名单检验的 r.Host，不信任可能被客户端伪造的 X-Forwarded-Host
+	host := strings.TrimSpace(r.Host)
 	if host == "" {
 		return ""
 	}
@@ -63,6 +62,10 @@ func (s *Server) ResourceMetadataURL(r *http.Request) string {
 func (s *Server) withCORS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+			if !isValidCORSOrigin(origin) {
+				http.Error(w, `{"error":"forbidden origin"}`, http.StatusForbidden)
+				return
+			}
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
 		} else {
@@ -77,6 +80,18 @@ func (s *Server) withCORS(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+func isValidCORSOrigin(origin string) bool {
+	if strings.EqualFold(origin, "null") {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	return (scheme == "https" || scheme == "http") && u.Hostname() != ""
 }
 
 func (s *Server) handleProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
@@ -194,6 +209,11 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
+	if err := s.pruneUnboundClientsLocked(now); err != nil {
+		s.mu.Unlock()
+		writeOAuthError(w, http.StatusTooManyRequests, "temporarily_unavailable", err.Error())
+		return
+	}
 	s.clients[clientID] = cli
 	_ = s.saveStateLocked()
 	s.broadcastLocked(Event{Type: "oauth_clients_updated", Payload: s.listClientsLocked(now)})
@@ -290,6 +310,13 @@ func (s *Server) handleAuthorizePoll(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.pollLimiter.allow(clientIP(r)) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"status": "rate_limited"})
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+
 	reqID := strings.TrimSpace(r.URL.Query().Get("req"))
 	now := time.Now().UTC()
 
@@ -304,8 +331,11 @@ func (s *Server) handleAuthorizePoll(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"status": req.Status,
 	}
-	if req.Status == "approved" || req.Status == "denied" {
+	if (req.Status == "approved" || req.Status == "denied") && !req.PollConsumed && req.RedirectResult != "" {
 		resp["redirect_url"] = req.RedirectResult
+		// 一次性消费含授权码的回调地址，防止重复轮询泄露 code
+		req.PollConsumed = true
+		req.RedirectResult = ""
 	}
 	if req.ErrorMessage != "" {
 		resp["error_message"] = req.ErrorMessage
@@ -345,13 +375,17 @@ func (s *Server) handleAuthorizeConfirm(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		s.mu.Lock()
 		req, ok := s.pendingAuths[reqID]
+		var reqCopy PendingAuthRequest
+		if ok {
+			reqCopy = *req
+		}
 		s.mu.Unlock()
 		if !ok {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		w.WriteHeader(http.StatusForbidden)
-		s.renderAuthorizePage(w, *req, err.Error())
+		s.renderAuthorizePage(w, reqCopy, err.Error())
 		return
 	}
 	http.Redirect(w, r, redirectURL, http.StatusFound)
@@ -415,8 +449,10 @@ func (s *Server) handleAuthCodeGrant(w http.ResponseWriter, clientID, clientSecr
 	rec.Used = true
 	delete(s.authCodes, codeHash)
 
+	// OAuth 2.1 要求必须显式提供 client_id（表单/JSON 或 HTTP Basic Auth）
 	if clientID == "" {
-		clientID = rec.ClientID
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "缺少必需参数 client_id")
+		return
 	}
 	if rec.ClientID != clientID {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "client_id 与授权码不匹配")
@@ -573,6 +609,10 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.limiter.allow(clientIP(r)) {
+		writeOAuthError(w, http.StatusTooManyRequests, "temporarily_unavailable", "吊销接口速率超限")
+		return
+	}
 	params := parseTokenParams(r)
 	rawToken := strings.TrimSpace(params["token"])
 	if rawToken != "" {
@@ -582,6 +622,12 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		delete(s.accessTokens, hash)
 		if rt, ok := s.refreshTokens[hash]; ok {
 			rt.Revoked = true
+			// RFC 7009：撤销 Refresh Token 时联动撤销该客户端的活跃 Access Token
+			for atHash, at := range s.accessTokens {
+				if at.ClientID == rt.ClientID {
+					delete(s.accessTokens, atHash)
+				}
+			}
 		}
 		_ = s.saveStateLocked()
 		s.broadcastLocked(Event{Type: "oauth_clients_updated", Payload: s.listClientsLocked(now)})
@@ -751,24 +797,30 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 func clientIP(r *http.Request) string {
-	for _, h := range []string{"CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"} {
-		if v := strings.TrimSpace(r.Header.Get(h)); v != "" {
-			if idx := strings.Index(v, ","); idx >= 0 {
-				v = strings.TrimSpace(v[:idx])
-			}
-			if v != "" {
-				return v
+	remoteHost, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		remoteHost = strings.TrimSpace(r.RemoteAddr)
+	}
+	// 仅当直连来源为本地回环（本机 cloudflared 或本地反代）时才读取转发 IP 头，防止客户端直接伪造头绕过限流
+	if ip := net.ParseIP(strings.Trim(remoteHost, "[]")); ip != nil && ip.IsLoopback() {
+		for _, h := range []string{"CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"} {
+			if v := strings.TrimSpace(r.Header.Get(h)); v != "" {
+				if idx := strings.Index(v, ","); idx >= 0 {
+					v = strings.TrimSpace(v[:idx])
+				}
+				if v != "" {
+					return v
+				}
 			}
 		}
 	}
-	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
-	if err == nil && host != "" {
-		return host
+	if remoteHost != "" {
+		return remoteHost
 	}
 	return strings.TrimSpace(r.RemoteAddr)
 }
 
-// ipRateLimiter 实现简单的按 IP 滑动窗口速率限制器，防公网 OAuth 接口爆破。
+// ipRateLimiter 实现简单的按 IP 滑动窗口速率限制器，防公网 OAuth 接口爆破并定期清理过期桶防内存泄漏。
 type ipRateLimiter struct {
 	mu      sync.Mutex
 	limit   int
@@ -796,6 +848,23 @@ func (l *ipRateLimiter) allow(ip string) bool {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	if len(l.entries) > 256 {
+		for k, times := range l.entries {
+			alive := times[:0]
+			for _, ts := range times {
+				if ts.After(cutoff) {
+					alive = append(alive, ts)
+				}
+			}
+			if len(alive) == 0 {
+				delete(l.entries, k)
+			} else {
+				l.entries[k] = alive
+			}
+		}
+	}
+
 	hits := l.entries[ip]
 	kept := hits[:0]
 	for _, ts := range hits {

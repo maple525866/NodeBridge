@@ -439,6 +439,10 @@ func (s *Server) handlePairingCodes(w http.ResponseWriter, r *http.Request) {
 			Note              string   `json:"note"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := s.validateAllowedWorkspaces(body.AllowedWorkspaces); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
 		pc, err := s.oauthSrv.CreatePairingCode(body.ReadOnly, body.AllowedWorkspaces, body.Note)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -490,6 +494,13 @@ func (s *Server) handleOAuthRequestAction(w http.ResponseWriter, r *http.Request
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "不支持的操作: " + action})
 		return
+	}
+
+	if approve {
+		if err := s.validateAllowedWorkspaces(body.AllowedWorkspaces); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
 	}
 
 	resolved, err := s.oauthSrv.ResolveAuthRequest(reqID, approve, body.ReadOnly, body.AllowedWorkspaces, body.Note)
@@ -563,6 +574,26 @@ func (s *Server) handleOAuthRevokeAll(w http.ResponseWriter, r *http.Request) {
 		ArgsSummary: fmt.Sprintf("revoked_tokens=%d", count),
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"revoked_tokens": count, "clients": s.oauthSrv.ListClients()})
+}
+
+func (s *Server) validateAllowedWorkspaces(ids []string) error {
+	if len(ids) == 0 || s.fsMgr == nil {
+		return nil
+	}
+	valid := make(map[string]struct{})
+	for _, ws := range s.fsMgr.Workspaces() {
+		valid[ws.ID] = struct{}{}
+	}
+	for _, id := range ids {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := valid[trimmed]; !ok {
+			return fmt.Errorf("工作区 %q 不存在，请检查配置中的工作区 ID", trimmed)
+		}
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
