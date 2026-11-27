@@ -172,3 +172,18 @@ oauth:
   allow_dynamic_registration: true
   # 公网 OAuth 接口按来源 IP 每分钟请求速率上限
   rate_limit_per_minute: 20
+
+# 长期稳定使用（固定域名模式）：开机自启动与系统守护进程配置
+service:
+  # 固定域名模式（cloudflared_named / external）下运行 `nodebridge daemon` 时，自动注册开机自启并交接给系统守护进程后台运行
+  auto_register: true
+  # 注册到操作系统的服务/任务名称（默认 nodebridge）
+  name: "nodebridge"
+  # 作用域：auto（默认，管理员自动装系统级服务支持未登录自启，普通用户免提权装用户级无黑框守护）| user | system
+  scope: "auto"
+  # 后台守护进程日志路径（留空默认写入 <data_dir>/logs/daemon.log）
+  log_file: ""
+  # 守护进程单日志文件轮转上限（MB）
+  log_max_size_mb: 10
+  # 守护进程日志保留的历史份数
+  log_max_backups: 5

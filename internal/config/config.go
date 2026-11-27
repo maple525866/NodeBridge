@@ -25,6 +25,31 @@ type Config struct {
 	Workspaces []WorkspaceConfig `yaml:"workspaces"`
 	Relay      RelayConfig       `yaml:"relay"`
 	OAuth      OAuthConfig       `yaml:"oauth"`
+	Service    ServiceConfig     `yaml:"service,omitempty"`
+}
+
+// ServiceConfig 定义固定域名长期使用场景下的开机自启动与守护进程配置。
+type ServiceConfig struct {
+	// AutoRegister 为 true（或省略）时，固定域名模式下直接运行 `nodebridge daemon` 会自动注册开机自启并交接给系统守护进程。
+	AutoRegister *bool `yaml:"auto_register,omitempty"`
+	// Name 指定注册到操作系统的服务/任务名称（默认 "nodebridge"）。
+	Name string `yaml:"name,omitempty"`
+	// Scope 指定开机自启作用域：auto（默认，管理员选 system、普通用户选 user）| user | system。
+	Scope string `yaml:"scope,omitempty"`
+	// LogFile 指定后台守护进程日志文件路径（留空则默认写入 <data_dir>/logs/daemon.log）。
+	LogFile string `yaml:"log_file,omitempty"`
+	// LogMaxSizeMB 指定守护进程单日志文件轮转上限（MB，默认 10）。
+	LogMaxSizeMB int `yaml:"log_max_size_mb,omitempty"`
+	// LogMaxBackups 指定守护进程日志保留的历史备份份数（默认 5）。
+	LogMaxBackups int `yaml:"log_max_backups,omitempty"`
+}
+
+// AutoRegisterEnabled 返回固定域名模式下运行 daemon 时是否启用自动注册并交接系统守护进程（默认开启）。
+func (s ServiceConfig) AutoRegisterEnabled() bool {
+	if s.AutoRegister == nil {
+		return true
+	}
+	return *s.AutoRegister
 }
 
 // ServerConfig 定义本地 MCP 服务与管理控制台监听配置。
@@ -208,6 +233,7 @@ func HardSecretDenyGlobs() []string {
 		"**/*.keystore",
 		"**/*.kdbx",
 		"**/nodebridge.yaml",
+		"**/service.env",
 	}
 }
 
@@ -246,6 +272,7 @@ func DefaultGlobalDenyGlobs() []string {
 		"**/credentials.json",
 		"**/*secret*",
 		"**/nodebridge.yaml",
+		"**/service.env",
 	}
 }
 
@@ -457,6 +484,29 @@ func (c *Config) ApplyDefaults(baseDir string) {
 		c.Security.GlobalDenyGlobs = DefaultGlobalDenyGlobs()
 	}
 
+	if strings.TrimSpace(c.Service.Name) == "" {
+		c.Service.Name = "nodebridge"
+	}
+	if strings.TrimSpace(c.Service.Scope) == "" {
+		c.Service.Scope = "auto"
+	} else {
+		c.Service.Scope = strings.ToLower(strings.TrimSpace(c.Service.Scope))
+	}
+	if strings.TrimSpace(c.Service.LogFile) != "" && !filepath.IsAbs(c.Service.LogFile) && baseDir != "" {
+		c.Service.LogFile = filepath.Join(baseDir, c.Service.LogFile)
+	}
+	if strings.TrimSpace(c.Service.LogFile) != "" {
+		if absLog, err := filepath.Abs(c.Service.LogFile); err == nil {
+			c.Service.LogFile = absLog
+		}
+	}
+	if c.Service.LogMaxSizeMB <= 0 {
+		c.Service.LogMaxSizeMB = 10
+	}
+	if c.Service.LogMaxBackups <= 0 {
+		c.Service.LogMaxBackups = 5
+	}
+
 	for i := range c.Workspaces {
 		root := c.Workspaces[i].Root
 		if root != "" && !filepath.IsAbs(root) && baseDir != "" {
@@ -525,6 +575,12 @@ func (c *Config) Validate() error {
 		}
 	default:
 		return fmt.Errorf("不支持的 relay.mode: %q（可选值: disabled / cloudflared_quick / cloudflared_named / external）", mode)
+	}
+
+	switch scope := strings.ToLower(strings.TrimSpace(c.Service.Scope)); scope {
+	case "", "auto", "user", "system":
+	default:
+		return fmt.Errorf("不支持的 service.scope: %q（可选值: auto / user / system）", c.Service.Scope)
 	}
 	return nil
 }

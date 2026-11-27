@@ -67,6 +67,16 @@ oauth:
   enabled: true
 ```
 
+### 固定域名模式的开机自启动与守护进程
+
+在 `cloudflared_named` 或 `external` 模式下，直接使用已编译二进制执行 `nodebridge daemon --config nodebridge.yaml` 会自动完成以下工作：
+1. 自动捕获 `relay.tunnel_token` 引用的 `env:VAR` 环境变量及当前 `PATH`，写入 `0600` 权限且受内核密钥红线硬保护的 `data/service/service.env`。
+2. 按权限自动适配系统守护后端并配置崩溃自动重启：
+   - **Windows**：管理员终端自动注册原生 Windows Service（支持开机未登录桌面即启动 + SCM 故障自动重启）；普通终端免提权注册无黑框任务计划程序（登录桌面即启 + 失败自动重启）。
+   - **Linux**：自动注册 `systemd`（`Restart=always`，`--scope user` 建议配合 `sudo loginctl enable-linger $USER` 实现未登录开机自启，或使用 `sudo ... --scope system`）。
+   - **macOS**：自动注册 `launchd`（`KeepAlive=true`，`--scope user` 为 LaunchAgent，`sudo ... --scope system` 为 LaunchDaemon）。
+3. 自动交接给系统守护进程在后台持续运行，日志轮转写入 `data/logs/daemon.log`；临时前台调试可附加 `--foreground`。
+
 ---
 
 ## 3. 接入前一键自检
@@ -117,4 +127,11 @@ nodebridge clients revoke-all --config nodebridge.yaml
 
 # 一键急停并联动断开远程隧道
 nodebridge stop-all --config nodebridge.yaml --disconnect-tunnel
+
+# 开机自启动守护进程运维（状态 / 日志 / 重启 / 停止 / 卸载）
+nodebridge service status --config nodebridge.yaml
+nodebridge service logs --config nodebridge.yaml --lines 100
+nodebridge service restart --config nodebridge.yaml
+nodebridge service stop --config nodebridge.yaml
+nodebridge service uninstall --config nodebridge.yaml
 ```

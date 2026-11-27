@@ -5,7 +5,9 @@ import (
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"strings"
@@ -20,8 +22,24 @@ import (
 	"nodebridge/internal/core/task"
 	"nodebridge/internal/platform/capability"
 	"nodebridge/internal/platform/filesystem"
+	"nodebridge/internal/platform/service"
 	"nodebridge/internal/transport/relay"
 )
+
+// 服务控制类型化错误哨兵，用于精确映射 Admin API HTTP 状态码（400 / 403 / 409）。
+var (
+	ErrServiceBadRequest = errors.New("invalid service control request")
+	ErrServiceForbidden  = errors.New("insufficient privilege for service control")
+	ErrServiceConflict   = errors.New("service control operation already in progress")
+)
+
+// ServiceController 抽象本地守护进程与开机自启动服务的受控运维能力（由 main 注入）。
+type ServiceController interface {
+	Status() service.Status
+	Restart() error
+	Uninstall(purgeEnv bool) error
+	Shutdown(reason string)
+}
 
 //go:embed web/*
 var webFiles embed.FS
@@ -41,6 +59,7 @@ type Server struct {
 	deviceID                string
 	killAllDisconnectTunnel bool
 	mcpAddr                 string
+	svcCtrl                 ServiceController
 
 	modeMu            sync.Mutex
 	securityUpdatedAt time.Time
@@ -85,6 +104,11 @@ func (s *Server) AttachSecurityControl(policyEng *policy.Engine, dataDir string,
 	s.securityUpdatedAt = initial.UpdatedAt
 }
 
+// AttachServiceControl 注入开机自启动与守护进程控制器，供控制台查询状态及受控重启/卸载。
+func (s *Server) AttachServiceControl(ctrl ServiceController) {
+	s.svcCtrl = ctrl
+}
+
 // Handler 返回挂载了静态控制台页面、REST API 与 SSE 事件流的 HTTP Handler。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -110,6 +134,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/oauth/requests/", s.withAuth(s.handleOAuthRequestAction))
 	mux.HandleFunc("/api/oauth/clients/", s.withAuth(s.handleOAuthClientAction))
 	mux.HandleFunc("/api/oauth/revoke-all", s.withAuth(s.handleOAuthRevokeAll))
+
+	// 开机自启动与守护进程受控管理 API（均受本机 admin_token 鉴权保护）
+	mux.HandleFunc("/api/service/status", s.withAuth(s.handleServiceStatus))
+	mux.HandleFunc("/api/service/restart", s.withAuth(s.handleServiceRestart))
+	mux.HandleFunc("/api/service/uninstall", s.withAuth(s.handleServiceUninstall))
+	mux.HandleFunc("/api/system/shutdown", s.withAuth(s.handleSystemShutdown))
 
 	return mux
 }
@@ -156,11 +186,18 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		pairingCodes = s.oauthSrv.ActivePairingCodes()
 	}
 
+	var autostart *service.Status
+	if s.svcCtrl != nil {
+		st := s.svcCtrl.Status()
+		autostart = &st
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"device_id":     s.deviceID,
 		"mcp_listen":    s.mcpAddr,
 		"capability":    s.capInfo,
 		"relay":         relaySt,
+		"autostart":     autostart,
 		"oauth_enabled": s.oauthSrv != nil,
 		"oauth_pending": oauthPending,
 		"oauth_clients": oauthClients,
@@ -714,6 +751,174 @@ func (s *Server) handleOAuthRevokeAll(w http.ResponseWriter, r *http.Request) {
 		ArgsSummary: fmt.Sprintf("revoked_tokens=%d", count),
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"revoked_tokens": count, "clients": s.oauthSrv.ListClients()})
+}
+
+func (s *Server) handleServiceStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if s.svcCtrl == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"installed": false, "state": "unattached"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.svcCtrl.Status())
+}
+
+func (s *Server) handleServiceRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if s.svcCtrl == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "当前实例未挂载守护进程控制器"})
+		return
+	}
+	if err := s.svcCtrl.Restart(); err != nil {
+		if s.auditLog != nil {
+			_ = s.auditLog.Record(audit.Event{
+				Tool:        "admin.service.restart",
+				Decision:    "SERVICE_RESTART_FAILED",
+				Approver:    "admin",
+				Status:      "FAILED",
+				ArgsSummary: audit.RedactSummary(err.Error(), 256),
+			})
+		}
+		writeJSON(w, mapServiceErrorStatus(err), map[string]any{"error": err.Error()})
+		return
+	}
+	st := s.svcCtrl.Status()
+	if s.auditLog != nil {
+		_ = s.auditLog.Record(audit.Event{
+			Tool:        "admin.service.restart",
+			Decision:    "SERVICE_RESTARTING",
+			Approver:    "admin",
+			Status:      "SUCCEEDED",
+			ArgsSummary: audit.RedactSummary(fmt.Sprintf("service=%s scope=%s backend=%s", st.ServiceName, st.Scope, st.Backend), 256),
+		})
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status":  "restarting",
+		"message": "已下发守护进程重启指令，控制台将在数秒内自动重连。",
+		"service": st,
+	})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (s *Server) handleServiceUninstall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if s.svcCtrl == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "当前实例未挂载守护进程控制器"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	var body struct {
+		PurgeEnv bool `json:"purge_env"`
+	}
+	if err := decodeOptionalJSON(r.Body, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体 JSON 格式无效"})
+		return
+	}
+
+	if err := s.svcCtrl.Uninstall(body.PurgeEnv); err != nil {
+		if s.auditLog != nil {
+			_ = s.auditLog.Record(audit.Event{
+				Tool:        "admin.service.uninstall",
+				Decision:    "SERVICE_UNINSTALL_FAILED",
+				Approver:    "admin",
+				Status:      "FAILED",
+				ArgsSummary: audit.RedactSummary(err.Error(), 256),
+			})
+		}
+		writeJSON(w, mapServiceErrorStatus(err), map[string]any{"error": err.Error()})
+		return
+	}
+	st := s.svcCtrl.Status()
+	if s.auditLog != nil {
+		_ = s.auditLog.Record(audit.Event{
+			Tool:        "admin.service.uninstall",
+			Decision:    "SERVICE_UNINSTALLING",
+			Approver:    "admin",
+			Status:      "SUCCEEDED",
+			ArgsSummary: audit.RedactSummary(fmt.Sprintf("service=%s scope=%s purge_env=%v", st.ServiceName, st.Scope, body.PurgeEnv), 256),
+		})
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status":  "uninstalling",
+		"message": "已下发取消开机自启并停止守护进程指令，服务将在短暂延迟后安全退出。",
+		"service": st,
+	})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (s *Server) handleSystemShutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if s.svcCtrl == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "当前实例不支持远程停机信号"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	if err := decodeOptionalJSON(r.Body, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体 JSON 格式无效"})
+		return
+	}
+	if strings.TrimSpace(body.Reason) == "" {
+		body.Reason = "本地管理请求优雅关闭"
+	}
+	if s.auditLog != nil {
+		_ = s.auditLog.Record(audit.Event{
+			Tool:        "admin.system.shutdown",
+			Decision:    "SHUTTING_DOWN",
+			Approver:    "admin",
+			Status:      "SUCCEEDED",
+			ArgsSummary: audit.RedactSummary(body.Reason, 256),
+		})
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "shutting_down", "reason": body.Reason})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		s.svcCtrl.Shutdown(body.Reason)
+	}()
+}
+
+func mapServiceErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, ErrServiceBadRequest):
+		return http.StatusBadRequest
+	case errors.Is(err, ErrServiceForbidden):
+		return http.StatusForbidden
+	case errors.Is(err, ErrServiceConflict):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func decodeOptionalJSON(r io.Reader, dst any) error {
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return nil
+	}
+	return json.Unmarshal(raw, dst)
 }
 
 func (s *Server) validateAllowedWorkspaces(ids []string) error {
