@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NodeBridge 本地安全审批与监控控制台</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --panel: #1e293b;
+    --panel-alt: #162032;
+    --border: #334155;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --primary: #3b82f6;
+    --green: #22c55e;
+    --yellow: #f59e0b;
+    --red: #ef4444;
+    --diff-add-bg: rgba(34, 197, 94, 0.14);
+    --diff-del-bg: rgba(239, 68, 68, 0.16);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.5;
+  }
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 16px; }
+  .pill { font-size: 12px; padding: 3px 9px; border-radius: 999px; font-weight: 600; }
+  .pill-ok { background: rgba(34,197,94,.2); color: #86efac; }
+  .pill-paused { background: rgba(239,68,68,.25); color: #fca5a5; }
+  .pill-l0 { background: rgba(148,163,184,.2); color: #cbd5e1; }
+  .pill-l1 { background: rgba(59,130,246,.2); color: #93c5fd; }
+  .pill-l2 { background: rgba(245,158,11,.22); color: #fcd34d; }
+  .pill-l3 { background: rgba(239,68,68,.25); color: #fca5a5; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button {
+    border: 1px solid var(--border); background: #273549; color: var(--text);
+    padding: 7px 13px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600;
+  }
+  button:hover { filter: brightness(1.12); }
+  .btn-approve { background: #15803d; border-color: #16a34a; color: #fff; }
+  .btn-grant { background: #1d4ed8; border-color: #2563eb; color: #fff; }
+  .btn-danger { background: #b91c1c; border-color: #dc2626; color: #fff; }
+  .btn-warn { background: #b45309; border-color: #d97706; color: #fff; }
+  main { max-width: 1280px; margin: 18px auto; padding: 0 18px 40px; display: grid; gap: 18px; }
+  section {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px;
+  }
+  h2 { margin: 0 0 12px; font-size: 15px; display: flex; align-items: center; justify-content: space-between; }
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 18px; }
+  .card {
+    background: var(--panel-alt); border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px; margin-bottom: 12px;
+  }
+  .meta { font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 12px; margin: 6px 0 10px; }
+  pre.diff {
+    margin: 8px 0 12px; padding: 10px; border-radius: 6px; background: #0b1220;
+    border: 1px solid var(--border); overflow-x: auto; font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px; max-height: 360px; overflow-y: auto;
+  }
+  .diff-line { display: block; white-space: pre; padding: 0 4px; }
+  .diff-add { background: var(--diff-add-bg); color: #86efac; }
+  .diff-del { background: var(--diff-del-bg); color: #fca5a5; }
+  .diff-hdr { color: #93c5fd; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; word-break: break-all; }
+  .empty { color: var(--muted); font-size: 13px; padding: 10px 0; }
+  .auth-box {
+    max-width: 460px; margin: 90px auto; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 24px;
+  }
+  input[type="password"], input[type="text"] {
+    width: 100%; padding: 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: #0b1220; color: var(--text); margin: 10px 0 14px; font-family: monospace;
+  }
+</style>
+</head>
+<body>
+<div id="authGate" class="auth-box" style="display:none;">
+  <h2>NodeBridge 控制台登录</h2>
+  <p style="font-size:13px;color:var(--muted);">请输入配置文件中的 <code>server.admin_token</code> 以连接本地审批与急停面板。</p>
+  <input id="tokenInput" type="password" placeholder="粘贴 admin_token">
+  <button class="btn-grant" style="width:100%;" onclick="saveToken()">连接本地 Daemon</button>
+  <div id="authErr" style="color:#fca5a5;font-size:12px;margin-top:8px;"></div>
+</div>
+
+<div id="app" style="display:none;">
+  <header>
+    <div class="brand">
+      <span>NodeBridge 本地安全控制台</span>
+      <span id="statusPill" class="pill pill-ok">运行中</span>
+      <span id="ssePill" class="pill pill-l0">SSE 连接中...</span>
+    </div>
+    <div class="controls">
+      <button class="btn-warn" onclick="pauseAll()">暂停新任务</button>
+      <button class="btn-danger" onclick="killAll()">一键急停（强杀全部任务）</button>
+      <button class="btn-approve" onclick="resumeAll()">恢复运行</button>
+      <button onclick="refreshState()">刷新</button>
+    </div>
+  </header>
+
+  <main>
+    <section>
+      <h2>
+        <span>待人工审批队列 <span id="pendingCount" class="pill pill-l2">0</span></span>
+        <span id="sysMeta" style="font-size:12px;color:var(--muted);font-weight:400;"></span>
+      </h2>
+      <div id="pendingList"></div>
+    </section>
+
+    <div class="grid-2">
+      <section>
+        <h2>
+          <span>活跃限时批量授权（仅 L1）</span>
+          <button onclick="revokeGrants('')">全部撤销</button>
+        </h2>
+        <div id="grantList"></div>
+      </section>
+      <section>
+        <h2>已授权工作区与安全边界</h2>
+        <div id="workspaceList"></div>
+      </section>
+    </div>
+
+    <section>
+      <h2>异步终端任务监控</h2>
+      <div id="taskTable"></div>
+    </section>
+
+    <section>
+      <h2>最近脱敏审计日志</h2>
+      <div id="auditTable"></div>
+    </section>
+  </main>
+</div>
+
+<script>
+let adminToken = '';
+let state = { pending: [], grants: [], tasks: [], audit: [], workspaces: [], pause: {} };
+let eventSource = null;
+
+function init() {
+  const params = new URLSearchParams(window.location.search);
+  const urlTok = params.get('token');
+  if (urlTok) {
+    sessionStorage.setItem('nb_admin_token', urlTok);
+    window.history.replaceState({}, document.title, window.location.pathname);
+  }
+  adminToken = sessionStorage.getItem('nb_admin_token') || '';
+  if (!adminToken) {
+    document.getElementById('authGate').style.display = 'block';
+    return;
+  }
+  connect();
+}
+
+function saveToken() {
+  const v = document.getElementById('tokenInput').value.trim();
+  if (!v) return;
+  adminToken = v;
+  sessionStorage.setItem('nb_admin_token', v);
+  connect();
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: {
+      'Authorization': 'Bearer ' + adminToken,
+      'Content-Type': 'application/json',
+      ...(opts.headers || {})
+    }
+  });
+  if (res.status === 401) {
+    sessionStorage.removeItem('nb_admin_token');
+    document.getElementById('app').style.display = 'none';
+    document.getElementById('authGate').style.display = 'block';
+    document.getElementById('authErr').textContent = 'Admin Token 无效，请重新输入。';
+    throw new Error('Unauthorized');
+  }
+  return res.json();
+}
+
+async function connect() {
+  try {
+    await refreshState();
+    document.getElementById('authGate').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+    startSSE();
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+async function refreshState() {
+  state = await api('/api/state');
+  renderAll();
+}
+
+function startSSE() {
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource('/api/events?token=' + encodeURIComponent(adminToken));
+  const pill = document.getElementById('ssePill');
+  eventSource.onopen = () => { pill.textContent = 'SSE 实时连接'; pill.className = 'pill pill-ok'; };
+  eventSource.onerror = () => { pill.textContent = 'SSE 重连中...'; pill.className = 'pill pill-l2'; };
+  ['approval_created', 'approval_resolved', 'grants_updated', 'pause_changed', 'task_updated', 'audit_recorded']
+    .forEach(evt => eventSource.addEventListener(evt, () => refreshState()));
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderDiff(diffText) {
+  if (!diffText) return '';
+  const lines = diffText.split('\n').map(line => {
+    let cls = 'diff-line';
+    if (line.startsWith('+') && !line.startsWith('+++')) cls += ' diff-add';
+    else if (line.startsWith('-') && !line.startsWith('---')) cls += ' diff-del';
+    else if (line.startsWith('@@') || line.startsWith('---') || line.startsWith('+++')) cls += ' diff-hdr';
+    return `<span class="${cls}">${esc(line)}</span>`;
+  }).join('');
+  return `<pre class="diff">${lines}</pre>`;
+}
+
+function renderAll() {
+  const sp = document.getElementById('statusPill');
+  if (state.pause && state.pause.paused) {
+    sp.textContent = '已急停/暂停：' + (state.pause.reason || '');
+    sp.className = 'pill pill-paused';
+  } else {
+    sp.textContent = '运行正常';
+    sp.className = 'pill pill-ok';
+  }
+
+  const cap = state.capability || {};
+  document.getElementById('sysMeta').textContent =
+    `MCP: ${state.mcp_listen || ''} | ${cap.os || ''}/${cap.arch || ''} | Git: ${cap.git_available ? cap.git_version : '未检测'} | Shell: ${cap.default_shell || '-'}`;
+
+  // 待审批列表
+  const pending = state.pending || [];
+  document.getElementById('pendingCount').textContent = pending.length;
+  const pEl = document.getElementById('pendingList');
+  if (!pending.length) {
+    pEl.innerHTML = '<div class="empty">当前没有等待人工确认的操作。</div>';
+  } else {
+    pEl.innerHTML = pending.map(r => `
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+          <div>
+            <span class="pill pill-${(r.risk_level||'l2').toLowerCase()}">${esc(r.risk_level)}</span>
+            <strong style="margin-left:6px;">${esc(r.tool)}</strong>
+            <span class="mono" style="margin-left:8px;color:var(--muted);">${esc(r.id)}</span>
+          </div>
+          <span style="font-size:12px;color:var(--muted);">${esc(r.created_at)}</span>
+        </div>
+        <div class="meta">
+          <span>工作区: <b>${esc(r.workspace_id)}</b></span>
+          ${r.target_path ? `<span>路径: <code class="mono">${esc(r.target_path)}</code></span>` : ''}
+          <span>原因: ${esc(r.reason)}</span>
+        </div>
+        ${r.command_preview ? `<pre class="diff">${esc(r.command_preview)}</pre>` : ''}
+        ${r.diff_preview ? renderDiff(r.diff_preview) : ''}
+        <div class="controls">
+          <button class="btn-approve" onclick="approve('${esc(r.id)}', 0)">批准单次</button>
+          ${r.allow_batch_ttl ? `
+            <button class="btn-grant" onclick="approve('${esc(r.id)}', 15)">批准 + 批授 15 分钟</button>
+            <button class="btn-grant" onclick="approve('${esc(r.id)}', 30)">批准 + 批授 30 分钟</button>
+          ` : ''}
+          <button class="btn-danger" onclick="reject('${esc(r.id)}')">拒绝</button>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  // 临时批量授权
+  const grants = state.grants || [];
+  document.getElementById('grantList').innerHTML = !grants.length
+    ? '<div class="empty">当前无活跃限时授权。</div>'
+    : `<table><tr><th>工作区</th><th>级别</th><th>过期时间</th><th>操作</th></tr>` +
+      grants.map(g => `<tr><td>${esc(g.workspace_id)}</td><td>${esc(g.risk_level)}</td><td class="mono">${esc(g.expires_at)}</td><td><button onclick="revokeGrants('${esc(g.workspace_id)}')">撤销</button></td></tr>`).join('') +
+      `</table>`;
+
+  // 工作区列表
+  const wss = state.workspaces || [];
+  document.getElementById('workspaceList').innerHTML = `<table><tr><th>ID</th><th>路径</th><th>模式</th></tr>` +
+    wss.map(w => `<tr><td><b>${esc(w.ID)}</b></td><td class="mono">${esc(w.RealRoot || w.Root)}</td><td>${w.ReadOnly ? '只读' : '可读写(审批)'}</td></tr>`).join('') +
+    `</table>`;
+
+  // 任务表
+  const tasks = state.tasks || [];
+  document.getElementById('taskTable').innerHTML = !tasks.length
+    ? '<div class="empty">暂无终端任务记录。</div>'
+    : `<table><tr><th>任务 ID</th><th>工作区</th><th>命令</th><th>状态</th><th>退出码</th><th>操作</th></tr>` +
+      tasks.slice(0, 25).map(t => {
+        const active = ['CREATED','QUEUED','RUNNING'].includes(t.status);
+        return `<tr>
+          <td class="mono">${esc(t.id)}</td>
+          <td>${esc(t.workspace_id)}</td>
+          <td class="mono">${esc(t.executable)} ${esc((t.args||[]).join(' '))}</td>
+          <td><span class="pill ${t.status==='SUCCEEDED'?'pill-ok':active?'pill-l1':'pill-l3'}">${esc(t.status)}</span></td>
+          <td>${t.exit_code === undefined || t.exit_code === null ? '-' : esc(t.exit_code)}</td>
+          <td>${active ? `<button class="btn-danger" onclick="cancelTask('${esc(t.id)}')">终止</button>` : '-'}</td>
+        </tr>`;
+      }).join('') + `</table>`;
+
+  // 审计表
+  const audits = state.audit || [];
+  document.getElementById('auditTable').innerHTML = !audits.length
+    ? '<div class="empty">暂无审计记录。</div>'
+    : `<table><tr><th>时间</th><th>工具</th><th>风险</th><th>裁决</th><th>状态</th><th>参数摘要（已脱敏）</th></tr>` +
+      audits.slice(0, 30).map(a => `<tr>
+        <td class="mono">${esc((a.timestamp||'').replace('T',' ').slice(0,19))}</td>
+        <td><b>${esc(a.tool)}</b></td>
+        <td>${esc(a.risk_level||'-')}</td>
+        <td>${esc(a.decision)}</td>
+        <td>${esc(a.status)}</td>
+        <td class="mono">${esc(a.args_summary || a.error || '')}</td>
+      </tr>`).join('') + `</table>`;
+}
+
+async function approve(id, mins) {
+  await api(`/api/approvals/${id}/approve`, { method: 'POST', body: JSON.stringify({ grant_minutes: mins, approver: 'web-console' }) });
+  refreshState();
+}
+async function reject(id) {
+  const note = prompt('请输入拒绝原因（可选）：', '用户在控制台拒绝');
+  if (note === null) return;
+  await api(`/api/approvals/${id}/reject`, { method: 'POST', body: JSON.stringify({ note, approver: 'web-console' }) });
+  refreshState();
+}
+async function revokeGrants(wsId) {
+  await api('/api/grants/revoke', { method: 'POST', body: JSON.stringify({ workspace_id: wsId }) });
+  refreshState();
+}
+async function pauseAll() {
+  await api('/api/kill-switch/pause', { method: 'POST', body: JSON.stringify({ reason: '用户在控制台暂停新任务' }) });
+  refreshState();
+}
+async function killAll() {
+  if (!confirm('确认触发一键急停？这将立即终止所有运行中任务、拒绝所有待审批操作并清空限时授权！')) return;
+  await api('/api/kill-switch/kill-all', { method: 'POST', body: JSON.stringify({ reason: '用户在控制台触发一键急停' }) });
+  refreshState();
+}
+async function resumeAll() {
+  await api('/api/kill-switch/resume', { method: 'POST' });
+  refreshState();
+}
+async function cancelTask(id) {
+  await api(`/api/tasks/${id}/cancel`, { method: 'POST' });
+  refreshState();
+}
+
+init();
+</script>
+</body>
+</html>

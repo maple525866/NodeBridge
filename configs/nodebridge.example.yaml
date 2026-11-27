@@ -1,0 +1,124 @@
+# NodeBridge 本地智能体网关配置模板
+# 复制为 nodebridge.yaml 或运行 `nodebridge init` 自动生成带随机 Token 的配置
+
+server:
+  # MCP Streamable HTTP 监听地址（默认仅监听本地回环，严禁未经认证暴露公网）
+  mcp_listen: "127.0.0.1:18765"
+  # 本地 Web 审批控制台与管理 API 监听地址
+  admin_listen: "127.0.0.1:18766"
+  # MCP 客户端鉴权 Bearer Token（建议使用 `nodebridge init` 生成高熵随机值）
+  mcp_token: "CHANGE_ME_MCP_TOKEN"
+  # 本地管理控制台与 CLI 鉴权 Token
+  admin_token: "CHANGE_ME_ADMIN_TOKEN"
+  # 允许的 HTTP Origin 列表（为空时仅允许无 Origin 的原生客户端或同源本地回环）
+  allowed_origins:
+    - "http://127.0.0.1:18766"
+    - "http://localhost:18766"
+
+storage:
+  # 本地持久化目录（任务快照、审计日志）
+  data_dir: "./data"
+  # 单审计日志文件轮转上限（MB）
+  audit_max_size_mb: 10
+  # 审计日志保留历史文件个数
+  audit_max_backups: 10
+
+approval:
+  # 审批等待超时（秒）。0 表示一直等待用户批准或拒绝，直到客户端取消或触发急停
+  timeout_seconds: 0
+  # L1 限时批量授权允许的最大时长（分钟）
+  max_grant_minutes: 60
+
+tasks:
+  # 最大并发运行任务数
+  max_concurrent: 4
+  # 默认单任务超时（秒）
+  default_timeout_seconds: 300
+  # 最大允许单任务超时（秒）
+  max_timeout_seconds: 1800
+  # 单任务 stdout/stderr 各自保留的最大字节数（防日志打爆内存）
+  max_output_bytes: 1048576
+
+security:
+  # 默认拒绝读取/搜索/写入的敏感路径通配符（不可被工作区降级覆盖）
+  global_deny_globs:
+    - "**/.env"
+    - "**/.env.*"
+    - "**/*.pem"
+    - "**/*.key"
+    - "**/*.p12"
+    - "**/*.pfx"
+    - "**/id_rsa*"
+    - "**/id_ed25519*"
+    - "**/.ssh/**"
+    - "**/.aws/**"
+    - "**/.gnupg/**"
+    - "**/.npmrc"
+    - "**/.pypirc"
+    - "**/credentials.json"
+    - "**/*secret*"
+  # 命令执行分层白名单策略
+  command_policy:
+    # 是否允许通过显式 use_shell=true 调用系统 Shell（即使开启也强制 L2/L3 审批）
+    allow_explicit_shell: true
+    # L0 只读可执行命令规则（免审批，仅当参数匹配时生效）
+    l0_rules:
+      - executable: "git"
+        allowed_subcommands: ["status", "diff", "log", "branch", "rev-parse", "show"]
+      - executable: "go"
+        allowed_subcommands: ["version", "env", "list"]
+    # L1 普通开发测试命令规则（默认需审批，支持按工作区限时批量授权）
+    l1_rules:
+      - executable: "go"
+        allowed_subcommands: ["test", "vet", "build", "fmt", "mod"]
+      - executable: "npm"
+        allowed_subcommands: ["test", "run"]
+      - executable: "pnpm"
+        allowed_subcommands: ["test", "run"]
+      - executable: "pytest"
+        allowed_subcommands: []
+      - executable: "python"
+        allowed_subcommands: ["-m"]
+    # L2 高风险命令（强制每次人工审批，不享受限时批量授权）
+    l2_executables:
+      - "npm"
+      - "pnpm"
+      - "yarn"
+      - "pip"
+      - "pip3"
+      - "curl"
+      - "wget"
+      - "rm"
+      - "del"
+    # L3 硬拒绝可执行程序（默认直接拒绝，防提权与系统破坏）
+    hard_deny_executables:
+      - "sudo"
+      - "su"
+      - "runas"
+      - "gsudo"
+      - "shutdown"
+      - "reboot"
+      - "diskpart"
+      - "format"
+      - "mkfs"
+      - "reg"
+      - "regedit"
+      - "netsh"
+      - "iptables"
+      - "ufw"
+      - "sc"
+      - "schtasks"
+
+workspaces:
+  - id: "default"
+    # 请修改为您要授权的本地项目根目录绝对路径
+    root: "."
+    read_only: false
+    deny_globs: []
+
+# 阶段二预留：远程隧道 / Relay 配置（阶段一默认 disabled）
+relay:
+  enabled: false
+  provider: ""
+  endpoint: ""
+  device_id: ""

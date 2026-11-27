@@ -1,0 +1,24 @@
+# 二进制与构建产物
+/nodebridge
+/nodebridge.exe
+/bin/
+/dist/
+
+# 本地运行数据、配置与日志（防止泄露本地 Token 与审计日志）
+/data/
+*.local.yaml
+nodebridge.yaml
+*.log
+*.jsonl
+*.tmp
+
+# Go 测试与覆盖率
+*.test
+*.out
+coverage.html
+
+# IDE 与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
