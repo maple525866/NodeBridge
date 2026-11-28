@@ -103,12 +103,31 @@ func TestCrossVolumeMovePreservesEntries(t *testing.T) {
 	if err := os.WriteFile(child, []byte("child"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	dstTree := filepath.Join(target, "tree")
+	dstTree := filepath.Join(target, "nested", "parent", "tree")
 	checkFailure(srcTree, dstTree, false)
 	if data, err := os.ReadFile(child); err != nil || string(data) != "child" {
 		t.Fatalf("source tree changed: %q, %v", data, err)
 	}
-	if _, err := os.Lstat(dstTree); !os.IsNotExist(err) {
-		t.Fatalf("unexpected destination tree: %v", err)
+	if _, err := os.Lstat(filepath.Join(target, "nested")); !os.IsNotExist(err) {
+		t.Fatalf("failed move left a destination directory: %v", err)
+	}
+}
+
+func TestFailedMovePreservesPopulatedParent(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "new", "parent")
+	retained := filepath.Join(parent, "local.txt")
+	failure := errors.New("rename failed")
+	err := withMoveParent(parent, func() error {
+		if err := os.WriteFile(retained, []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return failure
+	})
+	if !errors.Is(err, failure) {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(retained); err != nil || string(data) != "keep" {
+		t.Fatalf("rollback changed a populated directory: %q, %v", data, err)
 	}
 }

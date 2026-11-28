@@ -76,6 +76,9 @@ func TestWriteRejectsNULAfterTextHeader(t *testing.T) {
 func TestMutationRequiresApprovedPaths(t *testing.T) {
 	m, root := setupTestFS(t)
 	approved := filepath.Join(root, "previous")
+	if err := checkApprovedPath(filepath.Join(root, "Release"), filepath.Join(root, "release")); !errors.Is(err, ErrConflict) {
+		t.Fatalf("accepted a case-only change to an approved path: %v", err)
+	}
 	if _, err := m.WriteFile(WriteRequest{WorkspaceID: "demo", Path: "new.go", ApprovedPath: approved}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("write expected path conflict, got %v", err)
 	}
