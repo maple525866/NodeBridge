@@ -1,16 +1,15 @@
 package filesystem
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -31,10 +30,10 @@ var ErrConflict = errors.New("patch conflict")
 
 // ListEntry 表示目录列表中的单个文件或目录条目。
 type ListEntry struct {
-	Path      string `json:"path"`
-	IsDir     bool   `json:"is_dir"`
-	Size      int64  `json:"size"`
-	ModTime   string `json:"mod_time"`
+	Path    string `json:"path"`
+	IsDir   bool   `json:"is_dir"`
+	Size    int64  `json:"size"`
+	ModTime string `json:"mod_time"`
 }
 
 // ListResult 表示 workspace.list 的返回结果。
@@ -59,11 +58,13 @@ type ReadResult struct {
 	Content     string `json:"content"`
 }
 
-// SearchMatch 表示单条代码搜索命中结果。
+// SearchMatch 表示单条代码搜索命中结果（支持可选上下文行）。
 type SearchMatch struct {
-	Path       string `json:"path"`
-	LineNumber int    `json:"line_number"`
-	Line       string `json:"line"`
+	Path          string   `json:"path"`
+	LineNumber    int      `json:"line_number"`
+	Line          string   `json:"line"`
+	ContextBefore []string `json:"context_before,omitempty"`
+	ContextAfter  []string `json:"context_after,omitempty"`
 }
 
 // SearchResult 表示 workspace.search 的返回结果。
@@ -71,6 +72,7 @@ type SearchResult struct {
 	Source      string        `json:"source"`
 	WorkspaceID string        `json:"workspace_id"`
 	Query       string        `json:"query"`
+	Engine      string        `json:"engine,omitempty"`
 	Matches     []SearchMatch `json:"matches"`
 	Truncated   bool          `json:"truncated"`
 }
@@ -343,149 +345,14 @@ func (m *Manager) Search(workspaceID, query string, isRegex bool, globPattern st
 
 // SearchInPath 在指定目录或文件（默认工作区根目录，开启全部目录模式时可为宿主机任意路径）内搜索文本。
 func (m *Manager) SearchInPath(workspaceID, targetPath, query string, isRegex bool, globPattern string, maxResults int) (*SearchResult, error) {
-	if strings.TrimSpace(query) == "" {
-		return nil, errors.New("搜索关键词 query 不能为空")
-	}
-	resolved, err := m.Resolve(workspaceID, targetPath, false)
-	if err != nil {
-		return nil, err
-	}
-	ws := resolved.Workspace
-	if maxResults <= 0 {
-		maxResults = defaultSearchLimit
-	}
-	if maxResults > maxSearchLimit {
-		maxResults = maxSearchLimit
-	}
-
-	var re *regexp.Regexp
-	if isRegex {
-		re, err = regexp.Compile(query)
-		if err != nil {
-			return nil, fmt.Errorf("无效正则表达式: %w", err)
-		}
-	}
-
-	var matches []SearchMatch
-	truncated := false
-	errStop := errors.New("search limit reached")
-	allowAllDirs := m.AllowAllDirs()
-	inWorkspace := isWithinRoot(ws.RealRoot, resolved.AbsPath)
-
-	walkErr := filepath.WalkDir(resolved.AbsPath, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if p == resolved.AbsPath {
-				return nil
-			}
-			if _, skip := defaultSkipDirs[d.Name()]; skip {
-				return filepath.SkipDir
-			}
-			dirPOSIX := filepath.ToSlash(p)
-			if inWorkspace {
-				if relToWS, relErr := filepath.Rel(ws.RealRoot, p); relErr == nil {
-					dirPOSIX = filepath.ToSlash(relToWS)
-				}
-			}
-			if m.IsSensitive(ws, dirPOSIX) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		readTarget := p
-		// 无论是否开启全部目录模式，符号链接必须先解析真实目标并执行工作区边界与敏感密钥硬红线检查
-		if d.Type()&os.ModeSymlink != 0 {
-			realP, symErr := filepath.EvalSymlinks(p)
-			if symErr != nil {
-				return nil
-			}
-			if !allowAllDirs && !isWithinRoot(ws.RealRoot, realP) {
-				return nil
-			}
-			realCheckPath := filepath.ToSlash(realP)
-			if isWithinRoot(ws.RealRoot, realP) {
-				if relReal, relErr := filepath.Rel(ws.RealRoot, realP); relErr == nil {
-					realCheckPath = filepath.ToSlash(relReal)
-				}
-			}
-			if m.checkHardSecretPath(filepath.ToSlash(realP)) != nil || m.IsSensitive(ws, realCheckPath) {
-				return nil
-			}
-			readTarget = realP
-		}
-
-		var entryPOSIX string
-		if inWorkspace {
-			relToWS, relErr := filepath.Rel(ws.RealRoot, p)
-			if relErr != nil {
-				return nil
-			}
-			entryPOSIX = filepath.ToSlash(relToWS)
-		} else {
-			entryPOSIX = filepath.ToSlash(p)
-		}
-		if m.IsSensitive(ws, entryPOSIX) {
-			return nil
-		}
-		if globPattern != "" && !matchGlob(globPattern, entryPOSIX) {
-			return nil
-		}
-
-		// 对真实目标执行 Stat，避免符号链接 Lstat 大小绕过单文件读取上限或误读目录
-		fi, err := os.Stat(readTarget)
-		if err != nil || fi.IsDir() || fi.Size() > defaultReadMaxBytes {
-			return nil
-		}
-
-		raw, err := os.ReadFile(readTarget)
-		if err != nil || isBinaryContent(raw) {
-			return nil
-		}
-
-		scanner := bufio.NewScanner(bytes.NewReader(raw))
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		lineNo := 0
-		for scanner.Scan() {
-			lineNo++
-			text := scanner.Text()
-			hit := false
-			if isRegex {
-				hit = re.MatchString(text)
-			} else {
-				hit = strings.Contains(text, query)
-			}
-			if !hit {
-				continue
-			}
-			if len(text) > maxSearchLineLen {
-				text = text[:maxSearchLineLen] + "...(truncated)"
-			}
-			matches = append(matches, SearchMatch{
-				Path:       entryPOSIX,
-				LineNumber: lineNo,
-				Line:       text,
-			})
-			if len(matches) >= maxResults {
-				truncated = true
-				return errStop
-			}
-		}
-		return nil
-	})
-	if walkErr != nil && !errors.Is(walkErr, errStop) {
-		return nil, walkErr
-	}
-
-	return &SearchResult{
-		Source:      "local_workspace_search",
+	return m.SearchWithOptions(SearchOptions{
 		WorkspaceID: workspaceID,
+		Path:        targetPath,
 		Query:       query,
-		Matches:     matches,
-		Truncated:   truncated,
-	}, nil
+		IsRegex:     isRegex,
+		Glob:        globPattern,
+		MaxResults:  maxResults,
+	})
 }
 
 // PreviewPatch 在不修改磁盘的前提下校验路径、SHA256 乐观锁与 Search/Replace 匹配，并生成 Unified Diff。
@@ -641,6 +508,30 @@ func (m *Manager) computePatchLocked(resolved *ResolvedPath, req PatchRequest) (
 		NewContent:  finalContent,
 		UnifiedDiff: diff,
 	}, nil
+}
+
+func readBoundedRegularFile(p string) ([]byte, error) {
+	before, err := os.Lstat(p)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() || before.Size() > defaultReadMaxBytes {
+		return nil, errors.New("文件必须是大小未超限的普通文件")
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !os.SameFile(before, info) || !info.Mode().IsRegular() {
+		return nil, errors.New("读取时目标文件发生变化")
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, defaultReadMaxBytes+1))
+	if len(raw) > defaultReadMaxBytes {
+		return nil, errors.New("文件超过读取上限")
+	}
+	return raw, err
 }
 
 func sha256Hex(data []byte) string {

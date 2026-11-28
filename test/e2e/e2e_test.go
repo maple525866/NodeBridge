@@ -177,13 +177,13 @@ func TestStageOneEndToEndMCPWorkflow(t *testing.T) {
 	}
 	defer cs.Close()
 
-	// 验证全部 11 个工具（10 个 P0 工具 + 阶段二 approval.status）均已暴露
+	// 验证全部 19 个 MCP 工具均已暴露
 	listToolsRes, err := cs.ListTools(ctx, &mcp.ListToolsParams{})
 	if err != nil {
 		t.Fatalf("ListTools 失败: %v", err)
 	}
-	if len(listToolsRes.Tools) != 11 {
-		t.Fatalf("期望暴露 11 个 MCP 工具，实际 %d", len(listToolsRes.Tools))
+	if len(listToolsRes.Tools) != 19 {
+		t.Fatalf("期望暴露 19 个 MCP 工具，实际 %d", len(listToolsRes.Tools))
 	}
 
 	// 辅助函数：调用本地管理 API
@@ -410,6 +410,7 @@ func TestStageOneEndToEndMCPWorkflow(t *testing.T) {
 				"workspace_id": "default",
 				"executable":   sleepCmd,
 				"use_shell":    true,
+				"wait_seconds": 0,
 			},
 		})
 		sleepStartDone <- r
@@ -744,5 +745,405 @@ func TestSecurityModeFullPermissionsAndAllDirsE2E(t *testing.T) {
 	})
 	if deniedAgain == nil || !deniedAgain.IsError {
 		t.Fatalf("取消勾选全部目录后应重新拦截工作区外文件")
+	}
+}
+
+func TestEnhancedMCPToolsE2E(t *testing.T) {
+	wsDir := t.TempDir()
+	dataDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(wsDir, ".gitignore"), []byte("ignored.tmp\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wsDir, "ignored.tmp"), []byte("FindMeIgnored\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wsDir, "main.go"), []byte("package demo\n// before ctx\nfunc HelloTarget() {}\n// after ctx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	hasGit := false
+	if _, err := exec.LookPath("git"); err == nil {
+		hasGit = true
+		runGit := func(args ...string) {
+			t.Helper()
+			cmd := exec.Command("git", args...)
+			cmd.Dir = wsDir
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git %v 失败: %v\n%s", args, err, string(out))
+			}
+		}
+		runGit("init")
+		runGit("config", "user.email", "e2e@nodebridge.local")
+		runGit("config", "user.name", "E2E")
+		runGit("add", ".gitignore", "main.go")
+		runGit("commit", "-m", "initial commit")
+
+		if err := os.WriteFile(filepath.Join(wsDir, "main.go"), []byte("package demo\n// before ctx\nfunc HelloTarget() { println(2) }\n// after ctx\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGit("add", "main.go")
+		runGit("commit", "-m", "second commit")
+	}
+
+	cfg, err := config.DefaultConfig(wsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Storage.DataDir = dataDir
+
+	taskStore, _ := store.NewJSONFileTaskStore(dataDir)
+	auditLog, _ := audit.NewLogger(dataDir, 10, 5)
+	fsMgr, err := filesystem.NewManager(cfg.Workspaces, cfg.Security.GlobalDenyGlobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitAdapter, _ := git.NewAdapter(fsMgr)
+	taskMgr, _ := task.NewManager(taskStore, task.Options{
+		MaxConcurrent:  2,
+		DefaultTimeout: 20 * time.Second,
+		MaxTimeout:     30 * time.Second,
+		MaxOutputBytes: 512, // 刻意设小以验证超长输出截断尾部保留
+	})
+	policyEng := policy.NewEngine(cfg.Security)
+	broker := approval.NewBroker(0, 60, taskMgr.CancelAll)
+	capInfo := capability.Detect()
+
+	mcpSrv := mcpserver.NewMCPServer("0.2.0-enhanced-e2e", tools.Deps{
+		FS:     fsMgr,
+		Git:    gitAdapter,
+		Tasks:  taskMgr,
+		Policy: policyEng,
+		Broker: broker,
+		Audit:  auditLog,
+		Cap:    &capInfo,
+	})
+	mcpHandler := mcpserver.NewHTTPHandler(mcpSrv, mcpserver.GatewayConfig{
+		AuthProvider:   session.NewBearerTokenAuthProvider(cfg.Server.MCPToken),
+		AllowedOrigins: cfg.Server.AllowedOrigins,
+	})
+	adminSrv := admin.NewServer(
+		cfg.Server.AdminToken,
+		"127.0.0.1:0",
+		broker,
+		taskMgr,
+		auditLog,
+		fsMgr,
+		capInfo,
+		relay.DisabledConnector{},
+	)
+	adminSrv.AttachSecurityControl(policyEng, dataDir, store.SecurityMode{})
+
+	mcpTS := httptest.NewServer(mcpHandler)
+	defer mcpTS.Close()
+	adminTS := httptest.NewServer(adminSrv.Handler())
+	defer adminTS.Close()
+
+	adminCall := func(method, path string, body any) []byte {
+		t.Helper()
+		var r io.Reader
+		if body != nil {
+			b, _ := json.Marshal(body)
+			r = bytes.NewReader(b)
+		}
+		req, _ := http.NewRequest(method, adminTS.URL+path, r)
+		req.Header.Set("Authorization", "Bearer "+cfg.Server.AdminToken)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Admin API %s %s 失败: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= 400 {
+			t.Fatalf("Admin API %s %s 返回 HTTP %d: %s", method, path, resp.StatusCode, string(out))
+		}
+		return out
+	}
+
+	waitPending := func() approval.Request {
+		t.Helper()
+		for i := 0; i < 80; i++ {
+			raw := adminCall(http.MethodGet, "/api/state", nil)
+			var st struct {
+				Pending []approval.Request `json:"pending"`
+			}
+			_ = json.Unmarshal(raw, &st)
+			if len(st.Pending) > 0 {
+				return st.Pending[0]
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		t.Fatalf("等待审批单超时")
+		return approval.Request{}
+	}
+
+	ctx := context.Background()
+	mcpClient := mcp.NewClient(&mcp.Implementation{Name: "e2e-enhanced-client", Version: "1.0.0"}, nil)
+	cs, err := mcpClient.Connect(ctx, &mcp.StreamableClientTransport{
+		Endpoint: mcpTS.URL + "/mcp",
+		HTTPClient: &http.Client{
+			Transport: &authTransport{base: http.DefaultTransport, token: cfg.Server.MCPToken},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("连接 MCP 失败: %v", err)
+	}
+	defer cs.Close()
+
+	// 1. system.info：默认隔离模式隐藏 root/cwd；开启全目录后暴露
+	sysRes, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "system.info", Arguments: map[string]any{}})
+	if err != nil || sysRes.IsError {
+		t.Fatalf("system.info 失败: err=%v res=%+v", err, sysRes)
+	}
+	var sysOut tools.SystemInfoOutput
+	decodeToolJSON(t, sysRes, &sysOut)
+	if sysOut.OS != runtime.GOOS || len(sysOut.Workspaces) != 1 || sysOut.Workspaces[0].ID != "default" {
+		t.Fatalf("system.info 返回异常: %+v", sysOut)
+	}
+	if sysOut.Workspaces[0].Root != "" || sysOut.Cwd != "" {
+		t.Fatalf("默认隔离模式下 system.info 不应暴露绝对路径 root/cwd: %+v", sysOut)
+	}
+
+	// 2. workspace.glob + 增强版 workspace.search（忽略大小写 + context_lines + .gitignore）
+	globRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "workspace.glob",
+		Arguments: map[string]any{"workspace_id": "default", "pattern": "*.go"},
+	})
+	if err != nil || globRes.IsError {
+		t.Fatalf("workspace.glob 失败: err=%v res=%+v", err, globRes)
+	}
+	var globOut filesystem.GlobResult
+	decodeToolJSON(t, globRes, &globOut)
+	if len(globOut.Entries) != 1 || globOut.Entries[0].Path != "main.go" {
+		t.Fatalf("workspace.glob 结果异常: %+v", globOut)
+	}
+
+	searchRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "workspace.search",
+		Arguments: map[string]any{
+			"workspace_id":  "default",
+			"query":         "hellotarget",
+			"ignore_case":   true,
+			"context_lines": 1,
+		},
+	})
+	if err != nil || searchRes.IsError {
+		t.Fatalf("workspace.search 失败: err=%v res=%+v", err, searchRes)
+	}
+	var searchOut filesystem.SearchResult
+	decodeToolJSON(t, searchRes, &searchOut)
+	if len(searchOut.Matches) != 1 || len(searchOut.Matches[0].ContextBefore) != 1 || len(searchOut.Matches[0].ContextAfter) != 1 {
+		t.Fatalf("workspace.search 上下文/忽略大小写结果异常: %+v", searchOut)
+	}
+
+	// 审批期间本地编辑器写入的新数据应保留。
+	for _, tc := range []struct {
+		tool      string
+		args      map[string]any
+		localFile string
+	}{
+		{"workspace.write", map[string]any{"path": "draft.txt", "content": "remote"}, "draft.txt"},
+		{"workspace.move", map[string]any{"source_path": "main.go", "destination_path": "renamed.go", "overwrite": true}, "renamed.go"},
+		{"workspace.delete", map[string]any{"path": "initially-empty", "recursive": true}, "initially-empty/new.txt"},
+	} {
+		dest := filepath.Join(wsDir, tc.localFile)
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		tc.args["workspace_id"] = "default"
+		done := make(chan *mcp.CallToolResult, 1)
+		go func() {
+			result, _ := cs.CallTool(ctx, &mcp.CallToolParams{Name: tc.tool, Arguments: tc.args})
+			done <- result
+		}()
+		request := waitPending()
+		if request.Tool != tc.tool || request.RiskLevel != policy.RiskL1 {
+			t.Fatalf("%s unexpected approval: %+v", tc.tool, request)
+		}
+		if err := os.WriteFile(dest, []byte("from editor"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		adminCall(http.MethodPost, "/api/approvals/"+request.ID+"/approve", map[string]any{"grant_minutes": 0})
+		if result := <-done; result == nil || !result.IsError {
+			t.Fatalf("%s accepted a changed target: %+v", tc.tool, result)
+		}
+		if data, err := os.ReadFile(dest); err != nil || string(data) != "from editor" {
+			t.Fatalf("%s lost local edit: %q, %v", tc.tool, data, err)
+		}
+	}
+
+	// 3. workspace.write（授予 15 分钟 L1 批授）-> workspace.move（走 L1 批授免再审）-> workspace.delete 单文件（走 L1 批授）-> 递归删非空目录（自动升 L2 必须再次弹窗审批！）
+	writeDone := make(chan *mcp.CallToolResult, 1)
+	go func() {
+		r, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name: "workspace.write",
+			Arguments: map[string]any{
+				"workspace_id": "default",
+				"path":         "folder/draft.txt",
+				"content":      "hello write\n",
+			},
+		})
+		writeDone <- r
+	}()
+	aprWrite := waitPending()
+	if aprWrite.RiskLevel != policy.RiskL1 {
+		t.Fatalf("workspace.write 应为 L1，实际 %s", aprWrite.RiskLevel)
+	}
+	adminCall(http.MethodPost, "/api/approvals/"+aprWrite.ID+"/approve", map[string]any{"grant_minutes": 15})
+	if wr := <-writeDone; wr == nil || wr.IsError {
+		t.Fatalf("workspace.write 失败: %+v", wr)
+	}
+
+	// L1 批授期内：workspace.mkdir 创建新目录 -> workspace.move 移动文件到该新目录 -> 删单文件应免弹窗放行
+	mkdirRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "workspace.mkdir",
+		Arguments: map[string]any{
+			"workspace_id": "default",
+			"path":         "folder/subpkg",
+		},
+	})
+	if err != nil || mkdirRes.IsError {
+		t.Fatalf("L1 批授期内 workspace.mkdir 应直接成功: err=%v res=%+v", err, mkdirRes)
+	}
+	var mkdirOut filesystem.MkdirResult
+	decodeToolJSON(t, mkdirRes, &mkdirOut)
+	if !mkdirOut.Created || mkdirOut.Path != "folder/subpkg" {
+		t.Fatalf("workspace.mkdir 返回异常: %+v", mkdirOut)
+	}
+
+	mvRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "workspace.move",
+		Arguments: map[string]any{
+			"workspace_id":     "default",
+			"source_path":      "folder/draft.txt",
+			"destination_path": "folder/subpkg/moved.txt",
+		},
+	})
+	if err != nil || mvRes.IsError {
+		t.Fatalf("L1 批授期内 workspace.move 应直接成功: err=%v res=%+v", err, mvRes)
+	}
+	// 再写一个文件让 folder 保持非空
+	if _, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "workspace.write",
+		Arguments: map[string]any{
+			"workspace_id": "default",
+			"path":         "folder/keep.txt",
+			"content":      "keep\n",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	delSingleRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "workspace.delete",
+		Arguments: map[string]any{"workspace_id": "default", "path": "folder/subpkg/moved.txt"},
+	})
+	if err != nil || delSingleRes.IsError {
+		t.Fatalf("L1 批授期内删除单文件应直接成功: err=%v res=%+v", err, delSingleRes)
+	}
+
+	// 递归删除非空目录 folder：即使在 L1 批授期内也必须升级为 L2 强制人工审批！
+	delRecDone := make(chan *mcp.CallToolResult, 1)
+	go func() {
+		r, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name: "workspace.delete",
+			Arguments: map[string]any{
+				"workspace_id": "default",
+				"path":         "folder",
+				"recursive":    true,
+			},
+		})
+		delRecDone <- r
+	}()
+	aprDelRec := waitPending()
+	if aprDelRec.RiskLevel != policy.RiskL2 || aprDelRec.AllowBatchTTL {
+		t.Fatalf("递归删非空目录必须升级为 L2 且禁止批授，实际: %+v", aprDelRec)
+	}
+	adminCall(http.MethodPost, "/api/approvals/"+aprDelRec.ID+"/approve", map[string]any{"grant_minutes": 0})
+	if dr := <-delRecDone; dr == nil || dr.IsError {
+		t.Fatalf("批准后递归删除失败: %+v", dr)
+	}
+
+	// 4. git.log / git.show / git.diff (base/target)
+	if hasGit && gitAdapter != nil {
+		logRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name:      "git.log",
+			Arguments: map[string]any{"workspace_id": "default", "limit": 5},
+		})
+		if err != nil || logRes.IsError {
+			t.Fatalf("git.log 失败: err=%v res=%+v", err, logRes)
+		}
+		var logOut git.LogResult
+		decodeToolJSON(t, logRes, &logOut)
+		if len(logOut.Commits) != 2 || logOut.Commits[0].Subject != "second commit" {
+			t.Fatalf("git.log 返回异常: %+v", logOut)
+		}
+
+		showRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name:      "git.show",
+			Arguments: map[string]any{"workspace_id": "default", "ref": "HEAD"},
+		})
+		if err != nil || showRes.IsError {
+			t.Fatalf("git.show 失败: err=%v res=%+v", err, showRes)
+		}
+		var showOut git.ShowResult
+		decodeToolJSON(t, showRes, &showOut)
+		if !strings.Contains(showOut.Diff, "println(2)") {
+			t.Fatalf("git.show 差异异常: %+v", showOut)
+		}
+
+		rangeDiffRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name:      "git.diff",
+			Arguments: map[string]any{"workspace_id": "default", "base": "HEAD~1", "target": "HEAD"},
+		})
+		if err != nil || rangeDiffRes.IsError {
+			t.Fatalf("git.diff ref 对比失败: err=%v res=%+v", err, rangeDiffRes)
+		}
+		var rangeDiffOut git.DiffResult
+		decodeToolJSON(t, rangeDiffRes, &rangeDiffOut)
+		if !strings.Contains(rangeDiffOut.Diff, "println(2)") {
+			t.Fatalf("git.diff ref 对比未反映差异: %+v", rangeDiffOut)
+		}
+	}
+
+	// 5. terminal.start 默认短等待一次直出（无需 poll）+ 超长日志截断尾部保留（stdout_tail）
+	// 开启全权限与全目录方便测试短等待与 system.info 全目录路径暴露
+	adminCall(http.MethodPost, "/api/security/mode", map[string]any{
+		"full_permissions": true,
+		"allow_all_dirs":   true,
+	})
+	sysAllRes, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "system.info", Arguments: map[string]any{}})
+	if err != nil || sysAllRes.IsError {
+		t.Fatalf("全目录模式 system.info 失败: err=%v res=%+v", err, sysAllRes)
+	}
+	var sysAllOut tools.SystemInfoOutput
+	decodeToolJSON(t, sysAllRes, &sysAllOut)
+	if !sysAllOut.AllowAllDirs || !sysAllOut.FullPermissions || sysAllOut.Workspaces[0].Root == "" || sysAllOut.Cwd == "" {
+		t.Fatalf("全目录模式 system.info 应返回绝对 root 和 cwd: %+v", sysAllOut)
+	}
+
+	// 短命令一次调用直出结果 + 截断尾部保留
+	longOutCmd := `for i in $(seq 1 40); do echo "line_$i padding_content_0123456789"; done; echo "FINAL_TAIL_TOKEN_OK"`
+	if runtime.GOOS == "windows" {
+		longOutCmd = `1..40 | ForEach-Object { Write-Output "line_$_ padding_content_0123456789" }; Write-Output "FINAL_TAIL_TOKEN_OK"`
+	}
+	directRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "terminal.start",
+		Arguments: map[string]any{
+			"workspace_id": "default",
+			"executable":   longOutCmd,
+			"use_shell":    true,
+		},
+	})
+	if err != nil || directRes.IsError {
+		t.Fatalf("terminal.start 短等待直出失败: err=%v res=%+v", err, directRes)
+	}
+	var directOut tools.TerminalStartOutput
+	decodeToolJSON(t, directRes, &directOut)
+	if directOut.Status != string(task.StatusSucceeded) || directOut.ExitCode == nil || *directOut.ExitCode != 0 {
+		t.Fatalf("短命令应在默认 10s 等待内直接返回 SUCCEEDED 与 exit_code=0，实际: %+v", directOut)
+	}
+	if !directOut.StdoutTruncated || !strings.Contains(directOut.StdoutTail, "FINAL_TAIL_TOKEN_OK") {
+		t.Fatalf("超长输出截断时应保留末尾摘要 stdout_tail，实际: %+v", directOut)
 	}
 }

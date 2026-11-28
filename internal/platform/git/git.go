@@ -4,8 +4,10 @@ package git
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -18,6 +20,8 @@ import (
 const (
 	defaultGitTimeout = 30 * time.Second
 	defaultMaxDiff    = 256 * 1024 // 默认最大返回 256KB Diff
+	defaultLogLimit   = 20
+	maxLogLimit       = 100
 )
 
 // Adapter 提供面向授权工作区的受控 Git 操作。
@@ -42,6 +46,42 @@ type DiffResult struct {
 	Source      string `json:"source"`
 	WorkspaceID string `json:"workspace_id"`
 	Staged      bool   `json:"staged"`
+	Base        string `json:"base,omitempty"`
+	Target      string `json:"target,omitempty"`
+	Truncated   bool   `json:"truncated"`
+	Diff        string `json:"diff"`
+}
+
+// LogCommit 表示 git.log 中的单条提交记录。
+type LogCommit struct {
+	Hash      string `json:"hash"`
+	ShortHash string `json:"short_hash"`
+	Author    string `json:"author"`
+	Date      string `json:"date"`
+	Subject   string `json:"subject"`
+}
+
+// LogResult 表示 git.log 的返回结果。
+type LogResult struct {
+	Source      string      `json:"source"`
+	WorkspaceID string      `json:"workspace_id"`
+	Ref         string      `json:"ref,omitempty"`
+	Commits     []LogCommit `json:"commits"`
+	Truncated   bool        `json:"truncated,omitempty"`
+}
+
+// ShowResult 表示 git.show 的返回结果。
+type ShowResult struct {
+	Source      string `json:"source"`
+	WorkspaceID string `json:"workspace_id"`
+	Ref         string `json:"ref"`
+	Hash        string `json:"hash"`
+	ShortHash   string `json:"short_hash"`
+	Author      string `json:"author"`
+	Date        string `json:"date"`
+	Subject     string `json:"subject"`
+	Body        string `json:"body,omitempty"`
+	StatOnly    bool   `json:"stat_only,omitempty"`
 	Truncated   bool   `json:"truncated"`
 	Diff        string `json:"diff"`
 }
@@ -134,6 +174,11 @@ func (a *Adapter) Diff(ctx context.Context, workspaceID string, staged bool, pat
 
 // DiffAt 查看指定 Git 仓库目录（默认工作区根目录）的变更差异。
 func (a *Adapter) DiffAt(ctx context.Context, workspaceID, repoPath string, staged bool, paths []string, maxBytes int) (*DiffResult, error) {
+	return a.DiffRangeAt(ctx, workspaceID, repoPath, staged, "", "", paths, maxBytes)
+}
+
+// DiffRangeAt 查看指定 Git 仓库目录的变更差异，支持可选 base / target ref 对比（如 main...HEAD、HEAD~1）。
+func (a *Adapter) DiffRangeAt(ctx context.Context, workspaceID, repoPath string, staged bool, baseRef, targetRef string, paths []string, maxBytes int) (*DiffResult, error) {
 	resolvedRepo, err := a.fsMgr.Resolve(workspaceID, repoPath, false)
 	if err != nil {
 		return nil, err
@@ -142,62 +187,274 @@ func (a *Adapter) DiffAt(ctx context.Context, workspaceID, repoPath string, stag
 		maxBytes = defaultMaxDiff
 	}
 
-	args := []string{"diff", "--no-ext-diff"}
+	baseRef = strings.TrimSpace(baseRef)
+	targetRef = strings.TrimSpace(targetRef)
+	if targetRef != "" && (staged || baseRef == "") {
+		return nil, errors.New("target 必须与 base 搭配使用，且不能与 staged 同时使用")
+	}
+	args := []string{"diff", "--no-ext-diff", "--no-textconv"}
 	if staged {
 		args = append(args, "--cached")
 	}
-	if len(paths) > 0 {
-		args = append(args, "--")
-		for _, p := range paths {
-			target := p
-			if strings.TrimSpace(repoPath) != "" && !filepath.IsAbs(p) {
-				target = filepath.Join(resolvedRepo.AbsPath, filepath.FromSlash(p))
-			}
-			resolved, err := a.fsMgr.Resolve(workspaceID, target, false)
-			if err != nil {
-				return nil, err
-			}
-			gitRel := resolved.RelPath
-			if rel, relErr := filepath.Rel(resolvedRepo.AbsPath, resolved.AbsPath); relErr == nil {
-				gitRel = filepath.ToSlash(rel)
-			}
-			args = append(args, gitRel)
+	if baseRef != "" {
+		base, err := a.resolveRevision(ctx, resolvedRepo.AbsPath, baseRef, targetRef == "" && !staged)
+		if err != nil {
+			return nil, err
 		}
-	} else {
-		// 未指定路径时显式排除敏感密钥与凭证文件，防止 git.diff 泄露已跟踪或暂存的密钥
-		args = append(args, "--", ".",
-			":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*",
-			":(exclude,glob)**/.ssh/**", ":(exclude,glob)**/.gnupg/**",
-			":(exclude,glob)**/.aws/**", ":(exclude,glob)**/.kube/**",
-			":(exclude,glob)**/*.pem", ":(exclude,glob)**/*.key",
-			":(exclude,glob)**/*.ppk", ":(exclude,glob)**/*.p12",
-			":(exclude,glob)**/*.pfx", ":(exclude,glob)**/*.kdbx",
-			":(exclude,glob)**/id_rsa*", ":(exclude,glob)**/id_ed25519*",
-			":(exclude,glob)**/id_ecdsa*", ":(exclude,glob)**/id_dsa*",
-			":(exclude,glob)**/authorized_keys", ":(exclude,glob)**/nodebridge.yaml",
-		)
+		args = append(args, base)
 	}
-
-	stdout, stderr, err := a.runGit(ctx, resolvedRepo.AbsPath, nil, args...)
+	if targetRef != "" {
+		target, err := a.resolveCommit(ctx, resolvedRepo.AbsPath, targetRef)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, target)
+	}
+	specs, err := a.visiblePathspecs(resolvedRepo, workspaceID, paths)
 	if err != nil {
-		return nil, fmt.Errorf("git diff 失败: %v (%s)", err, strings.TrimSpace(stderr))
+		return nil, err
 	}
-
-	stdout = audit.RedactPrivateSecrets(stdout)
-
-	truncated := false
-	if len(stdout) > maxBytes {
-		stdout = stdout[:maxBytes] + "\n...(diff truncated)"
-		truncated = true
+	stdout, truncated, err := a.readDiff(ctx, resolvedRepo.AbsPath, maxBytes, append(args, specs...))
+	if err != nil {
+		return nil, err
 	}
 
 	return &DiffResult{
 		Source:      "git_output",
 		WorkspaceID: workspaceID,
 		Staged:      staged,
+		Base:        baseRef,
+		Target:      targetRef,
 		Truncated:   truncated,
 		Diff:        stdout,
 	}, nil
+}
+
+// LogAt 查看指定 Git 仓库目录的提交历史（支持 ref 与安全校验后的单文件/目录路径过滤）。
+func (a *Adapter) LogAt(ctx context.Context, workspaceID, repoPath, ref, filePath string, limit int) (*LogResult, error) {
+	resolvedRepo, err := a.fsMgr.Resolve(workspaceID, repoPath, false)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = defaultLogLimit
+	}
+	if limit > maxLogLimit {
+		limit = maxLogLimit
+	}
+	ref = strings.TrimSpace(ref)
+	args := []string{
+		"log", "--no-notes", "--no-show-signature", fmt.Sprintf("-n%d", limit),
+		"--format=%H%x00%h%x00%an%x00%aI%x00%s", "-z",
+	}
+	if ref != "" {
+		resolved, err := a.resolveRevision(ctx, resolvedRepo.AbsPath, ref, true)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, resolved)
+	}
+	var paths []string
+	if strings.TrimSpace(filePath) != "" {
+		paths = []string{filePath}
+	}
+	specs, err := a.visiblePathspecs(resolvedRepo, workspaceID, paths)
+	if err != nil {
+		return nil, err
+	}
+	stdout, truncated, err := a.readGit(ctx, resolvedRepo.AbsPath, defaultMaxDiff, append(args, specs...)...)
+	if err != nil {
+		return nil, err
+	}
+
+	commits := make([]LogCommit, 0)
+	fields := strings.Split(stdout, "\x00")
+	for len(fields) > 5 { // the fifth field must have a terminating NUL
+		commits = append(commits, LogCommit{
+			Hash:      fields[0],
+			ShortHash: fields[1],
+			Author:    audit.RedactPrivateSecrets(fields[2]),
+			Date:      fields[3],
+			Subject:   audit.RedactPrivateSecrets(fields[4]),
+		})
+		fields = fields[5:]
+	}
+
+	return &LogResult{
+		Source:      "git_output",
+		WorkspaceID: workspaceID,
+		Ref:         ref,
+		Commits:     commits,
+		Truncated:   truncated,
+	}, nil
+}
+
+// ShowAt 查看指定提交的元数据与差异（强制排除敏感密钥路径并执行输出脱敏）。
+func (a *Adapter) ShowAt(ctx context.Context, workspaceID, repoPath, ref string, statOnly bool, maxBytes int) (*ShowResult, error) {
+	resolvedRepo, err := a.fsMgr.Resolve(workspaceID, repoPath, false)
+	if err != nil {
+		return nil, err
+	}
+	if maxBytes <= 0 || maxBytes > 2*1024*1024 {
+		maxBytes = defaultMaxDiff
+	}
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		ref = "HEAD"
+	}
+	oid, err := a.resolveCommit(ctx, resolvedRepo.AbsPath, ref)
+	if err != nil {
+		return nil, err
+	}
+	specs, err := a.visiblePathspecs(resolvedRepo, workspaceID, nil)
+	if err != nil {
+		return nil, err
+	}
+	metaArgs := []string{"show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%H%x00%h%x00%an%x00%aI%x00%s%x00%b", oid}
+	metaOut, metaTruncated, err := a.readGit(ctx, resolvedRepo.AbsPath, defaultMaxDiff, append(metaArgs, specs...)...)
+	if err != nil {
+		return nil, err
+	}
+	if metaTruncated {
+		metaOut = metaOut[:strings.LastIndexByte(metaOut, '\n')+1]
+	}
+	fields := strings.SplitN(metaOut, "\x00", 6)
+	if len(fields) < 6 {
+		return nil, errors.New("该提交没有可见的变更或提交元数据超出限制")
+	}
+	res := &ShowResult{
+		Source: "git_output", WorkspaceID: workspaceID, Ref: ref, StatOnly: statOnly,
+		Hash: fields[0], ShortHash: fields[1], Author: audit.RedactPrivateSecrets(fields[2]),
+		Date: fields[3], Subject: audit.RedactPrivateSecrets(fields[4]),
+		Body: audit.RedactPrivateSecrets(strings.TrimSpace(fields[5])),
+	}
+	diffArgs := []string{"show", "--no-notes", "--no-show-signature", "--no-ext-diff", "--no-textconv", "--format="}
+	if statOnly {
+		diffArgs = append(diffArgs, "--stat")
+	}
+	diffArgs = append(diffArgs, oid)
+	res.Diff, res.Truncated, err = a.readDiff(ctx, resolvedRepo.AbsPath, maxBytes, append(diffArgs, specs...))
+	if err != nil {
+		return nil, err
+	}
+	res.Truncated = res.Truncated || metaTruncated
+	return res, nil
+}
+
+// Only immutable commits are passed to history commands. Git also accepts tree and
+// blob objects for "show", whose output has different path filtering semantics.
+func (a *Adapter) resolveCommit(ctx context.Context, dir, ref string) (string, error) {
+	if err := validateGitRef(ref); err != nil {
+		return "", err
+	}
+	out, _, err := a.readGit(ctx, dir, 128, "rev-parse", "--verify", "--end-of-options", ref)
+	if err != nil {
+		return "", fmt.Errorf("无效的提交引用: %w", err)
+	}
+	id := strings.TrimSpace(out)
+	if _, err := hex.DecodeString(id); err != nil || (len(id) != 40 && len(id) != 64) {
+		return "", errors.New("引用必须解析为单个 Git 对象")
+	}
+	out, _, err = a.readGit(ctx, dir, 128, "rev-parse", "--verify", id+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("无效的提交引用: %w", err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func (a *Adapter) resolveRevision(ctx context.Context, dir, ref string, allowRange bool) (string, error) {
+	if allowRange {
+		left, right, found := strings.Cut(ref, "..")
+		if found {
+			separator := ".."
+			if strings.HasPrefix(right, ".") {
+				separator, right = "...", right[1:]
+			}
+			if left == "" {
+				left = "HEAD"
+			}
+			if right == "" {
+				right = "HEAD"
+			}
+			start, err := a.resolveCommit(ctx, dir, left)
+			if err != nil {
+				return "", err
+			}
+			end, err := a.resolveCommit(ctx, dir, right)
+			if err != nil {
+				return "", err
+			}
+			return start + separator + end, nil
+		}
+	}
+	return a.resolveCommit(ctx, dir, ref)
+}
+
+func (a *Adapter) visiblePathspecs(dir *filesystem.ResolvedPath, workspaceID string, paths []string) ([]string, error) {
+	specs := []string{"--"}
+	if len(paths) == 0 {
+		specs = append(specs, ".")
+	}
+	for _, p := range paths {
+		target := p
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(dir.AbsPath, filepath.FromSlash(target))
+		}
+		resolved, err := a.fsMgr.Resolve(workspaceID, target, false)
+		if err != nil {
+			return nil, err
+		}
+		rel, err := filepath.Rel(dir.AbsPath, resolved.AbsPath)
+		if err != nil || (rel != "." && !filepath.IsLocal(rel)) {
+			return nil, fmt.Errorf("%w: 指定路径在仓库目录以外", filesystem.ErrAccessDenied)
+		}
+		if rel == "." {
+			specs = append(specs, ".")
+		} else {
+			specs = append(specs, ":(literal)"+filepath.ToSlash(rel))
+		}
+	}
+	for _, pattern := range a.fsMgr.DenyGlobsBelow(dir) {
+		specs = append(specs, ":(exclude,glob,icase)"+pattern)
+	}
+	return specs, nil
+}
+
+func (a *Adapter) readDiff(ctx context.Context, dir string, maxBytes int, args []string) (string, bool, error) {
+	// Keep enough lookahead to recognize redaction markers at the displayed boundary.
+	out, truncated, err := a.readGit(ctx, dir, maxBytes+4096, args...)
+	if err != nil {
+		return "", false, err
+	}
+	if truncated {
+		// Discard the unfinished line before redaction: it may contain half a token.
+		out = out[:strings.LastIndexByte(out, '\n')+1]
+	}
+	out = audit.RedactPrivateSecrets(out)
+	if len(out) > maxBytes {
+		out = out[:maxBytes]
+		truncated = true
+	}
+	if truncated {
+		out += "\n...(diff truncated)"
+	}
+	return out, truncated, nil
+}
+
+// validateGitRef 拦截以 '-' 开头或含空白/控制字符的非法 Git 引用，防止参数注入。
+func validateGitRef(ref string) error {
+	if ref == "" {
+		return errors.New("ref 不能为空")
+	}
+	if strings.HasPrefix(ref, "-") {
+		return fmt.Errorf("ref 不能以 '-' 开头: %q", ref)
+	}
+	for _, r := range ref {
+		if r <= 0x20 || r == 0x7f {
+			return fmt.Errorf("ref 包含非法空白或控制字符: %q", ref)
+		}
+	}
+	return nil
 }
 
 // ValidatePatch 在人工审批前解析补丁涉及的全部文件路径并进行目录/敏感文件安全校验与 `git apply --check` 预检。
@@ -418,6 +675,33 @@ func parseNumstatZPaths(out string) []string {
 }
 
 func (a *Adapter) runGit(ctx context.Context, cwd string, stdin []byte, args ...string) (string, string, error) {
+	var stdout, stderr bytes.Buffer
+	err := a.execGit(ctx, cwd, stdin, &stdout, &stderr, args...)
+	return stdout.String(), stderr.String(), err
+}
+
+type limitedOutput struct {
+	data      bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (b *limitedOutput) Write(p []byte) (int, error) {
+	n := min(len(p), b.limit-b.data.Len())
+	b.data.Write(p[:n])
+	b.truncated = b.truncated || n < len(p)
+	return len(p), nil
+}
+
+func (a *Adapter) readGit(ctx context.Context, cwd string, limit int, args ...string) (string, bool, error) {
+	stdout, stderr := limitedOutput{limit: limit}, limitedOutput{limit: 4096}
+	if err := a.execGit(ctx, cwd, nil, &stdout, &stderr, args...); err != nil {
+		return "", false, fmt.Errorf("git %s 失败: %w (%s)", args[0], err, audit.RedactPrivateSecrets(strings.TrimSpace(stderr.data.String())))
+	}
+	return stdout.data.String(), stdout.truncated, nil
+}
+
+func (a *Adapter) execGit(ctx context.Context, cwd string, stdin []byte, stdout, stderr io.Writer, args ...string) error {
 	runCtx, cancel := context.WithTimeout(ctx, defaultGitTimeout)
 	defer cancel()
 
@@ -428,10 +712,6 @@ func (a *Adapter) runGit(ctx context.Context, cwd string, stdin []byte, args ...
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	return stdout.String(), stderr.String(), err
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	return cmd.Run()
 }

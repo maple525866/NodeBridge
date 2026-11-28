@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -33,31 +34,52 @@ type Handle interface {
 
 // 默认允许透传给子进程的基础无害环境变量名（防止泄露宿主机 API Key、云凭据等）
 var safeBaseEnvKeys = map[string]struct{}{
-	"PATH":          {},
-	"PATHEXT":       {},
-	"SYSTEMROOT":    {},
-	"WINDIR":        {},
-	"COMSPEC":       {},
-	"TEMP":          {},
-	"TMP":           {},
-	"TMPDIR":        {},
-	"HOME":          {},
-	"USERPROFILE":   {},
-	"HOMEDRIVE":     {},
-	"HOMEPATH":      {},
-	"APPDATA":       {},
-	"LOCALAPPDATA":  {},
-	"LANG":          {},
-	"LC_ALL":        {},
-	"TERM":          {},
-	"GOROOT":        {},
-	"GOPATH":        {},
-	"GOCACHE":       {},
-	"GOMODCACHE":    {},
-	"GOPROXY":       {},
-	"GOTOOLCHAIN":   {},
+	"PATH":             {},
+	"PATHEXT":          {},
+	"SYSTEMROOT":       {},
+	"WINDIR":           {},
+	"COMSPEC":          {},
+	"TEMP":             {},
+	"TMP":              {},
+	"TMPDIR":           {},
+	"HOME":             {},
+	"USERPROFILE":      {},
+	"HOMEDRIVE":        {},
+	"HOMEPATH":         {},
+	"APPDATA":          {},
+	"LOCALAPPDATA":     {},
+	"LANG":             {},
+	"LC_ALL":           {},
+	"TERM":             {},
+	"CI":               {},
+	"NO_COLOR":         {},
+	"FORCE_COLOR":      {},
+	"HTTP_PROXY":       {},
+	"HTTPS_PROXY":      {},
+	"NO_PROXY":         {},
+	"ALL_PROXY":        {},
+	"GOROOT":           {},
+	"GOPATH":           {},
+	"GOCACHE":          {},
+	"GOMODCACHE":       {},
+	"GOPROXY":          {},
+	"GOPRIVATE":        {},
+	"GOTOOLCHAIN":      {},
 	"NODE_ENV":         {},
+	"NODE_OPTIONS":     {},
+	"NVM_DIR":          {},
+	"PNPM_HOME":        {},
+	"BUN_INSTALL":      {},
 	"PYTHONIOENCODING": {},
+	"VIRTUAL_ENV":      {},
+	"CONDA_PREFIX":     {},
+	"PYENV_ROOT":       {},
+	"CARGO_HOME":       {},
+	"RUSTUP_HOME":      {},
+	"JAVA_HOME":        {},
+	"MAVEN_HOME":       {},
+	"GRADLE_HOME":      {},
+	"DOTNET_ROOT":      {},
 }
 
 var (
@@ -107,14 +129,14 @@ func BuildCommand(spec Spec) (*exec.Cmd, error) {
 		if shellCmd == "" {
 			return nil, errors.New("显式 Shell 模式下命令内容不能为空")
 		}
+		_, shellBin, err := DefaultShell()
+		if err != nil {
+			return nil, err
+		}
 		if runtime.GOOS == "windows" {
-			shellBin := "powershell"
-			if p, err := exec.LookPath("pwsh"); err == nil {
-				shellBin = p
-			}
 			cmd = exec.Command(shellBin, "-NoProfile", "-NonInteractive", "-Command", shellCmd)
 		} else {
-			cmd = exec.Command("/bin/sh", "-c", shellCmd)
+			cmd = exec.Command(shellBin, "-c", shellCmd)
 		}
 	} else {
 		cmd = exec.Command(spec.Executable, spec.Args...)
@@ -125,6 +147,28 @@ func BuildCommand(spec Spec) (*exec.Cmd, error) {
 	cmd.Stdout = spec.Stdout
 	cmd.Stderr = spec.Stderr
 	return cmd, nil
+}
+
+// DefaultShell returns the interpreter used by a terminal command with UseShell.
+func DefaultShell() (name, path string, err error) {
+	if runtime.GOOS != "windows" {
+		path, err = exec.LookPath("/bin/sh")
+		return "sh", path, err
+	}
+	if path, err = exec.LookPath("pwsh"); err == nil {
+		return "pwsh", path, nil
+	}
+	path, err = exec.LookPath("powershell")
+	return "powershell", path, err
+}
+
+// Keep credentials in authenticated proxy URLs out of subprocess environments.
+func safeProxyAddress(value string) bool {
+	if !strings.Contains(value, "://") {
+		value = "//" + value
+	}
+	u, err := url.Parse(value)
+	return err == nil && u.Host != "" && u.User == nil && u.RawQuery == "" && u.Fragment == ""
 }
 
 func buildFilteredEnv(allowList []string, extra map[string]string) []string {
@@ -151,6 +195,12 @@ func buildFilteredEnv(allowList []string, extra map[string]string) []string {
 			continue
 		}
 		if _, ok := allowed[upper]; ok {
+			switch upper {
+			case "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY":
+				if !safeProxyAddress(kv[idx+1:]) {
+					continue
+				}
+			}
 			env = append(env, kv)
 		}
 	}

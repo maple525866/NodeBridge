@@ -94,7 +94,11 @@ security:
         allowed_subcommands: ["status", "diff", "log", "branch", "rev-parse", "show"]
       - executable: "go"
         allowed_subcommands: ["version", "env", "list"]
-    # L1 普通开发测试命令规则（默认需审批，支持按工作区限时批量授权）
+      - executable: "node"
+        allowed_subcommands: ["--version", "-v"]
+      - executable: "rustc"
+        allowed_subcommands: ["--version"]
+    # L1 普通开发测试命令规则（默认需审批，支持按工作区限时批量授权；依赖安装类命令仍保留在 L2）
     l1_rules:
       - executable: "go"
         allowed_subcommands: ["test", "vet", "build", "fmt", "mod"]
@@ -102,15 +106,44 @@ security:
         allowed_subcommands: ["test", "run"]
       - executable: "pnpm"
         allowed_subcommands: ["test", "run"]
+      - executable: "yarn"
+        allowed_subcommands: ["test", "run"]
+      - executable: "bun"
+        allowed_subcommands: ["test", "run", "build"]
+      - executable: "node"
+        allowed_subcommands: ["--check"]
+      - executable: "tsc"
+        allowed_subcommands: []
+      - executable: "eslint"
+        allowed_subcommands: []
+      - executable: "prettier"
+        allowed_subcommands: []
       - executable: "pytest"
         allowed_subcommands: []
+      - executable: "ruff"
+        allowed_subcommands: ["check", "format"]
       - executable: "python"
         allowed_subcommands: ["-m"]
+      - executable: "python3"
+        allowed_subcommands: ["-m"]
+      - executable: "cargo"
+        allowed_subcommands: ["test", "check", "build", "clippy", "fmt"]
+      - executable: "make"
+        allowed_subcommands: []
+      - executable: "cmake"
+        allowed_subcommands: ["--build", "--version"]
+      - executable: "mvn"
+        allowed_subcommands: ["test", "compile", "verify", "package"]
+      - executable: "gradle"
+        allowed_subcommands: ["test", "check", "build", "assemble"]
+      - executable: "dotnet"
+        allowed_subcommands: ["test", "build", "format"]
     # L2 高风险命令（强制每次人工审批，不享受限时批量授权）
     l2_executables:
       - "npm"
       - "pnpm"
       - "yarn"
+      - "bun"
       - "pip"
       - "pip3"
       - "curl"

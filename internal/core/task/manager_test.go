@@ -1,6 +1,8 @@
 package task
 
 import (
+	"context"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -8,6 +10,89 @@ import (
 
 	"nodebridge/internal/core/store"
 )
+
+type gatedTerminalStore struct {
+	store.TaskStore
+	saving  chan struct{}
+	release chan struct{}
+}
+
+func (s *gatedTerminalStore) SaveAll(records []store.TaskRecord) error {
+	if len(records) == 1 && Status(records[0].Status).IsTerminal() {
+		close(s.saving)
+		<-s.release
+	}
+	return s.TaskStore.SaveAll(records)
+}
+
+func TestCompletionWaitsForFinalSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	disk, err := store.NewJSONFileTaskStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gated := &gatedTerminalStore{TaskStore: disk, saving: make(chan struct{}), release: make(chan struct{})}
+	mgr, err := NewManager(gated, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := mgr.Start(StartRequest{Executable: filepath.Join(dir, "missing-command"), Cwd: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-gated.saving:
+	case <-time.After(5 * time.Second):
+		close(gated.release)
+		t.Fatal("final snapshot did not reach the store")
+	}
+	_, earlyErr := mgr.WaitForTerminal(rec.ID, 0)
+	close(gated.release)
+	res, err := mgr.WaitForTerminal(rec.ID, 5*time.Second)
+	if earlyErr == nil || err != nil || res.Status != StatusFailed {
+		t.Fatalf("completion before/after save: earlyErr=%v err=%v result=%+v", earlyErr, err, res)
+	}
+	records, err := disk.LoadAll()
+	if err != nil || len(records) != 1 || records[0].Status != string(StatusFailed) {
+		t.Fatalf("missing final snapshot: err=%v records=%+v", err, records)
+	}
+}
+
+func TestPollWaitReturnsNewTailBeforeCompletion(t *testing.T) {
+	mt := &managedTask{record: store.TaskRecord{ID: "tail", Status: string(StatusRunning)}, done: make(chan struct{})}
+	mt.stdout = newCappedBuffer(8, mt.broadcastUpdate)
+	mt.stderr = newCappedBuffer(8, mt.broadcastUpdate)
+	_, _ = mt.stdout.Write([]byte("0123456789\n"))
+	mgr := &Manager{tasks: map[string]*managedTask{"tail": mt}}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result := make(chan *PollResult, 1)
+	go func() {
+		res, _ := mgr.PollWait(ctx, "tail", 8, 0, 10*time.Second)
+		result <- res
+	}()
+	for {
+		mt.mu.Lock()
+		watching := mt.updateCh != nil
+		mt.mu.Unlock()
+		if watching {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatal("poll did not subscribe")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	_, _ = mt.stdout.Write([]byte("last\n"))
+	select {
+	case got := <-result:
+		if got == nil || got.StdoutChunk != "" || !strings.HasSuffix(got.StdoutTail, "last\n") || got.Status != StatusRunning || ctx.Err() != nil {
+			t.Fatalf("poll did not report a tail-only update: %+v", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("new tail did not wake poll")
+	}
+}
 
 func TestTaskLifecycleTimeoutCancelAndRecovery(t *testing.T) {
 	dataDir := t.TempDir()
@@ -121,5 +206,49 @@ func TestTaskLifecycleTimeoutCancelAndRecovery(t *testing.T) {
 	}
 	if orphan.Status != StatusFailed || !strings.Contains(orphan.ErrorMessage, "重启") {
 		t.Fatalf("遗留任务未正确收敛: %+v", orphan)
+	}
+
+	// 5. 测试 WaitUntilTerminal 短等待一次直出与 PollWait 长轮询唤醒
+	rec2, err := mgr2.Start(StartRequest{
+		WorkspaceID: "default",
+		ToolName:    "terminal.start",
+		Executable:  exe,
+		Args:        args,
+		Cwd:         dataDir,
+	})
+	if err != nil {
+		t.Fatalf("Start 短等待任务失败: %v", err)
+	}
+	directRes, err := mgr2.WaitUntilTerminal(context.Background(), rec2.ID, 5*time.Second)
+	if err != nil || directRes.Status != StatusSucceeded || !strings.Contains(directRes.StdoutChunk, "hello_nodebridge") {
+		t.Fatalf("WaitUntilTerminal 异常: err=%v res=%+v", err, directRes)
+	}
+
+	var delayedCmd string
+	if runtime.GOOS == "windows" {
+		delayedCmd = `Start-Sleep -Milliseconds 300; Write-Output "delayed_chunk_ready"`
+	} else {
+		delayedCmd = `sleep 0.3 && echo delayed_chunk_ready`
+	}
+	rec3, err := mgr2.Start(StartRequest{
+		WorkspaceID: "default",
+		ToolName:    "terminal.start",
+		Executable:  delayedCmd,
+		Cwd:         dataDir,
+		UseShell:    true,
+	})
+	if err != nil {
+		t.Fatalf("Start 延迟输出任务失败: %v", err)
+	}
+	pollWaitRes, err := mgr2.PollWait(context.Background(), rec3.ID, 0, 0, 5*time.Second)
+	if err != nil {
+		t.Fatalf("PollWait 失败: %v", err)
+	}
+	if !strings.Contains(pollWaitRes.StdoutChunk, "delayed_chunk_ready") && !pollWaitRes.Status.IsTerminal() {
+		t.Fatalf("PollWait 应在延迟输出到达或终态时唤醒返回，实际: %+v", pollWaitRes)
+	}
+	completed, err := mgr2.WaitForTerminal(rec3.ID, 5*time.Second)
+	if err != nil || completed.Status != StatusSucceeded {
+		t.Fatalf("等待延迟输出任务结束失败: err=%v result=%+v", err, completed)
 	}
 }

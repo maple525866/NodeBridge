@@ -319,6 +319,54 @@ func (m *Manager) IsSensitive(ws *Workspace, relPOSIX string) bool {
 	return m.checkSensitivePath(ws, relPOSIX) != nil
 }
 
+// DenyGlobsBelow returns the active exclusions relative to a resolved directory.
+// A directory can match several prefixes of a pattern containing **.
+func (m *Manager) DenyGlobsBelow(dir *ResolvedPath) []string {
+	var prefix []string
+	if dir.RelPath != "." {
+		prefix = strings.Split(strings.ToLower(strings.Trim(filepath.ToSlash(dir.RelPath), "/")), "/")
+	}
+	seen := make(map[string]bool)
+	var globs []string
+	for _, rules := range [][]string{m.hardSecretDenyGlobs, m.globalDenyGlobs, dir.Workspace.DenyGlobs} {
+		for _, rule := range rules {
+			parts := strings.Split(strings.TrimPrefix(filepath.ToSlash(rule), "/"), "/")
+			// Each position is the next pattern component after consuming the directory prefix.
+			positions := map[int]bool{0: true}
+			for _, name := range prefix {
+				next := make(map[int]bool)
+				for i := range positions {
+					for i < len(parts) && parts[i] == "**" {
+						next[i] = true
+						i++
+					}
+					if i == len(parts) {
+						return []string{"**"} // a denied directory excludes all its descendants
+					}
+					if ok, _ := path.Match(strings.ToLower(parts[i]), name); ok {
+						next[i+1] = true
+					}
+				}
+				positions = next
+			}
+			for i := 0; i <= len(parts); i++ {
+				if !positions[i] {
+					continue
+				}
+				if i == len(parts) {
+					return []string{"**"}
+				}
+				suffix := strings.Join(parts[i:], "/")
+				if !seen[suffix] {
+					seen[suffix] = true
+					globs = append(globs, suffix)
+				}
+			}
+		}
+	}
+	return globs
+}
+
 func (m *Manager) checkHardSecretPath(pathPOSIX string) error {
 	cleanPath := strings.TrimPrefix(path.Clean("/"+filepath.ToSlash(pathPOSIX)), "/")
 	if cleanPath == "" || cleanPath == "." {

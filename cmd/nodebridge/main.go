@@ -449,6 +449,7 @@ func executeDaemonRuntime(hostCtx context.Context, cfg *config.Config, absCfg, s
 		Policy: policyEng,
 		Broker: broker,
 		Audit:  auditLog,
+		Cap:    &capInfo,
 	})
 
 	staticAuth := session.NewBearerTokenAuthProvider(cfg.Server.MCPToken)
