@@ -267,7 +267,9 @@ func (m *Manager) PreviewMkdir(req MkdirRequest) (*MkdirPreview, error) {
 	resolved, err := m.resolveEntryNoFollow(req.WorkspaceID, req.Path, true)
 	if err != nil {
 		if errors.Is(err, syscall.ENOTDIR) && !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("%w: 祖先路径不是目录", ErrConflict)
+			// Resolution stopped before authorization completed. Preserve its
+			// denial so a remote retry cannot replay an earlier approval.
+			return nil, fmt.Errorf("%w: %w", ErrConflict, err)
 		}
 		return nil, err
 	}

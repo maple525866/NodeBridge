@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -565,6 +566,15 @@ func TestMkdirSecurityAndSemantics(t *testing.T) {
 			if _, err := mgr.Mkdir(MkdirRequest{WorkspaceID: "demo", Path: path, Parents: parents}); !errors.Is(err, ErrConflict) {
 				t.Fatalf("path=%q parents=%t: 期望 ErrConflict，实际: %v", path, parents, err)
 			}
+		}
+	}
+
+	// On Unix, a non-directory above the immediate parent stops path resolution
+	// before authorization completes; both error classifications must survive.
+	if runtime.GOOS != "windows" {
+		_, err := mgr.PreviewMkdir(MkdirRequest{WorkspaceID: "demo", Path: "hello.go/missing/child", Parents: true})
+		if !errors.Is(err, ErrAccessDenied) || !errors.Is(err, ErrConflict) {
+			t.Fatalf("expected denied resolution and a mkdir conflict, got %v", err)
 		}
 	}
 
