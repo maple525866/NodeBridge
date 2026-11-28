@@ -524,6 +524,7 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 			if writeReq.ExpectedSHA256 == "" && !preview.IsNewFile {
 				writeReq.ExpectedSHA256 = preview.OldSHA256
 			}
+			writeReq.ApprovedPath = preview.Resolved.AbsPath
 			actionWord := "覆写"
 			if preview.IsNewFile {
 				writeReq.Overwrite = false
@@ -571,7 +572,7 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "workspace.move",
-		Description: "重命名或移动工作区内的文件或目录（受路径边界、敏感密钥红线与人工审批约束）",
+		Description: "在同一文件系统内重命名或移动文件和目录（受工作区边界、敏感路径与人工审批约束）",
 	}, func(ctx context.Context, callReq *mcp.CallToolRequest, in WorkspaceMoveInput) (*mcp.CallToolResult, *filesystem.MoveResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("workspace.move")
@@ -596,6 +597,8 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 		} else {
 			srcRel = preview.Source.RelPath
 			dstRel = preview.Destination.RelPath
+			moveReq.ApprovedSource = preview.Source.AbsPath
+			moveReq.ApprovedDestination = preview.Destination.AbsPath
 			moveReq.Overwrite = moveReq.Overwrite && preview.DestExists
 			outcome, err = d.Broker.ExecuteWithApproval(ctx, approval.Request{
 				SessionID:     p.SessionID,
@@ -665,6 +668,7 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 		} else {
 			targetPath = preview.Resolved.RelPath
 			delReq.Recursive = preview.RecursiveNonEmpty
+			delReq.ApprovedPath = preview.Resolved.AbsPath
 			ev = d.Policy.EvaluateDelete(preview.RecursiveNonEmpty)
 			summary := fmt.Sprintf("删除工作区 %s 中的 %s", in.WorkspaceID, targetPath)
 			if preview.RecursiveNonEmpty {

@@ -393,6 +393,7 @@ func (mt *managedTask) watchCh() <-chan struct{} {
 // Manager 负责管理所有异步终端任务的生命周期、并发配额、急停清理与持久化快照。
 type Manager struct {
 	mu             sync.RWMutex
+	persistMu      sync.Mutex // serialize snapshot collection and publication
 	tasks          map[string]*managedTask
 	order          []string
 	store          store.TaskStore
@@ -613,11 +614,11 @@ func (m *Manager) finishTask(mt *managedTask, st Status, exitCode *int, errMsg s
 	}
 	mt.record.OutputSummary = summary
 	snap := mt.record
-	close(mt.done)
 	mt.mu.Unlock()
 
 	_ = m.persist()
 	m.notify(snap)
+	close(mt.done)
 }
 
 func (mt *managedTask) getCancelReason(fallback string) string {
@@ -719,18 +720,20 @@ func (m *Manager) PollWait(ctx context.Context, taskID string, stdoutOffset, std
 // WaitUntilTerminal 等待指定任务进入终态，或到达 waitDur / ctx 取消时返回当前完整快照。
 // 主要供 terminal.start 的短等待直出模式使用。
 func (m *Manager) WaitUntilTerminal(ctx context.Context, taskID string, waitDur time.Duration) (*PollResult, error) {
-	if waitDur <= 0 {
-		return m.Poll(taskID, 0, 0)
-	}
+	res, _, err := m.waitForCompletion(ctx, taskID, waitDur)
+	return res, err
+}
+
+func (m *Manager) waitForCompletion(ctx context.Context, taskID string, waitDur time.Duration) (*PollResult, bool, error) {
 	m.mu.RLock()
 	mt, ok := m.tasks[taskID]
 	m.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("任务 %q 不存在", taskID)
+		return nil, false, fmt.Errorf("任务 %q 不存在", taskID)
 	}
 
 	// 恢复自持久化的历史任务均已进入终态，没有完成通知。
-	if mt.done != nil {
+	if mt.done != nil && waitDur > 0 {
 		timer := time.NewTimer(waitDur)
 		defer timer.Stop()
 		select {
@@ -739,7 +742,14 @@ func (m *Manager) WaitUntilTerminal(ctx context.Context, taskID string, waitDur 
 		case <-ctx.Done():
 		}
 	}
-	return m.Poll(taskID, 0, 0)
+	completed := mt.done == nil
+	select {
+	case <-mt.done:
+		completed = true
+	default:
+	}
+	res, err := m.Poll(taskID, 0, 0)
+	return res, completed, err
 }
 
 // Cancel 取消指定任务（若正在运行则强杀整个进程树）。
@@ -843,6 +853,8 @@ func (m *Manager) persist() error {
 	if m.store == nil {
 		return nil
 	}
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
 	records := m.List()
 	// 保持按正序持久化，避免重加载后顺序反转
 	for i, j := 0, len(records)-1; i < j; i, j = i+1, j-1 {
@@ -859,18 +871,9 @@ func newTaskID() string {
 
 // WaitForTerminal 辅助方法：等待任务到达终态或超时（主要用于测试与 CLI）。
 func (m *Manager) WaitForTerminal(taskID string, maxWait time.Duration) (*PollResult, error) {
-	deadline := time.Now().Add(maxWait)
-	for {
-		res, err := m.Poll(taskID, 0, 0)
-		if err != nil {
-			return nil, err
-		}
-		if res.Status.IsTerminal() {
-			return res, nil
-		}
-		if time.Now().After(deadline) {
-			return res, errors.New("等待任务完成超时")
-		}
-		time.Sleep(30 * time.Millisecond)
+	res, completed, err := m.waitForCompletion(context.Background(), taskID, maxWait)
+	if err == nil && !completed {
+		return res, errors.New("等待任务完成超时")
 	}
+	return res, err
 }

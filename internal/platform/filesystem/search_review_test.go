@@ -80,3 +80,16 @@ func TestGitignoreContentsCanBeReincluded(t *testing.T) {
 		t.Fatalf("gitignore negation should keep the selected child: %+v, %v", results, err)
 	}
 }
+
+func TestGitignoreNegatedCharacterClass(t *testing.T) {
+	_, root := setupTestFS(t)
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("file[!0].txt\nliteral\\[!0].txt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rules := newGitignoreTree(root)
+	for name, want := range map[string]bool{"file0.txt": false, "file1.txt": true, "literal[!0].txt": true, "literal[^0].txt": false} {
+		if got := rules.IsIgnored(filepath.Join(root, name), false); got != want {
+			t.Errorf("%s ignored=%t, want %t", name, got, want)
+		}
+	}
+}

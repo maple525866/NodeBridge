@@ -1,9 +1,9 @@
 package filesystem
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -14,6 +14,7 @@ import (
 
 // WriteRequest 表示整文件新建或覆写请求。
 type WriteRequest struct {
+	ApprovedPath   string `json:"-"`
 	WorkspaceID    string `json:"workspace_id"`
 	Path           string `json:"path"`
 	Content        string `json:"content"`
@@ -48,10 +49,12 @@ type WriteResult struct {
 
 // MoveRequest 表示重命名或移动文件/目录的请求。
 type MoveRequest struct {
-	WorkspaceID     string `json:"workspace_id"`
-	SourcePath      string `json:"source_path"`
-	DestinationPath string `json:"destination_path"`
-	Overwrite       bool   `json:"overwrite,omitempty"`
+	ApprovedSource      string `json:"-"`
+	ApprovedDestination string `json:"-"`
+	WorkspaceID         string `json:"workspace_id"`
+	SourcePath          string `json:"source_path"`
+	DestinationPath     string `json:"destination_path"`
+	Overwrite           bool   `json:"overwrite,omitempty"`
 }
 
 // MovePreview 表示移动操作预检结果。
@@ -76,9 +79,10 @@ type MoveResult struct {
 
 // DeleteRequest 表示删除文件或目录的请求。
 type DeleteRequest struct {
-	WorkspaceID string `json:"workspace_id"`
-	Path        string `json:"path"`
-	Recursive   bool   `json:"recursive,omitempty"`
+	ApprovedPath string `json:"-"`
+	WorkspaceID  string `json:"workspace_id"`
+	Path         string `json:"path"`
+	Recursive    bool   `json:"recursive,omitempty"`
 }
 
 // DeletePreview 表示删除操作预检结果，供工具层区分 L1（单文件/空目录）与 L2（递归删非空目录）。
@@ -122,6 +126,9 @@ func (m *Manager) WriteFile(req WriteRequest) (*WriteResult, error) {
 	unlock := m.LockPath(resolved.AbsPath)
 	defer unlock()
 
+	if err := checkApprovedPath(req.ApprovedPath, resolved.AbsPath); err != nil {
+		return nil, err
+	}
 	preview, err := m.computeWriteLocked(resolved, req)
 	if err != nil {
 		return nil, err
@@ -172,7 +179,7 @@ func (m *Manager) computeWriteLocked(resolved *ResolvedPath, req WriteRequest) (
 	if len(req.Content) > defaultReadMaxBytes {
 		return nil, fmt.Errorf("写入内容体积过大 (%d bytes)，超过单次文本写入上限 %d bytes", len(req.Content), defaultReadMaxBytes)
 	}
-	if isBinaryContent([]byte(req.Content)) {
+	if strings.IndexByte(req.Content, 0) >= 0 {
 		return nil, fmt.Errorf("%w: workspace.write 仅支持文本内容，禁止写入二进制 NUL 字节", ErrAccessDenied)
 	}
 
@@ -192,7 +199,7 @@ func (m *Manager) computeWriteLocked(resolved *ResolvedPath, req WriteRequest) (
 		if err != nil {
 			return nil, err
 		}
-		if isBinaryContent(raw) {
+		if bytes.IndexByte(raw, 0) >= 0 {
 			return nil, fmt.Errorf("目标文件 %q 为二进制文件，禁止使用文本写入覆盖", resolved.RelPath)
 		}
 		oldSHA = sha256Hex(raw)
@@ -239,6 +246,12 @@ func (m *Manager) PreviewMove(req MoveRequest) (*MovePreview, error) {
 	if err != nil {
 		return nil, fmt.Errorf("目标路径校验失败: %w", err)
 	}
+	if err := checkApprovedPath(req.ApprovedSource, src.AbsPath); err != nil {
+		return nil, err
+	}
+	if err := checkApprovedPath(req.ApprovedDestination, dst.AbsPath); err != nil {
+		return nil, err
+	}
 
 	if sameFSPath(src.AbsPath, dst.AbsPath) {
 		return nil, fmt.Errorf("%w: 源路径与目标路径相同", ErrConflict)
@@ -259,7 +272,7 @@ func (m *Manager) PreviewMove(req MoveRequest) (*MovePreview, error) {
 		return nil, fmt.Errorf("%w: 不能将目录 %q 移动到其自身子目录 %q 中", ErrConflict, src.RelPath, dst.RelPath)
 	}
 	if isDir {
-		if err := m.ensureTreeHasNoSecrets(src.Workspace, src.AbsPath); err != nil {
+		if _, err := m.checkTreePaths(src.Workspace, src.AbsPath, dst.AbsPath); err != nil {
 			return nil, err
 		}
 	}
@@ -310,24 +323,10 @@ func (m *Manager) Move(req MoveRequest) (*MoveResult, error) {
 	src, dst := preview.Source.AbsPath, preview.Destination.AbsPath
 	if err := publishEntry(src, dst, preview.DestExists && req.Overwrite); err != nil {
 		// Windows returns ERROR_NOT_SAME_DEVICE (17) directly from MoveFileEx.
-		if !errors.Is(err, syscall.EXDEV) && !(runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(17))) {
-			return nil, fmt.Errorf("移动失败: %w", err)
+		if errors.Is(err, syscall.EXDEV) || (runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(17))) {
+			return nil, fmt.Errorf("workspace.move 仅支持同一文件系统内的重命名或移动: %w", err)
 		}
-		stage, err := os.MkdirTemp(filepath.Dir(dst), ".nodebridge-move-*")
-		if err != nil {
-			return nil, err
-		}
-		defer os.RemoveAll(stage)
-		copyDst := filepath.Join(stage, "entry")
-		if err := copyPathForMove(src, copyDst); err != nil {
-			return nil, fmt.Errorf("跨文件系统复制失败: %w", err)
-		}
-		if err := publishEntry(copyDst, dst, preview.DestExists && req.Overwrite); err != nil {
-			return nil, fmt.Errorf("提交移动失败: %w", err)
-		}
-		if rmErr := os.RemoveAll(preview.Source.AbsPath); rmErr != nil {
-			return nil, fmt.Errorf("已复制到目标，但清理源路径失败: %w", rmErr)
-		}
+		return nil, fmt.Errorf("移动失败: %w", err)
 	}
 
 	return &MoveResult{
@@ -347,6 +346,9 @@ func (m *Manager) PreviewDelete(req DeleteRequest) (*DeletePreview, error) {
 	}
 	resolved, err := m.resolveEntryNoFollow(req.WorkspaceID, req.Path, true)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkApprovedPath(req.ApprovedPath, resolved.AbsPath); err != nil {
 		return nil, err
 	}
 	if m.containsWorkspaceRoot(resolved) {
@@ -378,7 +380,7 @@ func (m *Manager) PreviewDelete(req DeleteRequest) (*DeletePreview, error) {
 					ErrConflict, resolved.RelPath, len(entries))
 			}
 			// 递归删除前必须确认目录树内不含任何受硬保护的敏感密钥目录或文件
-			count, secErr := m.countAndCheckTreeSecrets(resolved.Workspace, resolved.AbsPath)
+			count, secErr := m.checkTreePaths(resolved.Workspace, resolved.AbsPath, "")
 			if secErr != nil {
 				return nil, secErr
 			}
@@ -516,14 +518,21 @@ func (m *Manager) resolveEntryNoFollow(workspaceID, targetPath string, forWrite 
 	}, nil
 }
 
-func (m *Manager) ensureTreeHasNoSecrets(ws *Workspace, dirAbs string) error {
-	_, err := m.countAndCheckTreeSecrets(ws, dirAbs)
-	return err
-}
-
-func (m *Manager) countAndCheckTreeSecrets(ws *Workspace, dirAbs string) (int, error) {
+func (m *Manager) checkTreePaths(ws *Workspace, dirAbs, destination string) (int, error) {
 	count := 0
-	inWorkspace := isWithinRoot(ws.RealRoot, dirAbs)
+	checkPath := func(p string) error {
+		if err := m.checkHardSecretPath(filepath.ToSlash(p)); err != nil {
+			return err
+		}
+		if isWithinRoot(ws.RealRoot, p) {
+			rel, err := filepath.Rel(ws.RealRoot, p)
+			if err != nil {
+				return err
+			}
+			p = rel
+		}
+		return m.checkSensitivePath(ws, filepath.ToSlash(p))
+	}
 	err := filepath.WalkDir(dirAbs, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -532,17 +541,15 @@ func (m *Manager) countAndCheckTreeSecrets(ws *Workspace, dirAbs string) (int, e
 		if p == dirAbs {
 			return nil
 		}
-		if err := m.checkHardSecretPath(filepath.ToSlash(p)); err != nil {
+		if err := checkPath(p); err != nil {
 			return err
 		}
-		checkPOSIX := filepath.ToSlash(p)
-		if inWorkspace {
-			if rel, relErr := filepath.Rel(ws.RealRoot, p); relErr == nil {
-				checkPOSIX = filepath.ToSlash(rel)
+		if destination != "" {
+			rel, err := filepath.Rel(dirAbs, p)
+			if err != nil {
+				return err
 			}
-		}
-		if err := m.checkSensitivePath(ws, checkPOSIX); err != nil {
-			return err
+			return checkPath(filepath.Join(destination, rel))
 		}
 		return nil
 	})
@@ -584,6 +591,13 @@ func sameFSPath(a, b string) bool {
 	return ca == cb
 }
 
+func checkApprovedPath(approved, current string) error {
+	if approved != "" && !sameFSPath(approved, current) {
+		return fmt.Errorf("%w: 目标路径在审批后发生变化，请重新预览", ErrConflict)
+	}
+	return nil
+}
+
 func isRootOrDrivePath(absPath string) bool {
 	clean := filepath.Clean(absPath)
 	return filepath.Dir(clean) == clean
@@ -611,50 +625,4 @@ func publishEntry(src, dst string, overwrite bool) error {
 		return fmt.Errorf("%w: 目标已存在", ErrConflict)
 	}
 	return err
-}
-
-func copyPathForMove(src, dst string) error {
-	info, err := os.Lstat(src)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(src)
-		if err != nil {
-			return err
-		}
-		return os.Symlink(target, dst)
-	}
-	if info.IsDir() {
-		if err := os.Mkdir(dst, 0o700); err != nil {
-			return err
-		}
-		entries, err := os.ReadDir(src)
-		if err != nil {
-			return err
-		}
-		for _, e := range entries {
-			if err := copyPathForMove(filepath.Join(src, e.Name()), filepath.Join(dst, e.Name())); err != nil {
-				return err
-			}
-		}
-		return os.Chmod(dst, info.Mode().Perm())
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("不支持跨文件系统移动特殊文件 %q", src)
-	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		return err
-	}
-	return out.Close()
 }

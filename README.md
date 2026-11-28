@@ -247,7 +247,7 @@ oauth:
 | :--- | :--- | :---: | :--- |
 | **环境自发现** | `system.info` | L0 只读 | 返回宿主机 OS/Arch、默认 Shell、已安装开发工具链、当前权限/目录模式与当前客户端可见工作区（隔离模式下隐藏绝对路径） |
 | **文件系统** | `workspace.list` / `workspace.glob` / `workspace.read` / `workspace.search` | L0 只读 | 列目录、按通配符查文件、按行读取（附 `sha256`）与全文搜索（优先本机 `rg`，支持 `.gitignore`、忽略大小写与上下文行）；自动屏蔽敏感密钥目录与二进制 |
-| **文件系统** | `workspace.patch` / `workspace.write` / `workspace.move` | L1 写入 | Search/Replace 局部补丁、整文件新建/覆写（均含 SHA256 乐观锁与 Diff 预览）及重命名/移动；默认审批（支持限时批授），全权限模式免审批 |
+| **文件系统** | `workspace.patch` / `workspace.write` / `workspace.move` | L1 写入 | Search/Replace 局部补丁、整文件新建/覆写（均含 SHA256 乐观锁与 Diff 预览），以及同一文件系统内的重命名和移动。默认审批（支持限时批授），全权限模式免审批 |
 | **文件系统** | `workspace.delete` | L1 / L2 | 删除单文件或空目录为 L1（支持批授）；`recursive=true` 删除非空目录自动升级为 L2 强制每次审批；始终禁止删根目录与敏感路径 |
 | **Git** | `git.status` / `git.diff` / `git.log` / `git.show` | L0 只读 | 受控 Git 只读状态、工作区/暂存区/任意 ref 范围对比、提交历史与单次提交详情（自动排除敏感路径并脱敏） |
 | **Git** | `git.apply_patch` | L1 写入 | 补丁路径安全预检 + `git apply --check` + 审批后应用（支持可选 `path` 指定仓库目录） |

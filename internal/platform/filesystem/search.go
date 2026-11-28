@@ -582,12 +582,37 @@ func (t *gitignoreTree) loadDir(dirAbs string) []gitignoreRule {
 			if line == "" {
 				continue
 			}
-			rule.pattern = line
+			rule.pattern = normalizeIgnoreClasses(line)
 			rules = append(rules, rule)
 		}
 	}
 	t.loaded[dirAbs] = rules
 	return rules
+}
+
+// Git uses [!...] for a negated class; path.Match uses [^...].
+func normalizeIgnoreClasses(pattern string) string {
+	if !strings.Contains(pattern, "[!") {
+		return pattern
+	}
+	b := []byte(pattern)
+	inClass := false
+	for i := 0; i < len(b); i++ {
+		switch b[i] {
+		case '\\':
+			i++
+		case '[':
+			if !inClass {
+				inClass = true
+				if i+1 < len(b) && b[i+1] == '!' {
+					b[i+1] = '^'
+				}
+			}
+		case ']':
+			inClass = false
+		}
+	}
+	return string(b)
 }
 
 func (t *gitignoreTree) IsIgnored(absPath string, isDir bool) bool {

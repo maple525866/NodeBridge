@@ -57,6 +57,41 @@ func TestWriteBoundsBothVersions(t *testing.T) {
 	}
 }
 
+func TestWriteRejectsNULAfterTextHeader(t *testing.T) {
+	m, root := setupTestFS(t)
+	binary := strings.Repeat("a", 8192) + "\x00"
+	req := WriteRequest{WorkspaceID: "demo", Path: "sample.dat", Content: binary, Overwrite: true}
+	if _, err := m.WriteFile(req); err == nil {
+		t.Fatal("created a file containing NUL")
+	}
+	if err := os.WriteFile(filepath.Join(root, req.Path), []byte(binary), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	req.Content = "replacement"
+	if _, err := m.WriteFile(req); err == nil {
+		t.Fatal("overwrote a file containing NUL")
+	}
+}
+
+func TestMutationRequiresApprovedPaths(t *testing.T) {
+	m, root := setupTestFS(t)
+	approved := filepath.Join(root, "previous")
+	if _, err := m.WriteFile(WriteRequest{WorkspaceID: "demo", Path: "new.go", ApprovedPath: approved}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("write expected path conflict, got %v", err)
+	}
+	if _, err := m.Delete(DeleteRequest{WorkspaceID: "demo", Path: "hello.go", ApprovedPath: approved}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("delete expected path conflict, got %v", err)
+	}
+	for _, req := range []MoveRequest{
+		{WorkspaceID: "demo", SourcePath: "hello.go", DestinationPath: "new.go", ApprovedSource: approved},
+		{WorkspaceID: "demo", SourcePath: "hello.go", DestinationPath: "new.go", ApprovedDestination: approved},
+	} {
+		if _, err := m.Move(req); !errors.Is(err, ErrConflict) {
+			t.Fatalf("move expected path conflict, got %v", err)
+		}
+	}
+}
+
 func TestMoveFailurePreservesDestination(t *testing.T) {
 	m, dir := setupTestFS(t)
 	if err := os.Mkdir(filepath.Join(dir, "source"), 0o755); err != nil {
