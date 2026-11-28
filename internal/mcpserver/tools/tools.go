@@ -262,21 +262,22 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 			Reason:        ev.Reason,
 		}, func() (any, error) {
 			return d.FS.ApplyPatch(patchReq)
-		}, makeProgressNotifier(ctx, callReq, "正在等待用户在本地 NodeBridge 控制台审批文件补丁..."))
+		}, makeProgressNotifier(ctx, callReq, "正在等待文件补丁处理结果..."))
 
 		if err != nil {
 			recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": preview.Resolved.RelPath}, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, err)
 			return nil, nil, err
 		}
 		if outcome.Pending {
-			recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": preview.Resolved.RelPath, "approval_id": outcome.ApprovalID}, "APPROVAL_PENDING", "", start, nil)
+			status, message := pendingResponse(outcome)
+			recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": preview.Resolved.RelPath, "approval_id": outcome.ApprovalID}, status, outcome.Decision.Approver, start, nil)
 			return nil, &filesystem.PatchResult{
 				Source:      "local_workspace_file",
 				WorkspaceID: in.WorkspaceID,
 				Path:        preview.Resolved.RelPath,
 				Pending:     true,
 				ApprovalID:  outcome.ApprovalID,
-				Message:     fmt.Sprintf("审批单 %s 正在等待用户在本地 NodeBridge 控制台确认。请提示用户批准后，调用 approval.status 查询最终执行结果。", outcome.ApprovalID),
+				Message:     message,
 			}, nil
 		}
 
@@ -373,21 +374,22 @@ func registerGitTools(srv *mcp.Server, d Deps) {
 			Reason:        ev.Reason,
 		}, func() (any, error) {
 			return d.Git.ApplyPatchAt(context.Background(), in.WorkspaceID, in.Path, in.Patch)
-		}, makeProgressNotifier(ctx, callReq, "正在等待用户在本地 NodeBridge 控制台审批 Git 补丁..."))
+		}, makeProgressNotifier(ctx, callReq, "正在等待 Git 补丁处理结果..."))
 
 		if err != nil {
 			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"files": affected}, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, err)
 			return nil, nil, err
 		}
 		if outcome.Pending {
-			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"files": affected, "approval_id": outcome.ApprovalID}, "APPROVAL_PENDING", "", start, nil)
+			status, message := pendingResponse(outcome)
+			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"files": affected, "approval_id": outcome.ApprovalID}, status, outcome.Decision.Approver, start, nil)
 			return nil, &git.ApplyPatchResult{
 				Source:        "git_output",
 				WorkspaceID:   in.WorkspaceID,
 				AffectedFiles: affected,
 				Pending:       true,
 				ApprovalID:    outcome.ApprovalID,
-				Message:       fmt.Sprintf("审批单 %s 正在等待用户在本地控制台确认。请提示用户批准后，调用 approval.status 查询结果。", outcome.ApprovalID),
+				Message:       message,
 			}, nil
 		}
 
@@ -466,23 +468,24 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 				CommandPreview: cmdPreview,
 				Summary:        fmt.Sprintf("在工作区 %s 执行命令: %s", in.WorkspaceID, in.Executable),
 				Reason:         ev.Reason,
-			}, startTaskFn, makeProgressNotifier(ctx, callReq, "正在等待用户在本地 NodeBridge 控制台审批命令执行..."))
+			}, startTaskFn, makeProgressNotifier(ctx, callReq, "正在等待命令启动结果..."))
 
 			if err != nil {
 				recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), in, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, err)
 				return nil, nil, err
 			}
 			if outcome.Pending {
-				recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"executable": in.Executable, "approval_id": outcome.ApprovalID}, "APPROVAL_PENDING", "", start, nil)
+				status, message := pendingResponse(outcome)
+				recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"executable": in.Executable, "approval_id": outcome.ApprovalID}, status, outcome.Decision.Approver, start, nil)
 				return nil, &TerminalStartOutput{
 					Source:      "terminal_task",
 					WorkspaceID: in.WorkspaceID,
-					Status:      "APPROVAL_PENDING",
+					Status:      status,
 					RiskLevel:   string(ev.RiskLevel),
 					Cwd:         resolvedCwd.RelPath,
 					Pending:     true,
 					ApprovalID:  outcome.ApprovalID,
-					Message:     fmt.Sprintf("命令审批单 %s 正在等待用户在本地控制台确认。请提示用户批准后，调用 approval.status 获取 task_id。", outcome.ApprovalID),
+					Message:     message,
 				}, nil
 			}
 			out, _ := outcome.Result.(*TerminalStartOutput)
@@ -645,7 +648,14 @@ func authorizePrincipal(
 	return nil
 }
 
-// makeProgressNotifier 构造等待审批期间向 MCP 客户端推送保活进度的回调，降低云端代理断连概率。
+func pendingResponse(outcome approval.ExecutionOutcome) (status, message string) {
+	if outcome.Decision.Approved {
+		return "EXECUTION_PENDING", fmt.Sprintf("审批单 %s 已获批准，操作正在后台执行。请调用 approval.status 查询执行结果。", outcome.ApprovalID)
+	}
+	return "APPROVAL_PENDING", fmt.Sprintf("审批单 %s 正在等待用户在本地控制台确认。批准后请调用 approval.status 查询执行结果。", outcome.ApprovalID)
+}
+
+// makeProgressNotifier 在同步等待期间向 MCP 客户端推送进度。
 func makeProgressNotifier(ctx context.Context, callReq *mcp.CallToolRequest, msg string) func(elapsed time.Duration) {
 	if callReq == nil || callReq.Session == nil || callReq.Params == nil {
 		return nil

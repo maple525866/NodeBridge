@@ -2,6 +2,9 @@ package approval
 
 import (
 	"context"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -171,6 +174,130 @@ func TestRemoteHybridApprovalAsyncContinuationAndIdempotency(t *testing.T) {
 	}, nil)
 	if err != nil || !outReplay.ReusedIdempotent || execCalls != 1 {
 		t.Fatalf("期望幂等命中缓存且不再重复执行: err=%v out=%+v execCalls=%d", err, outReplay, execCalls)
+	}
+}
+
+func TestApprovedRemoteExecutionRespectsWaitWindow(t *testing.T) {
+	for _, tag := range []string{"APPROVED_ONCE", "AUTO_ALLOW_FULL_PERMISSIONS", "APPROVED_BY_GRANT"} {
+		t.Run(tag, func(t *testing.T) {
+			broker := NewBroker(0, 30, nil)
+			broker.remoteWait = 250 * time.Millisecond
+			req := Request{
+				IsRemote: true, ClientID: "client", Tool: "workspace.patch", WorkspaceID: "demo",
+				RiskLevel: policy.RiskL1, AllowBatchTTL: true, Fingerprint: "same-patch",
+			}
+			switch tag {
+			case "AUTO_ALLOW_FULL_PERMISSIONS":
+				broker.SetFullPermissions(true)
+			case "APPROVED_BY_GRANT":
+				broker.grants[req.WorkspaceID] = WorkspaceGrant{GrantedBy: "tester", ExpiresAt: time.Now().Add(time.Minute)}
+			}
+
+			events, unsubscribe := broker.Subscribe()
+			defer unsubscribe()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			release := make(chan struct{})
+			finish := sync.OnceFunc(func() { close(release) })
+			defer finish()
+			var calls atomic.Int32
+			exec := func() (any, error) {
+				calls.Add(1)
+				<-release
+				return "patched", nil
+			}
+			type response struct {
+				out ExecutionOutcome
+				err error
+			}
+			firstCtx := ctx
+			if tag == "APPROVED_ONCE" {
+				broker.remoteWait = 2 * time.Second
+				var cancelFirst context.CancelFunc
+				firstCtx, cancelFirst = context.WithTimeout(ctx, 3*time.Second)
+				defer cancelFirst()
+			}
+			first := make(chan response, 1)
+			go func() {
+				out, err := broker.ExecuteWithApproval(firstCtx, req, exec, nil)
+				first <- response{out, err}
+			}()
+			if tag == "APPROVED_ONCE" {
+				select {
+				case event := <-events:
+					// 留出半秒执行窗口。如果批准时重启计时，调用会先遇到三秒的 context 截止时间。
+					time.Sleep(1500 * time.Millisecond)
+					id := event.Payload.(Request).ID
+					if _, err := broker.Resolve(id, true, 0, "tester", ""); err != nil {
+						t.Fatal(err)
+					}
+				case <-ctx.Done():
+					t.Fatal("未收到审批创建事件")
+				}
+			}
+
+			var id string
+			select {
+			case resp := <-first:
+				out := resp.out
+				if resp.err != nil || !out.Pending || out.ApprovalID == "" || !out.Decision.Approved || out.Decision.DecisionTag != tag {
+					t.Fatalf("远程窗口结束后应返回已批准、执行中的审批单: out=%+v err=%v", out, resp.err)
+				}
+				id = out.ApprovalID
+			case <-ctx.Done():
+				t.Fatal("执行仍未结束时，远程调用超过短等待窗口")
+			}
+			out, err := broker.ExecuteWithApproval(ctx, req, exec, nil)
+			if err != nil || !out.Pending || !out.ReusedIdempotent || !out.Decision.Approved || out.ApprovalID != id {
+				t.Fatalf("执行中重试应短等后复用同一审批单: out=%+v err=%v", out, err)
+			}
+			if record, ok := broker.GetRecord(id); !ok || record.ExecStatus != "RUNNING" {
+				t.Fatalf("等待超时后应可查询执行中状态: %+v", record)
+			}
+
+			finish()
+			out, err = broker.ExecuteWithApproval(ctx, req, exec, nil)
+			if err != nil || out.Pending || !out.ReusedIdempotent || out.ApprovalID != id || out.Result != "patched" || calls.Load() != 1 {
+				t.Fatalf("批准操作应仅执行一次且可恢复最终结果: out=%+v calls=%d err=%v", out, calls.Load(), err)
+			}
+			if record, ok := broker.GetRecord(id); !ok || record.ExecStatus != "SUCCEEDED" || record.ExecResult != "patched" {
+				t.Fatalf("等待结束后应可查询最终结果: %+v", record)
+			}
+		})
+	}
+}
+
+func TestRunningRemoteExecutionSurvivesCleanup(t *testing.T) {
+	broker := NewBroker(0, 30, nil)
+	old := time.Now().Add(-2 * time.Hour)
+	req := Request{ID: "running", IsRemote: true, Status: StatusApproved, ExecStatus: "RUNNING", ResolvedAt: old, Fingerprint: "same-operation"}
+	item := &pendingItem{
+		req: req, decision: Decision{Approved: true, ApprovalID: req.ID},
+		decisionDone: make(chan struct{}), execDone: make(chan struct{}),
+		execFn: func() (any, error) { return "done", nil },
+	}
+	item.closeDecision()
+	broker.records[req.ID] = item
+	broker.fingerprints[req.Fingerprint] = idempotencyEntry{approvalID: req.ID, expiresAt: old}
+	// 超过整理阈值，同时保留足够的近期记录，在操作完成后仍能触发清理。
+	for i := 0; i < 500; i++ {
+		broker.records[strconv.Itoa(i)] = &pendingItem{req: Request{Status: StatusApproved, ResolvedAt: time.Now()}}
+	}
+	if _, ok := broker.GetRecord(req.ID); !ok {
+		t.Fatal("仍在执行的审批单被按批准时间清理")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	retry, err := broker.ExecuteWithApproval(ctx, Request{IsRemote: true, Fingerprint: req.Fingerprint}, nil, nil)
+	if err != context.Canceled || !retry.Pending || !retry.ReusedIdempotent || retry.ApprovalID != req.ID {
+		t.Fatalf("运行中的请求超过指纹缓存期限后仍应复用: %+v err=%v", retry, err)
+	}
+	broker.runExecOnce(item)
+	if rec, ok := broker.GetRecord(req.ID); !ok || rec.ExecResult != "done" {
+		t.Fatalf("长任务刚完成，其结果应可查询: %+v", rec)
+	}
+	if _, exists := broker.fingerprints[req.Fingerprint]; exists {
+		t.Fatal("已过期的指纹在执行完成后应可清理")
 	}
 }
 

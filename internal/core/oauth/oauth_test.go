@@ -25,12 +25,11 @@ func TestOAuth21FullLifecycleAndReplayProtection(t *testing.T) {
 
 	srv, err := NewServer(Options{
 		Config: config.OAuthConfig{
-			Enabled:                  true,
-			AccessTokenTTLSeconds:    3600,
-			RefreshTokenTTLSeconds:   86400,
-			PairingCodeTTLSeconds:    300,
-			AllowDynamicRegistration: true,
-			RateLimitPerMinute:       100,
+			Enabled:                true,
+			AccessTokenTTLSeconds:  3600,
+			RefreshTokenTTLSeconds: 86400,
+			PairingCodeTTLSeconds:  300,
+			RateLimitPerMinute:     100,
 		},
 		DataDir:           dataDir,
 		DeviceID:          "dev_test_01",
@@ -160,12 +159,11 @@ func TestOAuth21FullLifecycleAndReplayProtection(t *testing.T) {
 		t.Fatalf("回调参数异常: %s", pollOut.RedirectURL)
 	}
 
-	// 5. 换取 Access Token + Refresh Token
+	// 5. OAuth 2.1 客户端凭 PKCE 换码，无需再次发送 redirect_uri。
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("client_id", regOut.ClientID)
 	form.Set("code", code)
-	form.Set("redirect_uri", "https://chatgpt.com/connector/oauth/callback")
 	form.Set("code_verifier", verifier)
 	tokResp, err := http.PostForm(ts.URL+"/oauth/token", form)
 	if err != nil || tokResp.StatusCode != http.StatusOK {
@@ -247,10 +245,9 @@ func TestOAuth21FullLifecycleAndReplayProtection(t *testing.T) {
 func TestPairingCodeOneTimeUseAndRateLimit(t *testing.T) {
 	srv, err := NewServer(Options{
 		Config: config.OAuthConfig{
-			Enabled:                  true,
-			PairingCodeTTLSeconds:    300,
-			AllowDynamicRegistration: true,
-			RateLimitPerMinute:       50,
+			Enabled:               true,
+			PairingCodeTTLSeconds: 300,
+			RateLimitPerMinute:    50,
 		},
 		DataDir:  t.TempDir(),
 		DeviceID: "dev_pair",
@@ -313,9 +310,8 @@ func TestPairingCodeOneTimeUseAndRateLimit(t *testing.T) {
 func TestOAuthSecurityHardening(t *testing.T) {
 	srv, err := NewServer(Options{
 		Config: config.OAuthConfig{
-			Enabled:                  true,
-			AllowDynamicRegistration: true,
-			RateLimitPerMinute:       100,
+			Enabled:            true,
+			RateLimitPerMinute: 100,
 		},
 		DataDir:  t.TempDir(),
 		DeviceID: "dev_sec",
@@ -354,7 +350,7 @@ func TestOAuthSecurityHardening(t *testing.T) {
 		t.Fatalf("Origin: null 应返回 403，实际 %d", respNull.StatusCode)
 	}
 
-	// 3. authorization_code 缺失 client_id 必须返回 400 invalid_request
+	// 3. 每次授权码兑换独立校验客户端身份与传入的回调地址。
 	regResp, _ := http.Post(ts.URL+"/oauth/register", "application/json", strings.NewReader(`{"client_name":"StrictClient","redirect_uris":["https://app.example/cb"]}`))
 	var regOut struct {
 		ClientID string `json:"client_id"`
@@ -363,26 +359,61 @@ func TestOAuthSecurityHardening(t *testing.T) {
 	regResp.Body.Close()
 
 	verifier := "strict_client_verifier_0123456789_abcdefghijklmnop"
-	authResp, _ := http.Get(ts.URL + "/oauth/authorize?response_type=code&client_id=" + regOut.ClientID +
-		"&redirect_uri=" + url.QueryEscape("https://app.example/cb") +
-		"&code_challenge=" + makePKCE(verifier) + "&code_challenge_method=S256")
-	authResp.Body.Close()
-	pending := srv.PendingAuthRequests()
-	resolved, err := srv.ResolveAuthRequest(pending[0].ID, true, false, nil, "ok")
-	if err != nil {
-		t.Fatal(err)
-	}
-	u, _ := url.Parse(resolved.RedirectResult)
-	code := u.Query().Get("code")
-
-	tokResp, _ := http.PostForm(ts.URL+"/oauth/token", url.Values{
-		"grant_type":    {"authorization_code"},
-		"code":          {code},
-		"redirect_uri":  {"https://app.example/cb"},
-		"code_verifier": {verifier},
-	})
-	tokResp.Body.Close()
-	if tokResp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("缺失 client_id 应返回 400，实际 %d", tokResp.StatusCode)
+	const callback = "https://app.example/cb"
+	for _, tc := range []struct {
+		name, clientID, redirectURI, wantError string
+	}{
+		{"missing client ID", "", callback, "invalid_request"},
+		{"matching redirect URI", regOut.ClientID, callback, ""},
+		{"different redirect URI", regOut.ClientID, callback + "/other", "invalid_grant"},
+		{"padded redirect URI", regOut.ClientID, callback + " ", "invalid_grant"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			authResp, err := http.Get(ts.URL + "/oauth/authorize?response_type=code&client_id=" + regOut.ClientID +
+				"&redirect_uri=" + url.QueryEscape(callback) +
+				"&code_challenge=" + makePKCE(verifier) + "&code_challenge_method=S256")
+			if err != nil {
+				t.Fatal(err)
+			}
+			authResp.Body.Close()
+			pending := srv.PendingAuthRequests()
+			if len(pending) != 1 {
+				t.Fatalf("期望一条待确认授权，实际 %d", len(pending))
+			}
+			resolved, err := srv.ResolveAuthRequest(pending[0].ID, true, false, nil, "ok")
+			if err != nil {
+				t.Fatal(err)
+			}
+			u, err := url.Parse(resolved.RedirectResult)
+			if err != nil {
+				t.Fatal(err)
+			}
+			form := url.Values{
+				"grant_type": {"authorization_code"}, "code": {u.Query().Get("code")},
+				"redirect_uri": {tc.redirectURI}, "code_verifier": {verifier},
+			}
+			if tc.clientID != "" {
+				form.Set("client_id", tc.clientID)
+			}
+			resp, err := http.PostForm(ts.URL+"/oauth/token", form)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			var result struct {
+				Error       string `json:"error"`
+				AccessToken string `json:"access_token"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantError == "" {
+				if resp.StatusCode != http.StatusOK || result.AccessToken == "" {
+					t.Fatalf("期望成功换码，实际 %d %s", resp.StatusCode, result.Error)
+				}
+			} else if resp.StatusCode != http.StatusBadRequest || result.Error != tc.wantError {
+				t.Fatalf("期望 400 %s，实际 %d %s", tc.wantError, resp.StatusCode, result.Error)
+			}
+		})
 	}
 }

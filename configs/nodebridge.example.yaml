@@ -28,7 +28,7 @@ approval:
   timeout_seconds: 0
   # L1 限时批量授权允许的最大时长（分钟）
   max_grant_minutes: 60
-  # 远程云端客户端同步等待审批短窗口（秒），超时后不销毁审批单并转为异步续接
+  # 远程调用同步等待审批和执行的总时长（秒），到期后可用 approval.status 查询
   remote_wait_seconds: 45
   # 远程异步续接审批单在本地控制台保留的最长秒数
   pending_ttl_seconds: 900
@@ -168,7 +168,7 @@ oauth:
   refresh_token_ttl_seconds: 604800
   # 一次性配对码有效期（秒，默认 5 分钟）
   pairing_code_ttl_seconds: 300
-  # 允许符合 RFC 7591 的动态客户端注册（DCR）
+  # 允许符合 RFC 7591 的动态客户端注册（DCR）。设为 false 可关闭新客户端注册。
   allow_dynamic_registration: true
   # 公网 OAuth 接口按来源 IP 每分钟请求速率上限
   rate_limit_per_minute: 20

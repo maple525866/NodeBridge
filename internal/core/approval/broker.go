@@ -105,6 +105,7 @@ type pendingItem struct {
 	execOnce          sync.Once
 	execDone          chan struct{}
 	execCloseOnce     sync.Once
+	execFinishedAt    time.Time
 }
 
 func (p *pendingItem) closeDecision() {
@@ -388,38 +389,9 @@ func (b *Broker) ExecuteWithApproval(
 
 	// 2. 指纹幂等去重：防云端超时重发造成重复弹窗或重复执行
 	if req.Fingerprint != "" {
-		if entry, ok := b.fingerprints[req.Fingerprint]; ok && now.Before(entry.expiresAt) {
+		if entry, ok := b.fingerprints[req.Fingerprint]; ok {
 			if existing, exists := b.records[entry.approvalID]; exists {
-				switch existing.req.Status {
-				case StatusPending:
-					// 审批单仍在等待中：复用同一审批单继续短等待，不创建新弹窗
-					waitDur := b.remoteWait
-					b.mu.Unlock()
-					return b.waitRemoteItem(ctx, existing, waitDur, true, progressFn)
-				case StatusApproved:
-					// 已批准：若执行结束直接返缓存；若正在执行则等待完成
-					execStatus := existing.req.ExecStatus
-					execRes := existing.req.ExecResult
-					execErrStr := existing.req.ExecError
-					dec := existing.decision
-					dec.DecisionTag = "IDEMPOTENT_REPLAY"
-					if execStatus == "SUCCEEDED" {
-						b.mu.Unlock()
-						return ExecutionOutcome{
-							ReusedIdempotent: true,
-							ApprovalID:       existing.req.ID,
-							Decision:         dec,
-							Result:           execRes,
-						}, nil
-					}
-					if execStatus == "FAILED" {
-						b.mu.Unlock()
-						return ExecutionOutcome{
-							ReusedIdempotent: true,
-							ApprovalID:       existing.req.ID,
-							Decision:         dec,
-						}, errors.New(execErrStr)
-					}
+				if existing.req.Status == StatusPending || existing.req.Status == StatusApproved {
 					waitDur := b.remoteWait
 					b.mu.Unlock()
 					return b.waitRemoteItem(ctx, existing, waitDur, true, progressFn)
@@ -459,17 +431,10 @@ func (b *Broker) ExecuteWithApproval(
 				expiresAt:  now.Add(b.idempotencyTTL),
 			}
 		}
+		waitDur := b.remoteWait
 		b.mu.Unlock()
-
-		b.runExecOnce(item)
-		b.mu.Lock()
-		res := item.req.ExecResult
-		errStr := item.req.ExecError
-		b.mu.Unlock()
-		if errStr != "" {
-			return ExecutionOutcome{ApprovalID: req.ID, Decision: dec}, errors.New(errStr)
-		}
-		return ExecutionOutcome{ApprovalID: req.ID, Decision: dec, Result: res}, nil
+		go b.runExecOnce(item)
+		return b.waitRemoteItem(ctx, item, waitDur, false, progressFn)
 	}
 
 	// 3. 检查 L1 工作区限时批量授权（命中后同样写入幂等缓存防重复写入）
@@ -505,17 +470,10 @@ func (b *Broker) ExecuteWithApproval(
 						expiresAt:  now.Add(b.idempotencyTTL),
 					}
 				}
+				waitDur := b.remoteWait
 				b.mu.Unlock()
-
-				b.runExecOnce(item)
-				b.mu.Lock()
-				res := item.req.ExecResult
-				errStr := item.req.ExecError
-				b.mu.Unlock()
-				if errStr != "" {
-					return ExecutionOutcome{ApprovalID: req.ID, Decision: dec}, errors.New(errStr)
-				}
-				return ExecutionOutcome{ApprovalID: req.ID, Decision: dec, Result: res}, nil
+				go b.runExecOnce(item)
+				return b.waitRemoteItem(ctx, item, waitDur, false, progressFn)
 			}
 			delete(b.grants, req.WorkspaceID)
 		}
@@ -572,105 +530,60 @@ func (b *Broker) waitRemoteItem(
 		tickC = ticker.C
 	}
 
-	// 阶段 A：等待人工审批结论（或短窗口到期）
+	// execDone 在拒绝、取消或执行结束时关闭。审批与后台执行共用本次调用的短窗口。
+	var waitErr error
+wait:
 	for {
 		select {
-		case <-item.decisionDone:
-			b.mu.Lock()
-			dec := item.decision
-			approved := dec.Approved
-			id := item.req.ID
-			b.mu.Unlock()
-			if !approved {
-				return ExecutionOutcome{
-					ReusedIdempotent: reused,
-					ApprovalID:       id,
-					Decision:         dec,
-				}, fmt.Errorf("用户拒绝操作 (%s): %s", id, dec.Note)
-			}
-			// 审批通过：等待后台闭包执行完成（若短窗口已逼近，最多再宽限等待结果）
-			goto waitExec
+		case <-item.execDone:
+			break wait
+		case <-timer.C:
+			break wait
+		case <-ctx.Done():
+			waitErr = ctx.Err()
+			break wait
 		case <-tickC:
 			progressFn(time.Since(start))
-		case <-timer.C:
-			// 短窗口超时：保留审批单继续等待用户在本地控制台点击确认，不销毁！
-			b.mu.Lock()
-			id := item.req.ID
-			b.mu.Unlock()
-			return ExecutionOutcome{
-				Pending:          true,
-				ReusedIdempotent: reused,
-				ApprovalID:       id,
-				Decision: Decision{
-					Approved:    false,
-					ApprovalID:  id,
-					DecisionTag: "APPROVAL_PENDING",
-					Note:        "等待用户在本地 NodeBridge 控制台确认",
-				},
-			}, nil
-		case <-ctx.Done():
-			// 云端 HTTP 连接提前断开：同样不销毁远程审批单，允许用户稍后批准并用 approval.status 续接！
-			b.mu.Lock()
-			id := item.req.ID
-			b.mu.Unlock()
-			return ExecutionOutcome{
-				Pending:          true,
-				ReusedIdempotent: reused,
-				ApprovalID:       id,
-				Decision: Decision{
-					Approved:    false,
-					ApprovalID:  id,
-					DecisionTag: "APPROVAL_PENDING",
-					Note:        "远程连接中断，审批单已保留在本地控制台等待确认",
-				},
-			}, ctx.Err()
 		}
 	}
 
-waitExec:
-	select {
-	case <-item.execDone:
-		b.mu.Lock()
-		res := item.req.ExecResult
-		errStr := item.req.ExecError
-		dec := item.decision
-		id := item.req.ID
-		b.mu.Unlock()
-		if reused {
-			dec.DecisionTag = "IDEMPOTENT_REPLAY"
-		}
-		if errStr != "" {
-			return ExecutionOutcome{
-				ReusedIdempotent: reused,
-				ApprovalID:       id,
-				Decision:         dec,
-			}, errors.New(errStr)
-		}
-		return ExecutionOutcome{
-			ReusedIdempotent: reused,
-			ApprovalID:       id,
-			Decision:         dec,
-			Result:           res,
-		}, nil
-	case <-ctx.Done():
-		b.mu.Lock()
-		id := item.req.ID
-		dec := item.decision
-		b.mu.Unlock()
-		return ExecutionOutcome{
-			Pending:    true,
-			ApprovalID: id,
-			Decision:   dec,
-		}, ctx.Err()
+	// 同时收到超时与状态变更时，以锁内的最新状态为准。
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := ExecutionOutcome{
+		ReusedIdempotent: reused,
+		ApprovalID:       item.req.ID,
+		Decision:         item.decision,
 	}
+	switch item.req.Status {
+	case StatusPending:
+		note := "等待用户在本地 NodeBridge 控制台确认"
+		if waitErr != nil {
+			note = "远程连接中断，审批单已保留在本地控制台等待确认"
+		}
+		out.Decision = Decision{ApprovalID: out.ApprovalID, DecisionTag: "APPROVAL_PENDING", Note: note}
+	case StatusApproved:
+		switch item.req.ExecStatus {
+		case "SUCCEEDED", "FAILED":
+			if reused {
+				out.Decision.DecisionTag = "IDEMPOTENT_REPLAY"
+			}
+			if item.req.ExecStatus == "FAILED" {
+				return out, errors.New(item.req.ExecError)
+			}
+			out.Result = item.req.ExecResult
+			return out, nil
+		}
+	default:
+		return out, fmt.Errorf("用户拒绝操作 (%s): %s", out.ApprovalID, out.Decision.Note)
+	}
+	out.Pending = true
+	return out, waitErr
 }
 
 func (b *Broker) runExecOnce(item *pendingItem) {
 	item.execOnce.Do(func() {
 		defer item.closeExec()
-		if item.execFn == nil {
-			return
-		}
 		b.mu.Lock()
 		// 二次检查急停状态：防止批准/开启全权限后异步启动瞬间用户触发 Pause/KillAll 导致竞态执行
 		if b.pauseState.Paused {
@@ -680,6 +593,7 @@ func (b *Broker) runExecOnce(item *pendingItem) {
 			}
 			item.req.ExecStatus = "FAILED"
 			item.req.ExecError = "系统处于急停暂停状态，取消后台执行：" + reason
+			item.execFinishedAt = time.Now().UTC()
 			snapshot := item.req
 			b.broadcastLocked(Event{Type: "approval_resolved", Payload: snapshot})
 			b.mu.Unlock()
@@ -688,9 +602,14 @@ func (b *Broker) runExecOnce(item *pendingItem) {
 		item.req.ExecStatus = "RUNNING"
 		b.mu.Unlock()
 
-		res, err := item.execFn()
+		var res any
+		var err error
+		if item.execFn != nil {
+			res, err = item.execFn()
+		}
 
 		b.mu.Lock()
+		item.execFinishedAt = time.Now().UTC()
 		if err != nil {
 			item.req.ExecStatus = "FAILED"
 			item.req.ExecError = err.Error()
@@ -941,7 +860,11 @@ func (b *Broker) Subscribe() (<-chan Event, func()) {
 
 func (b *Broker) expireStaleLocked(now time.Time) {
 	for fp, entry := range b.fingerprints {
-		if now.After(entry.expiresAt) {
+		if !now.Before(entry.expiresAt) {
+			item := b.records[entry.approvalID]
+			if item != nil && (item.req.Status == StatusPending || item.req.ExecStatus == "RUNNING") {
+				continue
+			}
 			delete(b.fingerprints, fp)
 		}
 	}
@@ -976,7 +899,10 @@ func (b *Broker) expireStaleLocked(now time.Time) {
 	// 控制内存记录数量，避免长时间运行内存无限增长
 	if len(b.records) > 500 {
 		for id, item := range b.records {
-			if item.req.Status != StatusPending && now.Sub(item.req.ResolvedAt) > time.Hour {
+			if item.req.Status == StatusPending || item.req.ExecStatus == "RUNNING" {
+				continue
+			}
+			if now.Sub(item.req.ResolvedAt) > time.Hour && now.Sub(item.execFinishedAt) > time.Hour {
 				delete(b.records, id)
 			}
 		}

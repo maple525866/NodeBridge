@@ -27,6 +27,9 @@ func TestDefaultConfigSaveAndLoad(t *testing.T) {
 	if loaded.Server.MCPToken != cfg.Server.MCPToken {
 		t.Fatalf("MCPToken 不一致")
 	}
+	if loaded.OAuth.AllowDynamicRegistration == nil || !*loaded.OAuth.AllowDynamicRegistration {
+		t.Fatal("新生成的配置应显式开启动态客户端注册")
+	}
 	if len(loaded.Workspaces) != 1 || loaded.Workspaces[0].ID != "default" {
 		t.Fatalf("工作区加载异常: %+v", loaded.Workspaces)
 	}
