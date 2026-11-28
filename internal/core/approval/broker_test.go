@@ -267,6 +267,84 @@ func TestApprovedRemoteExecutionRespectsWaitWindow(t *testing.T) {
 	}
 }
 
+func TestBlockedProgressDoesNotHoldRemoteCall(t *testing.T) {
+	for _, event := range []string{"deadline", "completed", "cancelled"} {
+		t.Run(event, func(t *testing.T) {
+			broker := NewBroker(0, 30, nil)
+			broker.SetFullPermissions(true)
+			broker.remoteWait = 3 * time.Second
+			if event == "deadline" {
+				broker.remoteWait = 250 * time.Millisecond
+			}
+			broker.progressPeriod = 5 * time.Millisecond
+			run := make(chan struct{})
+			finish := sync.OnceFunc(func() { close(run) })
+			defer finish()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			blocked := make(chan context.Context, 1)
+			release := make(chan struct{})
+			defer close(release)
+			var notifications atomic.Int32
+			type response struct {
+				out ExecutionOutcome
+				err error
+			}
+			done := make(chan response, 1)
+			go func() {
+				out, err := broker.ExecuteWithApproval(ctx, Request{IsRemote: true}, func() (any, error) {
+					<-run
+					return "done", nil
+				}, func(progressCtx context.Context, elapsed time.Duration) {
+					if notifications.Add(1) == 1 {
+						blocked <- progressCtx
+					}
+					<-release
+				})
+				done <- response{out, err}
+			}()
+
+			var progressCtx context.Context
+			select {
+			case progressCtx = <-blocked:
+			case <-time.After(time.Second):
+				t.Fatal("未收到进度回调")
+			}
+			switch event {
+			case "completed":
+				finish()
+			case "cancelled":
+				cancel()
+			}
+			select {
+			case resp := <-done:
+				if resp.out.ApprovalID == "" || !resp.out.Decision.Approved {
+					t.Fatalf("缺少真实审批状态: %+v", resp)
+				}
+				switch event {
+				case "completed":
+					if resp.err != nil || resp.out.Pending || resp.out.Result != "done" {
+						t.Fatalf("执行完成后应立即返回结果: %+v", resp)
+					}
+				case "cancelled":
+					if resp.err != context.Canceled || !resp.out.Pending {
+						t.Fatalf("请求取消后应返回执行中的审批单: %+v", resp)
+					}
+				case "deadline":
+					if resp.err != nil || !resp.out.Pending {
+						t.Fatalf("短窗口到期后应返回执行中的审批单: %+v", resp)
+					}
+				}
+			case <-time.After(time.Second):
+				t.Fatal("进度发送阻塞了远程调用返回")
+			}
+			if progressCtx.Err() == nil || notifications.Load() != 1 {
+				t.Fatalf("进度回调应串行且在等待结束时取消: err=%v count=%d", progressCtx.Err(), notifications.Load())
+			}
+		})
+	}
+}
+
 func TestRunningRemoteExecutionSurvivesCleanup(t *testing.T) {
 	broker := NewBroker(0, 30, nil)
 	old := time.Now().Add(-2 * time.Hour)

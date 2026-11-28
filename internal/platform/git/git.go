@@ -266,7 +266,7 @@ func (a *Adapter) ValidatePatchAt(ctx context.Context, workspaceID, repoPath, pa
 	// 4. 调用 git apply --check 预检补丁能否干净应用
 	_, stderr, err := a.runGit(ctx, resolvedRepo.AbsPath, []byte(patchText), "apply", "--check", "-")
 	if err != nil {
-		return nil, fmt.Errorf("git apply --check 预检失败: %v (%s)", err, strings.TrimSpace(stderr))
+		return validated, fmt.Errorf("git apply --check 预检失败: %v (%s)", err, strings.TrimSpace(stderr))
 	}
 	return validated, nil
 }

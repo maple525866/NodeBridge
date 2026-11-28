@@ -131,6 +131,7 @@ type Broker struct {
 	timeout         time.Duration // 0 表示本地直连无限等待
 	maxGrantMinutes int
 	remoteWait      time.Duration // 远程短等待窗口（超时转为异步续接）
+	progressPeriod  time.Duration // 远程同步等待期间的进度通知间隔
 	pendingTTL      time.Duration // 远程异步续接审批单最大存活时间
 	idempotencyTTL  time.Duration // 远程请求指纹幂等去重窗口
 	fullPermissions bool          // 全部权限模式：免除所有操作人工审批，直接自动放行
@@ -158,6 +159,7 @@ func NewBroker(timeoutSeconds, maxGrantMinutes int, killHook func(reason string)
 		timeout:         timeout,
 		maxGrantMinutes: maxGrantMinutes,
 		remoteWait:      45 * time.Second,
+		progressPeriod:  10 * time.Second,
 		pendingTTL:      15 * time.Minute,
 		idempotencyTTL:  5 * time.Minute,
 		pending:         make(map[string]*pendingItem),
@@ -356,7 +358,7 @@ func (b *Broker) ExecuteWithApproval(
 	ctx context.Context,
 	req Request,
 	execFn func() (any, error),
-	progressFn func(elapsed time.Duration),
+	progressFn func(context.Context, time.Duration),
 ) (ExecutionOutcome, error) {
 	// 本地调用完全沿用阶段一无限等待模型
 	if !req.IsRemote {
@@ -513,43 +515,49 @@ func (b *Broker) waitRemoteItem(
 	item *pendingItem,
 	waitDur time.Duration,
 	reused bool,
-	progressFn func(elapsed time.Duration),
+	progressFn func(context.Context, time.Duration),
 ) (ExecutionOutcome, error) {
 	if waitDur <= 0 {
 		waitDur = 45 * time.Second
 	}
 	start := time.Now()
-	timer := time.NewTimer(waitDur)
-	defer timer.Stop()
-
-	var ticker *time.Ticker
-	var tickC <-chan time.Time
+	waitCtx, cancel := context.WithTimeout(ctx, waitDur)
+	defer cancel()
 	if progressFn != nil {
-		ticker = time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		tickC = ticker.C
+		// 单独串行发送保活；传输阻塞不会占用等待审批或执行结果的协程。
+		go func() {
+			ticker := time.NewTicker(b.progressPeriod)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-waitCtx.Done():
+					return
+				case <-ticker.C:
+					if waitCtx.Err() != nil {
+						return
+					}
+					progressFn(waitCtx, time.Since(start))
+				}
+			}
+		}()
 	}
 
 	// execDone 在拒绝、取消或执行结束时关闭。审批与后台执行共用本次调用的短窗口。
 	var waitErr error
-wait:
-	for {
-		select {
-		case <-item.execDone:
-			break wait
-		case <-timer.C:
-			break wait
-		case <-ctx.Done():
-			waitErr = ctx.Err()
-			break wait
-		case <-tickC:
-			progressFn(time.Since(start))
-		}
+	select {
+	case <-item.execDone:
+	case <-waitCtx.Done():
+		waitErr = ctx.Err()
 	}
 
 	// 同时收到超时与状态变更时，以锁内的最新状态为准。
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return item.outcomeLocked(reused, waitErr)
+}
+
+// outcomeLocked 在 Broker 锁内读取审批结论与执行结果的一致快照。
+func (item *pendingItem) outcomeLocked(reused bool, waitErr error) (ExecutionOutcome, error) {
 	out := ExecutionOutcome{
 		ReusedIdempotent: reused,
 		ApprovalID:       item.req.ID,
@@ -635,33 +643,26 @@ func (b *Broker) GetRecord(id string) (Request, bool) {
 	return item.req, true
 }
 
-// LookupIdempotent 只读查询指定请求指纹是否已命中近期成功执行的幂等缓存（绝不创建新审批单）。
-func (b *Broker) LookupIdempotent(fingerprint string) (ExecutionOutcome, bool) {
-	fingerprint = strings.TrimSpace(fingerprint)
-	if fingerprint == "" {
-		return ExecutionOutcome{}, false
-	}
-	now := time.Now().UTC()
+// LookupIdempotent 返回匹配审批单的当前结果，不创建审批单或触发执行。
+func (b *Broker) LookupIdempotent(fingerprint string) (ExecutionOutcome, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.expireStaleLocked(now)
+	b.expireStaleLocked(time.Now().UTC())
 
 	entry, ok := b.fingerprints[fingerprint]
-	if !ok || !now.Before(entry.expiresAt) {
-		return ExecutionOutcome{}, false
+	if !ok {
+		return ExecutionOutcome{}, false, nil
 	}
 	existing, exists := b.records[entry.approvalID]
-	if !exists || existing.req.Status != StatusApproved || existing.req.ExecStatus != "SUCCEEDED" {
-		return ExecutionOutcome{}, false
+	if !exists {
+		return ExecutionOutcome{}, false, nil
 	}
-	dec := existing.decision
-	dec.DecisionTag = "IDEMPOTENT_REPLAY"
-	return ExecutionOutcome{
-		ReusedIdempotent: true,
-		ApprovalID:       existing.req.ID,
-		Decision:         dec,
-		Result:           existing.req.ExecResult,
-	}, true
+	if b.pauseState.Paused {
+		dec := Decision{DecisionTag: "PAUSED", Note: b.pauseState.Reason}
+		return ExecutionOutcome{Decision: dec}, true, fmt.Errorf("操作被拦截：%s", dec.Note)
+	}
+	out, err := existing.outcomeLocked(true, nil)
+	return out, true, err
 }
 
 // Resolve 由 Web 控制台或 CLI 调用，完成指定审批单的批准或拒绝。
