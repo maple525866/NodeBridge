@@ -1,6 +1,7 @@
 package task
 
 import (
+	"context"
 	"runtime"
 	"strings"
 	"testing"
@@ -121,5 +122,45 @@ func TestTaskLifecycleTimeoutCancelAndRecovery(t *testing.T) {
 	}
 	if orphan.Status != StatusFailed || !strings.Contains(orphan.ErrorMessage, "重启") {
 		t.Fatalf("遗留任务未正确收敛: %+v", orphan)
+	}
+
+	// 5. 测试 WaitUntilTerminal 短等待一次直出与 PollWait 长轮询唤醒
+	rec2, err := mgr.Start(StartRequest{
+		WorkspaceID: "default",
+		ToolName:    "terminal.start",
+		Executable:  exe,
+		Args:        args,
+		Cwd:         dataDir,
+	})
+	if err != nil {
+		t.Fatalf("Start 短等待任务失败: %v", err)
+	}
+	directRes, err := mgr.WaitUntilTerminal(context.Background(), rec2.ID, 5*time.Second)
+	if err != nil || directRes.Status != StatusSucceeded || !strings.Contains(directRes.StdoutChunk, "hello_nodebridge") {
+		t.Fatalf("WaitUntilTerminal 异常: err=%v res=%+v", err, directRes)
+	}
+
+	var delayedCmd string
+	if runtime.GOOS == "windows" {
+		delayedCmd = `Start-Sleep -Milliseconds 300; Write-Output "delayed_chunk_ready"`
+	} else {
+		delayedCmd = `sleep 0.3 && echo delayed_chunk_ready`
+	}
+	rec3, err := mgr.Start(StartRequest{
+		WorkspaceID: "default",
+		ToolName:    "terminal.start",
+		Executable:  delayedCmd,
+		Cwd:         dataDir,
+		UseShell:    true,
+	})
+	if err != nil {
+		t.Fatalf("Start 延迟输出任务失败: %v", err)
+	}
+	pollWaitRes, err := mgr.PollWait(context.Background(), rec3.ID, 0, 0, 5*time.Second)
+	if err != nil {
+		t.Fatalf("PollWait 失败: %v", err)
+	}
+	if !strings.Contains(pollWaitRes.StdoutChunk, "delayed_chunk_ready") && !pollWaitRes.Status.IsTerminal() {
+		t.Fatalf("PollWait 应在延迟输出到达或终态时唤醒返回，实际: %+v", pollWaitRes)
 	}
 }

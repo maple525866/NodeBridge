@@ -23,8 +23,14 @@ func TestCommandPolicyClassification(t *testing.T) {
 		wantBatch bool
 	}{
 		{"L0只读git", "git", []string{"status"}, false, RiskL0, ActionAllow, false},
+		{"L0只读node version", "node", []string{"--version"}, false, RiskL0, ActionAllow, false},
 		{"L1测试go test", "go.exe", []string{"test", "./..."}, false, RiskL1, ActionRequireApproval, true},
+		{"L1测试cargo test", "cargo", []string{"test"}, false, RiskL1, ActionRequireApproval, true},
+		{"L1类型检查tsc", "tsc", []string{"--noEmit"}, false, RiskL1, ActionRequireApproval, true},
+		{"L1构建dotnet build", "dotnet", []string{"build"}, false, RiskL1, ActionRequireApproval, true},
 		{"L2依赖安装npm install", "npm", []string{"install", "lodash"}, false, RiskL2, ActionRequireApproval, false},
+		{"L2依赖安装yarn add", "yarn", []string{"add", "lodash"}, false, RiskL2, ActionRequireApproval, false},
+		{"L2依赖安装bun install", "bun", []string{"install"}, false, RiskL2, ActionRequireApproval, false},
 		{"L2未知程序强制审批", "mycustombin", []string{"--run"}, false, RiskL2, ActionRequireApproval, false},
 		{"L2显式Shell强制审批", "echo hello", nil, true, RiskL2, ActionRequireApproval, false},
 		{"L3 git push强确认", "git", []string{"push", "origin", "main"}, false, RiskL3, ActionRequireApproval, false},
@@ -122,5 +128,40 @@ func TestFullPermissionsModeBypassesRestrictions(t *testing.T) {
 	eng.SetFullPermissions(false)
 	if ev := eng.EvaluateCommand("sudo", []string{"ls"}, false); ev.Action != ActionDeny {
 		t.Fatalf("关闭全权限后 sudo 应恢复拦截，实际: %+v", ev)
+	}
+}
+
+func TestNewToolsAndDeleteRiskClassification(t *testing.T) {
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := NewEngine(cfg.Security)
+
+	for _, roTool := range []string{"system.info", "workspace.glob", "git.log", "git.show"} {
+		ev := eng.EvaluateTool(roTool)
+		if ev.RiskLevel != RiskL0 || ev.Action != ActionAllow {
+			t.Fatalf("只读工具 %s 应为 L0 ALLOW，实际: %+v", roTool, ev)
+		}
+	}
+	for _, rwTool := range []string{"workspace.write", "workspace.move"} {
+		ev := eng.EvaluateTool(rwTool)
+		if ev.RiskLevel != RiskL1 || ev.Action != ActionRequireApproval || !ev.AllowBatchTTL {
+			t.Fatalf("写入工具 %s 应为 L1 支持批授，实际: %+v", rwTool, ev)
+		}
+	}
+
+	delSingle := eng.EvaluateDelete(false)
+	if delSingle.RiskLevel != RiskL1 || delSingle.Action != ActionRequireApproval || !delSingle.AllowBatchTTL {
+		t.Fatalf("单文件/空目录删除应为 L1 支持批授，实际: %+v", delSingle)
+	}
+	delRec := eng.EvaluateDelete(true)
+	if delRec.RiskLevel != RiskL2 || delRec.Action != ActionRequireApproval || delRec.AllowBatchTTL {
+		t.Fatalf("递归删除非空目录应为 L2 强制每次审批（不可批授），实际: %+v", delRec)
+	}
+
+	eng.SetFullPermissions(true)
+	if ev := eng.EvaluateDelete(true); ev.Action != ActionAllow {
+		t.Fatalf("全权限模式下递归删除应自动放行，实际: %+v", ev)
 	}
 }

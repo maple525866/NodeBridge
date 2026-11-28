@@ -126,21 +126,50 @@ func (e *Engine) EvaluateTool(toolName string) Evaluation {
 	return ev
 }
 
+// EvaluateDelete 针对 workspace.delete 根据是否为非空目录递归删除给出差异化风险评估。
+// 删除单文件或空目录按 L1（支持限时批授）；递归删除非空目录自动升级为 L2（强制每次人工审批）。
+func (e *Engine) EvaluateDelete(recursiveNonEmpty bool) Evaluation {
+	var ev Evaluation
+	if recursiveNonEmpty {
+		ev = Evaluation{
+			RiskLevel:     RiskL2,
+			Action:        ActionRequireApproval,
+			AllowBatchTTL: false,
+			Reason:        "将在工作区内递归删除非空目录，属于 L2 高风险操作，必须每次人工审批",
+		}
+	} else {
+		ev = Evaluation{
+			RiskLevel:     RiskL1,
+			Action:        ActionRequireApproval,
+			AllowBatchTTL: true,
+			Reason:        "将在授权工作区内删除单个文件或空目录，需要人工确认（支持限时批量授权）",
+		}
+	}
+	if e.fullPermissions.Load() && ev.Action != ActionAllow {
+		ev.Action = ActionAllow
+		ev.AllowBatchTTL = false
+		ev.BypassedByFullPerms = true
+		ev.Reason = "已开启全部权限模式，免审批直接放行"
+	}
+	return ev
+}
+
 func (e *Engine) evaluateToolBase(toolName string) Evaluation {
 	switch toolName {
-	case "workspace.list", "workspace.read", "workspace.search", "git.status", "git.diff", "terminal.poll", "approval.status":
+	case "system.info", "workspace.list", "workspace.read", "workspace.search", "workspace.glob",
+		"git.status", "git.diff", "git.log", "git.show", "terminal.poll", "approval.status":
 		return Evaluation{
 			RiskLevel:     RiskL0,
 			Action:        ActionAllow,
 			AllowBatchTTL: false,
 			Reason:        "授权工作区内的只读查询操作，自动放行",
 		}
-	case "workspace.patch", "git.apply_patch":
+	case "workspace.patch", "workspace.write", "workspace.move", "workspace.delete", "git.apply_patch":
 		return Evaluation{
 			RiskLevel:     RiskL1,
 			Action:        ActionRequireApproval,
 			AllowBatchTTL: true,
-			Reason:        "将在授权工作区内修改或新建代码文件，需要人工确认（支持限时批量授权）",
+			Reason:        "将在授权工作区内修改、新建、移动或删除代码文件，需要人工确认（支持限时批量授权）",
 		}
 	case "terminal.cancel":
 		return Evaluation{

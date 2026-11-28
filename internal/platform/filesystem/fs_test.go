@@ -296,3 +296,236 @@ func TestSymlinkCannotBypassSecretGuardInListAndSearch(t *testing.T) {
 		}
 	}
 }
+
+func TestWriteMoveAndDeleteWithSecurityAndRiskFlags(t *testing.T) {
+	mgr, wsDir := setupTestFS(t)
+
+	// 1. workspace.write：新建、overwrite=false 拒绝、乐观锁、覆写保留 CRLF、禁止二进制与敏感路径
+	w1, err := mgr.WriteFile(WriteRequest{
+		WorkspaceID: "demo",
+		Path:        "notes/app.txt",
+		Content:     "line1\r\nline2\r\n",
+		Overwrite:   true,
+	})
+	if err != nil || !w1.Created || w1.NewSHA256 == "" {
+		t.Fatalf("新建文件失败: err=%v res=%+v", err, w1)
+	}
+	if _, err := mgr.WriteFile(WriteRequest{
+		WorkspaceID: "demo",
+		Path:        "notes/app.txt",
+		Content:     "conflict",
+		Overwrite:   false,
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("overwrite=false 时覆盖已有文件应返回 ErrConflict，实际: %v", err)
+	}
+	if _, err := mgr.WriteFile(WriteRequest{
+		WorkspaceID:    "demo",
+		Path:           "notes/app.txt",
+		Content:        "bad lock",
+		ExpectedSHA256: "0000000000000000000000000000000000000000000000000000000000000000",
+		Overwrite:      true,
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("错误 expected_sha256 应触发 ErrConflict，实际: %v", err)
+	}
+	w2, err := mgr.WriteFile(WriteRequest{
+		WorkspaceID:    "demo",
+		Path:           "notes/app.txt",
+		Content:        "line1\nline2_new\n",
+		ExpectedSHA256: w1.NewSHA256,
+		Overwrite:      true,
+	})
+	if err != nil || w2.Created || !strings.Contains(w2.UnifiedDiff, "+line2_new") {
+		t.Fatalf("覆写文件失败: err=%v res=%+v", err, w2)
+	}
+	rawWritten, _ := os.ReadFile(filepath.Join(wsDir, "notes", "app.txt"))
+	if !strings.Contains(string(rawWritten), "\r\n") {
+		t.Fatalf("覆写已有 CRLF 文件应保留 CRLF 行尾，实际: %q", string(rawWritten))
+	}
+	if _, err := mgr.WriteFile(WriteRequest{
+		WorkspaceID: "demo",
+		Path:        "bin.dat",
+		Content:     "abc\x00def",
+		Overwrite:   true,
+	}); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("workspace.write 应拒绝含 NUL 字节的二进制内容，实际: %v", err)
+	}
+	if _, err := mgr.WriteFile(WriteRequest{
+		WorkspaceID: "demo",
+		Path:        ".env",
+		Content:     "HACK=1",
+		Overwrite:   true,
+	}); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("workspace.write 应拒绝写入 .env，实际: %v", err)
+	}
+
+	// 2. workspace.move：重命名文件、目标冲突保护、overwrite、防移入自身子目录与敏感目录拦截
+	mvRes, err := mgr.Move(MoveRequest{
+		WorkspaceID:     "demo",
+		SourcePath:      "notes/app.txt",
+		DestinationPath: "notes/renamed.txt",
+	})
+	if err != nil || mvRes.DestinationPath != "notes/renamed.txt" {
+		t.Fatalf("移动文件失败: err=%v res=%+v", err, mvRes)
+	}
+	if _, err := mgr.Move(MoveRequest{
+		WorkspaceID:     "demo",
+		SourcePath:      "notes/renamed.txt",
+		DestinationPath: "hello.go",
+		Overwrite:       false,
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("目标已存在且 overwrite=false 应返回 ErrConflict，实际: %v", err)
+	}
+	if _, err := mgr.Move(MoveRequest{
+		WorkspaceID:     "demo",
+		SourcePath:      "notes",
+		DestinationPath: "notes/inside",
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("禁止将目录移动到自身子目录，实际: %v", err)
+	}
+	if _, err := mgr.Move(MoveRequest{
+		WorkspaceID:     "demo",
+		SourcePath:      "sub", // 内含 id_rsa 敏感文件
+		DestinationPath: "sub_moved",
+	}); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("禁止移动包含敏感私钥文件的目录，实际: %v", err)
+	}
+
+	// 3. workspace.delete：单文件 L1、非空目录未开 recursive 拒绝、开启 recursive 标记 L2、敏感目录拦截、符号链接不跟随删除目标
+	pvFile, err := mgr.PreviewDelete(DeleteRequest{WorkspaceID: "demo", Path: "notes/renamed.txt"})
+	if err != nil || pvFile.RecursiveNonEmpty || pvFile.IsDir {
+		t.Fatalf("单文件删除预检异常: err=%v pv=%+v", err, pvFile)
+	}
+	if _, err := mgr.Delete(DeleteRequest{WorkspaceID: "demo", Path: "notes/renamed.txt"}); err != nil {
+		t.Fatalf("删除单文件失败: %v", err)
+	}
+	// 空目录可直接删且不触发递归 L2
+	pvEmptyDir, err := mgr.PreviewDelete(DeleteRequest{WorkspaceID: "demo", Path: "notes"})
+	if err != nil || !pvEmptyDir.IsDir || pvEmptyDir.RecursiveNonEmpty {
+		t.Fatalf("空目录删除预检异常: err=%v pv=%+v", err, pvEmptyDir)
+	}
+	if _, err := mgr.Delete(DeleteRequest{WorkspaceID: "demo", Path: "notes"}); err != nil {
+		t.Fatalf("删除空目录失败: %v", err)
+	}
+
+	// 非空目录测试
+	if err := os.MkdirAll(filepath.Join(wsDir, "tmp_dir", "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wsDir, "tmp_dir", "nested", "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.PreviewDelete(DeleteRequest{WorkspaceID: "demo", Path: "tmp_dir", Recursive: false}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("非空目录未传 recursive=true 应返回 ErrConflict，实际: %v", err)
+	}
+	pvRec, err := mgr.PreviewDelete(DeleteRequest{WorkspaceID: "demo", Path: "tmp_dir", Recursive: true})
+	if err != nil || !pvRec.RecursiveNonEmpty {
+		t.Fatalf("非空目录 recursive=true 应标记 RecursiveNonEmpty=true: err=%v pv=%+v", err, pvRec)
+	}
+	if _, err := mgr.Delete(DeleteRequest{WorkspaceID: "demo", Path: "tmp_dir", Recursive: true}); err != nil {
+		t.Fatalf("递归删除非空目录失败: %v", err)
+	}
+	if _, err := mgr.Delete(DeleteRequest{WorkspaceID: "demo", Path: "sub", Recursive: true}); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("禁止递归删除包含敏感私钥的目录 sub，实际: %v", err)
+	}
+	if _, err := mgr.Delete(DeleteRequest{WorkspaceID: "demo", Path: ".", Recursive: true}); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("禁止删除工作区根目录，实际: %v", err)
+	}
+}
+
+func TestGlobAndEnhancedSearchDualEngine(t *testing.T) {
+	mgr, wsDir := setupTestFS(t)
+
+	// 构造 .gitignore、构建产物目录 dist/、多文件代码结构
+	if err := os.WriteFile(filepath.Join(wsDir, ".gitignore"), []byte("ignored.log\nignored_dir/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wsDir, "ignored.log"), []byte("AuthToken should be ignored\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(wsDir, "ignored_dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wsDir, "ignored_dir", "hidden.go"), []byte("package x\n// AuthToken\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(wsDir, "dist"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wsDir, "dist", "bundle.js"), []byte("const AuthToken = 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(wsDir, "pkg", "auth"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	authContent := "package auth\n\n// before line\nfunc VerifyAuthToken() bool {\n\treturn true\n}\n"
+	if err := os.WriteFile(filepath.Join(wsDir, "pkg", "auth", "verify_auth.go"), []byte(authContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. workspace.glob 测试（.gitignore 生效 + 裸文件名模式 + 跳过 dist 与敏感文件）
+	g1, err := mgr.Glob(GlobOptions{WorkspaceID: "demo", Pattern: "**/*.go"})
+	if err != nil {
+		t.Fatalf("Glob 失败: %v", err)
+	}
+	foundVerify := false
+	for _, e := range g1.Entries {
+		if e.Path == "pkg/auth/verify_auth.go" {
+			foundVerify = true
+		}
+		if strings.Contains(e.Path, "ignored_dir") || strings.Contains(e.Path, "id_rsa") {
+			t.Fatalf("Glob 不应返回被 .gitignore 忽略或敏感文件: %s", e.Path)
+		}
+	}
+	if !foundVerify {
+		t.Fatalf("Glob 未找到 pkg/auth/verify_auth.go: %+v", g1.Entries)
+	}
+
+	g2, err := mgr.Glob(GlobOptions{WorkspaceID: "demo", Pattern: "*auth*"})
+	if err != nil || len(g2.Entries) != 1 || g2.Entries[0].Path != "pkg/auth/verify_auth.go" {
+		t.Fatalf("裸文件名模式 *auth* 匹配异常: err=%v res=%+v", err, g2)
+	}
+
+	falseVal := false
+	g3, err := mgr.Glob(GlobOptions{WorkspaceID: "demo", Pattern: "*.log", RespectGitignore: &falseVal})
+	if err != nil || len(g3.Entries) != 1 || g3.Entries[0].Path != "ignored.log" {
+		t.Fatalf("respect_gitignore=false 时应找到 ignored.log: err=%v res=%+v", err, g3)
+	}
+
+	// 2. 双引擎搜索一致性测试（默认优先 rg + 强制纯 Go 引擎）
+	for _, forceGo := range []bool{false, true} {
+		res, err := mgr.SearchWithOptions(SearchOptions{
+			WorkspaceID:   "demo",
+			Query:         "verifyauthtoken",
+			IgnoreCase:    true,
+			ContextLines:  1,
+			ForceGoEngine: forceGo,
+		})
+		if err != nil {
+			t.Fatalf("SearchWithOptions(forceGo=%v) 失败: %v", forceGo, err)
+		}
+		if len(res.Matches) != 1 {
+			t.Fatalf("期望命中 1 条 (forceGo=%v, engine=%s)，实际: %+v", forceGo, res.Engine, res.Matches)
+		}
+		m := res.Matches[0]
+		if m.Path != "pkg/auth/verify_auth.go" || m.LineNumber != 4 {
+			t.Fatalf("命中位置异常 (forceGo=%v): %+v", forceGo, m)
+		}
+		if len(m.ContextBefore) != 1 || !strings.Contains(m.ContextBefore[0], "before line") {
+			t.Fatalf("前上下文异常 (forceGo=%v): %+v", forceGo, m.ContextBefore)
+		}
+		if len(m.ContextAfter) != 1 || !strings.Contains(m.ContextAfter[0], "return true") {
+			t.Fatalf("后上下文异常 (forceGo=%v): %+v", forceGo, m.ContextAfter)
+		}
+
+		// 验证 .env 绝不被任何搜索引擎泄露
+		secRes, err := mgr.SearchWithOptions(SearchOptions{
+			WorkspaceID:      "demo",
+			Query:            "super_secret_123",
+			RespectGitignore: &falseVal,
+			ForceGoEngine:    forceGo,
+		})
+		if err != nil || len(secRes.Matches) != 0 {
+			t.Fatalf("搜索绝不能泄露 .env (forceGo=%v, engine=%s): err=%v res=%+v", forceGo, secRes.Engine, err, secRes)
+		}
+	}
+}

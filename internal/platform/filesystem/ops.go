@@ -1,0 +1,623 @@
+package filesystem
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+)
+
+// WriteRequest 表示整文件新建或覆写请求。
+type WriteRequest struct {
+	WorkspaceID    string `json:"workspace_id"`
+	Path           string `json:"path"`
+	Content        string `json:"content"`
+	ExpectedSHA256 string `json:"expected_sha256,omitempty"`
+	Overwrite      bool   `json:"overwrite"`
+}
+
+// WritePreview 表示整文件写入的审批前预检结果与 Unified Diff。
+type WritePreview struct {
+	Resolved    *ResolvedPath
+	IsNewFile   bool
+	OldSHA256   string
+	NewSHA256   string
+	NewContent  string
+	UnifiedDiff string
+}
+
+// WriteResult 表示 workspace.write 的执行结果。
+type WriteResult struct {
+	Source      string `json:"source"`
+	WorkspaceID string `json:"workspace_id"`
+	Path        string `json:"path"`
+	Created     bool   `json:"created"`
+	Bytes       int    `json:"bytes,omitempty"`
+	OldSHA256   string `json:"old_sha256,omitempty"`
+	NewSHA256   string `json:"new_sha256,omitempty"`
+	UnifiedDiff string `json:"unified_diff,omitempty"`
+	Pending     bool   `json:"pending,omitempty"`
+	ApprovalID  string `json:"approval_id,omitempty"`
+	Message     string `json:"message,omitempty"`
+}
+
+// MoveRequest 表示重命名或移动文件/目录的请求。
+type MoveRequest struct {
+	WorkspaceID     string `json:"workspace_id"`
+	SourcePath      string `json:"source_path"`
+	DestinationPath string `json:"destination_path"`
+	Overwrite       bool   `json:"overwrite,omitempty"`
+}
+
+// MovePreview 表示移动操作预检结果。
+type MovePreview struct {
+	Source      *ResolvedPath
+	Destination *ResolvedPath
+	IsDir       bool
+	DestExists  bool
+}
+
+// MoveResult 表示 workspace.move 的执行结果。
+type MoveResult struct {
+	Source          string `json:"source"`
+	WorkspaceID     string `json:"workspace_id"`
+	SourcePath      string `json:"source_path"`
+	DestinationPath string `json:"destination_path"`
+	IsDir           bool   `json:"is_dir,omitempty"`
+	Pending         bool   `json:"pending,omitempty"`
+	ApprovalID      string `json:"approval_id,omitempty"`
+	Message         string `json:"message,omitempty"`
+}
+
+// DeleteRequest 表示删除文件或目录的请求。
+type DeleteRequest struct {
+	WorkspaceID string `json:"workspace_id"`
+	Path        string `json:"path"`
+	Recursive   bool   `json:"recursive,omitempty"`
+}
+
+// DeletePreview 表示删除操作预检结果，供工具层区分 L1（单文件/空目录）与 L2（递归删非空目录）。
+type DeletePreview struct {
+	Resolved          *ResolvedPath
+	IsDir             bool
+	IsSymlink         bool
+	IsNonEmptyDir     bool
+	RecursiveNonEmpty bool
+	EntryCount        int
+}
+
+// DeleteResult 表示 workspace.delete 的执行结果。
+type DeleteResult struct {
+	Source      string `json:"source"`
+	WorkspaceID string `json:"workspace_id"`
+	Path        string `json:"path"`
+	IsDir       bool   `json:"is_dir,omitempty"`
+	Recursive   bool   `json:"recursive,omitempty"`
+	Pending     bool   `json:"pending,omitempty"`
+	ApprovalID  string `json:"approval_id,omitempty"`
+	Message     string `json:"message,omitempty"`
+}
+
+// PreviewWrite 预检整文件写入（含路径、敏感红线、大小、二进制与 SHA256 乐观锁），并生成 Unified Diff。
+func (m *Manager) PreviewWrite(req WriteRequest) (*WritePreview, error) {
+	resolved, err := m.Resolve(req.WorkspaceID, req.Path, true)
+	if err != nil {
+		return nil, err
+	}
+	return m.computeWriteLocked(resolved, req)
+}
+
+// WriteFile 在路径互斥锁下重新校验并原子写入整文件内容。
+func (m *Manager) WriteFile(req WriteRequest) (*WriteResult, error) {
+	resolved, err := m.Resolve(req.WorkspaceID, req.Path, true)
+	if err != nil {
+		return nil, err
+	}
+
+	unlock := m.LockPath(resolved.AbsPath)
+	defer unlock()
+
+	preview, err := m.computeWriteLocked(resolved, req)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(resolved.AbsPath), 0o755); err != nil {
+		return nil, fmt.Errorf("创建父目录失败: %w", err)
+	}
+
+	perm := os.FileMode(0o644)
+	if fi, err := os.Stat(resolved.AbsPath); err == nil {
+		perm = fi.Mode().Perm()
+	}
+
+	tmpFile, err := os.CreateTemp(filepath.Dir(resolved.AbsPath), ".nodebridge-write-*.tmp")
+	if err != nil {
+		return nil, fmt.Errorf("创建临时文件失败: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	if _, err := tmpFile.WriteString(preview.NewContent); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return nil, fmt.Errorf("写入临时文件失败: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return nil, fmt.Errorf("关闭临时文件失败: %w", err)
+	}
+	_ = os.Chmod(tmpPath, perm)
+
+	if err := os.Rename(tmpPath, resolved.AbsPath); err != nil {
+		if wErr := os.WriteFile(resolved.AbsPath, []byte(preview.NewContent), perm); wErr != nil {
+			_ = os.Remove(tmpPath)
+			return nil, fmt.Errorf("提交文件写入失败: %w", wErr)
+		}
+		_ = os.Remove(tmpPath)
+	}
+
+	return &WriteResult{
+		Source:      "local_workspace_write",
+		WorkspaceID: req.WorkspaceID,
+		Path:        resolved.RelPath,
+		Created:     preview.IsNewFile,
+		Bytes:       len(preview.NewContent),
+		OldSHA256:   preview.OldSHA256,
+		NewSHA256:   preview.NewSHA256,
+		UnifiedDiff: preview.UnifiedDiff,
+	}, nil
+}
+
+func (m *Manager) computeWriteLocked(resolved *ResolvedPath, req WriteRequest) (*WritePreview, error) {
+	if len(req.Content) > defaultReadMaxBytes {
+		return nil, fmt.Errorf("写入内容体积过大 (%d bytes)，超过单次文本写入上限 %d bytes", len(req.Content), defaultReadMaxBytes)
+	}
+	if isBinaryContent([]byte(req.Content)) {
+		return nil, fmt.Errorf("%w: workspace.write 仅支持文本内容，禁止写入二进制 NUL 字节", ErrAccessDenied)
+	}
+
+	raw, err := os.ReadFile(resolved.AbsPath)
+	isNew := false
+	if err != nil {
+		if os.IsNotExist(err) {
+			isNew = true
+			raw = nil
+		} else {
+			return nil, fmt.Errorf("读取目标文件失败: %w", err)
+		}
+	}
+
+	var oldSHA string
+	if !isNew {
+		if !req.Overwrite {
+			return nil, fmt.Errorf("%w: 目标文件 %q 已存在（overwrite=false）", ErrConflict, resolved.RelPath)
+		}
+		if isBinaryContent(raw) {
+			return nil, fmt.Errorf("目标文件 %q 为二进制文件，禁止使用文本写入覆盖", resolved.RelPath)
+		}
+		oldSHA = sha256Hex(raw)
+		if req.ExpectedSHA256 != "" && !strings.EqualFold(req.ExpectedSHA256, oldSHA) {
+			return nil, fmt.Errorf("%w: 文件 %q 已被修改（期望 sha256=%s，实际=%s），请重新读取后再写入",
+				ErrConflict, resolved.RelPath, req.ExpectedSHA256, oldSHA)
+		}
+	} else if req.ExpectedSHA256 != "" {
+		return nil, fmt.Errorf("%w: 目标文件不存在，但传入了 expected_sha256", ErrConflict)
+	}
+
+	oldContent := string(raw)
+	finalContent := req.Content
+	// 若原文件使用 CRLF 且新内容纯 LF，保留原文件行尾风格
+	if !isNew && strings.Contains(oldContent, "\r\n") && !strings.Contains(finalContent, "\r\n") {
+		finalContent = strings.ReplaceAll(finalContent, "\n", "\r\n")
+	}
+
+	newSHA := sha256Hex([]byte(finalContent))
+	diff := GenerateUnifiedDiff(resolved.RelPath, oldContent, finalContent)
+	return &WritePreview{
+		Resolved:    resolved,
+		IsNewFile:   isNew,
+		OldSHA256:   oldSHA,
+		NewSHA256:   newSHA,
+		NewContent:  finalContent,
+		UnifiedDiff: diff,
+	}, nil
+}
+
+// PreviewMove 预检重命名/移动文件或目录的合法性与安全边界。
+func (m *Manager) PreviewMove(req MoveRequest) (*MovePreview, error) {
+	if strings.TrimSpace(req.SourcePath) == "" || strings.TrimSpace(req.DestinationPath) == "" {
+		return nil, errors.New("source_path 和 destination_path 均不能为空")
+	}
+	src, err := m.resolveEntryNoFollow(req.WorkspaceID, req.SourcePath, true)
+	if err != nil {
+		return nil, fmt.Errorf("源路径校验失败: %w", err)
+	}
+	dst, err := m.resolveEntryNoFollow(req.WorkspaceID, req.DestinationPath, true)
+	if err != nil {
+		return nil, fmt.Errorf("目标路径校验失败: %w", err)
+	}
+
+	if sameFSPath(src.AbsPath, dst.AbsPath) {
+		return nil, fmt.Errorf("%w: 源路径与目标路径相同", ErrConflict)
+	}
+	if isRootOrDrivePath(src.AbsPath) || sameFSPath(src.AbsPath, src.Workspace.RealRoot) {
+		return nil, fmt.Errorf("%w: 禁止移动工作区根目录或磁盘根目录", ErrAccessDenied)
+	}
+
+	srcInfo, err := os.Lstat(src.AbsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("源路径 %q 不存在", src.RelPath)
+		}
+		return nil, fmt.Errorf("读取源路径状态失败: %w", err)
+	}
+	isDir := srcInfo.IsDir()
+	if isDir && isWithinRoot(src.AbsPath, dst.AbsPath) {
+		return nil, fmt.Errorf("%w: 不能将目录 %q 移动到其自身子目录 %q 中", ErrConflict, src.RelPath, dst.RelPath)
+	}
+	if isDir {
+		if err := m.ensureTreeHasNoSecrets(src.Workspace, src.AbsPath); err != nil {
+			return nil, err
+		}
+	}
+
+	destExists := false
+	if dstInfo, statErr := os.Lstat(dst.AbsPath); statErr == nil {
+		destExists = true
+		if !req.Overwrite {
+			return nil, fmt.Errorf("%w: 目标路径 %q 已存在（如需覆盖请设置 overwrite=true）", ErrConflict, dst.RelPath)
+		}
+		if dstInfo.IsDir() {
+			return nil, fmt.Errorf("%w: 禁止使用 overwrite 覆盖已存在的目录 %q", ErrConflict, dst.RelPath)
+		}
+	} else if !os.IsNotExist(statErr) {
+		return nil, fmt.Errorf("检查目标路径失败: %w", statErr)
+	}
+
+	return &MovePreview{
+		Source:      src,
+		Destination: dst,
+		IsDir:       isDir,
+		DestExists:  destExists,
+	}, nil
+}
+
+// Move 在按顺序获取双路径锁下安全执行文件或目录移动/重命名。
+func (m *Manager) Move(req MoveRequest) (*MoveResult, error) {
+	preview, err := m.PreviewMove(req)
+	if err != nil {
+		return nil, err
+	}
+
+	unlock := m.lockTwoPaths(preview.Source.AbsPath, preview.Destination.AbsPath)
+	defer unlock()
+
+	// 持锁二次校验防竞态
+	preview, err = m.PreviewMove(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(preview.Destination.AbsPath), 0o755); err != nil {
+		return nil, fmt.Errorf("创建目标父目录失败: %w", err)
+	}
+	if preview.DestExists && req.Overwrite {
+		if err := os.Remove(preview.Destination.AbsPath); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("移除已有目标文件失败: %w", err)
+		}
+	}
+
+	if err := os.Rename(preview.Source.AbsPath, preview.Destination.AbsPath); err != nil {
+		// 跨盘符移动安全回退：先复制到目标，成功后删除源
+		if copyErr := copyPathForMove(preview.Source.AbsPath, preview.Destination.AbsPath); copyErr != nil {
+			return nil, fmt.Errorf("移动失败 (rename=%v, copy=%v)", err, copyErr)
+		}
+		if rmErr := os.RemoveAll(preview.Source.AbsPath); rmErr != nil {
+			return nil, fmt.Errorf("已复制到目标，但清理源路径失败: %w", rmErr)
+		}
+	}
+
+	return &MoveResult{
+		Source:          "local_workspace_move",
+		WorkspaceID:     req.WorkspaceID,
+		SourcePath:      preview.Source.RelPath,
+		DestinationPath: preview.Destination.RelPath,
+		IsDir:           preview.IsDir,
+		Message:         fmt.Sprintf("已将 %s 移动至 %s", preview.Source.RelPath, preview.Destination.RelPath),
+	}, nil
+}
+
+// PreviewDelete 预检删除目标（不跟随符号链接），返回目录是否非空供策略层区分 L1/L2。
+func (m *Manager) PreviewDelete(req DeleteRequest) (*DeletePreview, error) {
+	if strings.TrimSpace(req.Path) == "" {
+		return nil, errors.New("path 不能为空")
+	}
+	resolved, err := m.resolveEntryNoFollow(req.WorkspaceID, req.Path, true)
+	if err != nil {
+		return nil, err
+	}
+	if isRootOrDrivePath(resolved.AbsPath) || sameFSPath(resolved.AbsPath, resolved.Workspace.RealRoot) {
+		return nil, fmt.Errorf("%w: 禁止删除工作区根目录或磁盘根目录", ErrAccessDenied)
+	}
+
+	info, err := os.Lstat(resolved.AbsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("目标路径 %q 不存在", resolved.RelPath)
+		}
+		return nil, fmt.Errorf("检查目标路径失败: %w", err)
+	}
+
+	isSymlink := info.Mode()&os.ModeSymlink != 0
+	isDir := !isSymlink && info.IsDir()
+	isNonEmpty := false
+	entryCount := 1
+
+	if isDir {
+		entries, readErr := os.ReadDir(resolved.AbsPath)
+		if readErr != nil {
+			return nil, fmt.Errorf("读取目录内容失败: %w", readErr)
+		}
+		if len(entries) > 0 {
+			isNonEmpty = true
+			if !req.Recursive {
+				return nil, fmt.Errorf("%w: 目录 %q 非空（包含 %d 个直接条目），如需递归删除请显式设置 recursive=true（将触发 L2 人工审批）",
+					ErrConflict, resolved.RelPath, len(entries))
+			}
+			// 递归删除前必须确认目录树内不含任何受硬保护的敏感密钥目录或文件
+			count, secErr := m.countAndCheckTreeSecrets(resolved.Workspace, resolved.AbsPath)
+			if secErr != nil {
+				return nil, secErr
+			}
+			entryCount = count
+		}
+	}
+
+	return &DeletePreview{
+		Resolved:          resolved,
+		IsDir:             isDir,
+		IsSymlink:         isSymlink,
+		IsNonEmptyDir:     isNonEmpty,
+		RecursiveNonEmpty: isDir && isNonEmpty && req.Recursive,
+		EntryCount:        entryCount,
+	}, nil
+}
+
+// Delete 在路径锁下安全删除文件、符号链接（仅删链接本身）、空目录或经审批的递归非空目录。
+func (m *Manager) Delete(req DeleteRequest) (*DeleteResult, error) {
+	preview, err := m.PreviewDelete(req)
+	if err != nil {
+		return nil, err
+	}
+
+	unlock := m.LockPath(preview.Resolved.AbsPath)
+	defer unlock()
+
+	// 持锁二次校验防竞态
+	preview, err = m.PreviewDelete(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if preview.IsDir && preview.RecursiveNonEmpty {
+		if err := os.RemoveAll(preview.Resolved.AbsPath); err != nil {
+			return nil, fmt.Errorf("递归删除目录失败: %w", err)
+		}
+	} else {
+		if err := os.Remove(preview.Resolved.AbsPath); err != nil {
+			return nil, fmt.Errorf("删除路径失败: %w", err)
+		}
+	}
+
+	return &DeleteResult{
+		Source:      "local_workspace_delete",
+		WorkspaceID: req.WorkspaceID,
+		Path:        preview.Resolved.RelPath,
+		IsDir:       preview.IsDir,
+		Recursive:   preview.RecursiveNonEmpty,
+		Message:     fmt.Sprintf("已删除 %s", preview.Resolved.RelPath),
+	}, nil
+}
+
+// resolveEntryNoFollow 解析文件或目录条目本身（对父目录解析符号链接防逃逸，但对叶节点保留符号链接本身以便移动/删除链接而非目标）。
+func (m *Manager) resolveEntryNoFollow(workspaceID, targetPath string, forWrite bool) (*ResolvedPath, error) {
+	allowAllDirs := m.AllowAllDirs()
+	fullPerms := m.FullPermissions()
+
+	ws, err := m.GetWorkspace(workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	if forWrite && ws.ReadOnly && !fullPerms {
+		return nil, fmt.Errorf("%w: 工作区 %q 为只读模式，禁止写入或变更", ErrAccessDenied, workspaceID)
+	}
+
+	raw := strings.TrimSpace(targetPath)
+	if raw == "" || raw == "." {
+		return nil, fmt.Errorf("%w: 目标路径不能为工作区根目录", ErrAccessDenied)
+	}
+	if allowAllDirs {
+		raw = normalizeAllDirsDrivePath(raw)
+	}
+	if err := checkDangerousPathSyntax(raw); err != nil {
+		return nil, err
+	}
+
+	var candidate string
+	if filepath.IsAbs(raw) {
+		candidate = filepath.Clean(raw)
+	} else {
+		candidate = filepath.Clean(filepath.Join(ws.RealRoot, filepath.FromSlash(raw)))
+	}
+	if !allowAllDirs && !isWithinRoot(ws.RealRoot, candidate) {
+		return nil, fmt.Errorf("%w: 路径 %q 超出授权工作区边界", ErrAccessDenied, targetPath)
+	}
+	if isRootOrDrivePath(candidate) {
+		return nil, fmt.Errorf("%w: 禁止操作磁盘根目录 %q", ErrAccessDenied, targetPath)
+	}
+
+	parentReal, err := resolveRealPath(filepath.Dir(candidate))
+	if err != nil {
+		return nil, fmt.Errorf("%w: 解析父目录失败: %v", ErrAccessDenied, err)
+	}
+	entryAbs := filepath.Clean(filepath.Join(parentReal, filepath.Base(candidate)))
+	if !allowAllDirs && !isWithinRoot(ws.RealRoot, entryAbs) {
+		return nil, fmt.Errorf("%w: 路径 %q 经父目录符号链接解析后逃逸出授权工作区", ErrAccessDenied, targetPath)
+	}
+
+	// 若目标存在且不是符号链接，同时检查其真实路径；若是符号链接，只校验链接路径本身与真实目标的硬红线
+	if fi, lErr := os.Lstat(entryAbs); lErr == nil && fi.Mode()&os.ModeSymlink == 0 {
+		if realTarget, rErr := filepath.EvalSymlinks(entryAbs); rErr == nil {
+			entryAbs = filepath.Clean(realTarget)
+			if !allowAllDirs && !isWithinRoot(ws.RealRoot, entryAbs) {
+				return nil, fmt.Errorf("%w: 路径 %q 经符号链接解析后逃逸出授权工作区", ErrAccessDenied, targetPath)
+			}
+		}
+	}
+
+	var relPOSIX string
+	if isWithinRoot(ws.RealRoot, entryAbs) {
+		relOS, relErr := filepath.Rel(ws.RealRoot, entryAbs)
+		if relErr != nil {
+			return nil, fmt.Errorf("%w: 计算相对路径失败: %v", ErrAccessDenied, relErr)
+		}
+		relPOSIX = filepath.ToSlash(relOS)
+	} else {
+		relPOSIX = filepath.ToSlash(entryAbs)
+	}
+	if relPOSIX == "." {
+		return nil, fmt.Errorf("%w: 目标路径不能为工作区根目录", ErrAccessDenied)
+	}
+
+	if err := m.checkHardSecretPath(filepath.ToSlash(entryAbs)); err != nil {
+		return nil, err
+	}
+	if err := m.checkSensitivePath(ws, relPOSIX); err != nil {
+		return nil, err
+	}
+
+	return &ResolvedPath{
+		Workspace: ws,
+		AbsPath:   entryAbs,
+		RelPath:   relPOSIX,
+	}, nil
+}
+
+func (m *Manager) ensureTreeHasNoSecrets(ws *Workspace, dirAbs string) error {
+	_, err := m.countAndCheckTreeSecrets(ws, dirAbs)
+	return err
+}
+
+func (m *Manager) countAndCheckTreeSecrets(ws *Workspace, dirAbs string) (int, error) {
+	count := 0
+	inWorkspace := isWithinRoot(ws.RealRoot, dirAbs)
+	err := filepath.WalkDir(dirAbs, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		count++
+		if p == dirAbs {
+			return nil
+		}
+		if err := m.checkHardSecretPath(filepath.ToSlash(p)); err != nil {
+			return err
+		}
+		checkPOSIX := filepath.ToSlash(p)
+		if inWorkspace {
+			if rel, relErr := filepath.Rel(ws.RealRoot, p); relErr == nil {
+				checkPOSIX = filepath.ToSlash(rel)
+			}
+		}
+		if err := m.checkSensitivePath(ws, checkPOSIX); err != nil {
+			return err
+		}
+		return nil
+	})
+	return count, err
+}
+
+func (m *Manager) lockTwoPaths(a, b string) func() {
+	ka := filepath.Clean(a)
+	kb := filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		ka = strings.ToLower(ka)
+		kb = strings.ToLower(kb)
+	}
+	if ka == kb {
+		return m.LockPath(a)
+	}
+	if ka < kb {
+		u1 := m.LockPath(a)
+		u2 := m.LockPath(b)
+		return func() {
+			u2()
+			u1()
+		}
+	}
+	u1 := m.LockPath(b)
+	u2 := m.LockPath(a)
+	return func() {
+		u2()
+		u1()
+	}
+}
+
+func sameFSPath(a, b string) bool {
+	ca := filepath.Clean(a)
+	cb := filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(ca, cb)
+	}
+	return ca == cb
+}
+
+func isRootOrDrivePath(absPath string) bool {
+	clean := filepath.Clean(absPath)
+	return filepath.Dir(clean) == clean
+}
+
+func copyPathForMove(src, dst string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(src)
+		if err != nil {
+			return err
+		}
+		return os.Symlink(target, dst)
+	}
+	if info.IsDir() {
+		if err := os.MkdirAll(dst, info.Mode().Perm()); err != nil {
+			return err
+		}
+		entries, err := os.ReadDir(src)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			if err := copyPathForMove(filepath.Join(src, e.Name()), filepath.Join(dst, e.Name())); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
+}

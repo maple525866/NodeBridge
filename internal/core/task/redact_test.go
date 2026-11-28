@@ -7,7 +7,7 @@ import (
 )
 
 func TestCappedBufferStreamingPrivateKeyAndTokenRedaction(t *testing.T) {
-	buf := newCappedBuffer(64 * 1024)
+	buf := newCappedBuffer(64*1024, nil)
 
 	// 1. 跨分片写入高敏 Token 与中文，中间 ReadFrom 不得泄露明文前缀且偏移单调递增
 	_, _ = buf.Write([]byte("你好前缀 token=sk-1234567890"))
@@ -53,5 +53,43 @@ func TestCappedBufferStreamingPrivateKeyAndTokenRedaction(t *testing.T) {
 	}
 	if !strings.Contains(c6, "[REDACTED_PRIVATE_KEY]") || !strings.Contains(c6, "编译完成：全部测试通过！") {
 		t.Fatalf("未闭合私钥头不应吞噬后续正常日志: %q", c6)
+	}
+}
+
+func TestCappedBufferTailRetentionAndRedaction(t *testing.T) {
+	// maxBytes=256 时，tailMaxBytes 也自动收敛为 256，方便验证超长日志尾部保留与脱敏
+	buf := newCappedBuffer(256, nil)
+
+	_, _ = buf.Write([]byte("HEAD_MARKER_LINE_0001\n"))
+	for i := 0; i < 20; i++ {
+		_, _ = buf.Write([]byte("middle filler log line for truncation testing 0123456789\n"))
+	}
+	_, _ = buf.Write([]byte("-----BEGIN OPENSSH PRIVATE KEY-----\nTAIL_SECRET_LINE\n-----END OPENSSH PRIVATE KEY-----\n"))
+	_, _ = buf.Write([]byte("FINAL_TEST_SUMMARY: FAIL expected 5 got 4\n"))
+	buf.Flush()
+
+	head, nextOff, truncated := buf.ReadFrom(0)
+	if !truncated {
+		t.Fatalf("期望发生截断")
+	}
+	if !strings.Contains(head, "HEAD_MARKER_LINE_0001") {
+		t.Fatalf("头部单调缓冲应保留开头内容: %q", head)
+	}
+	if nextOff <= 0 || nextOff > 256 {
+		t.Fatalf("头部缓冲偏移越界: %d", nextOff)
+	}
+
+	tail := buf.Tail()
+	if !strings.Contains(tail, "FINAL_TEST_SUMMARY: FAIL expected 5 got 4") {
+		t.Fatalf("尾部缓冲应保留最终报错摘要: %q", tail)
+	}
+	if strings.Contains(tail, "TAIL_SECRET_LINE") {
+		t.Fatalf("尾部缓冲绝不能泄露私钥正文: %q", tail)
+	}
+	if !strings.Contains(tail, "[REDACTED_PRIVATE_KEY]") {
+		t.Fatalf("尾部缓冲应包含私钥脱敏标记: %q", tail)
+	}
+	if !utf8.ValidString(tail) {
+		t.Fatalf("尾部缓冲出现非法 UTF-8 截断: %q", tail)
 	}
 }

@@ -18,7 +18,24 @@ import (
 const (
 	defaultGitTimeout = 30 * time.Second
 	defaultMaxDiff    = 256 * 1024 // 默认最大返回 256KB Diff
+	defaultLogLimit   = 20
+	maxLogLimit       = 100
 )
+
+// gitSensitiveExcludePathspecs 在 git diff / git show 未指定路径时强制排除敏感密钥与凭证文件。
+var gitSensitiveExcludePathspecs = []string{
+	":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*",
+	":(exclude,glob)**/.ssh/**", ":(exclude,glob)**/.gnupg/**",
+	":(exclude,glob)**/.aws/**", ":(exclude,glob)**/.kube/**",
+	":(exclude,glob)**/*.pem", ":(exclude,glob)**/*.key",
+	":(exclude,glob)**/*.ppk", ":(exclude,glob)**/*.p12",
+	":(exclude,glob)**/*.pfx", ":(exclude,glob)**/*.jks",
+	":(exclude,glob)**/*.keystore", ":(exclude,glob)**/*.kdbx",
+	":(exclude,glob)**/id_rsa*", ":(exclude,glob)**/id_ed25519*",
+	":(exclude,glob)**/id_ecdsa*", ":(exclude,glob)**/id_dsa*",
+	":(exclude,glob)**/authorized_keys", ":(exclude,glob)**/nodebridge.yaml",
+	":(exclude,glob)**/service.env",
+}
 
 // Adapter 提供面向授权工作区的受控 Git 操作。
 type Adapter struct {
@@ -42,6 +59,41 @@ type DiffResult struct {
 	Source      string `json:"source"`
 	WorkspaceID string `json:"workspace_id"`
 	Staged      bool   `json:"staged"`
+	Base        string `json:"base,omitempty"`
+	Target      string `json:"target,omitempty"`
+	Truncated   bool   `json:"truncated"`
+	Diff        string `json:"diff"`
+}
+
+// LogCommit 表示 git.log 中的单条提交记录。
+type LogCommit struct {
+	Hash      string `json:"hash"`
+	ShortHash string `json:"short_hash"`
+	Author    string `json:"author"`
+	Date      string `json:"date"`
+	Subject   string `json:"subject"`
+}
+
+// LogResult 表示 git.log 的返回结果。
+type LogResult struct {
+	Source      string      `json:"source"`
+	WorkspaceID string      `json:"workspace_id"`
+	Ref         string      `json:"ref,omitempty"`
+	Commits     []LogCommit `json:"commits"`
+}
+
+// ShowResult 表示 git.show 的返回结果。
+type ShowResult struct {
+	Source      string `json:"source"`
+	WorkspaceID string `json:"workspace_id"`
+	Ref         string `json:"ref"`
+	Hash        string `json:"hash"`
+	ShortHash   string `json:"short_hash"`
+	Author      string `json:"author"`
+	Date        string `json:"date"`
+	Subject     string `json:"subject"`
+	Body        string `json:"body,omitempty"`
+	StatOnly    bool   `json:"stat_only,omitempty"`
 	Truncated   bool   `json:"truncated"`
 	Diff        string `json:"diff"`
 }
@@ -134,6 +186,11 @@ func (a *Adapter) Diff(ctx context.Context, workspaceID string, staged bool, pat
 
 // DiffAt 查看指定 Git 仓库目录（默认工作区根目录）的变更差异。
 func (a *Adapter) DiffAt(ctx context.Context, workspaceID, repoPath string, staged bool, paths []string, maxBytes int) (*DiffResult, error) {
+	return a.DiffRangeAt(ctx, workspaceID, repoPath, staged, "", "", paths, maxBytes)
+}
+
+// DiffRangeAt 查看指定 Git 仓库目录的变更差异，支持可选 base / target ref 对比（如 main...HEAD、HEAD~1）。
+func (a *Adapter) DiffRangeAt(ctx context.Context, workspaceID, repoPath string, staged bool, baseRef, targetRef string, paths []string, maxBytes int) (*DiffResult, error) {
 	resolvedRepo, err := a.fsMgr.Resolve(workspaceID, repoPath, false)
 	if err != nil {
 		return nil, err
@@ -142,10 +199,33 @@ func (a *Adapter) DiffAt(ctx context.Context, workspaceID, repoPath string, stag
 		maxBytes = defaultMaxDiff
 	}
 
+	baseRef = strings.TrimSpace(baseRef)
+	targetRef = strings.TrimSpace(targetRef)
+	if baseRef != "" {
+		if err := validateGitRef(baseRef); err != nil {
+			return nil, fmt.Errorf("无效的 base 参数: %w", err)
+		}
+	}
+	if targetRef != "" {
+		if err := validateGitRef(targetRef); err != nil {
+			return nil, fmt.Errorf("无效的 target 参数: %w", err)
+		}
+	}
+	if staged && targetRef != "" {
+		return nil, errors.New("staged=true 不能与 target 同时使用")
+	}
+
 	args := []string{"diff", "--no-ext-diff"}
 	if staged {
 		args = append(args, "--cached")
 	}
+	if baseRef != "" {
+		args = append(args, baseRef)
+	}
+	if targetRef != "" {
+		args = append(args, targetRef)
+	}
+
 	if len(paths) > 0 {
 		args = append(args, "--")
 		for _, p := range paths {
@@ -165,17 +245,8 @@ func (a *Adapter) DiffAt(ctx context.Context, workspaceID, repoPath string, stag
 		}
 	} else {
 		// 未指定路径时显式排除敏感密钥与凭证文件，防止 git.diff 泄露已跟踪或暂存的密钥
-		args = append(args, "--", ".",
-			":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*",
-			":(exclude,glob)**/.ssh/**", ":(exclude,glob)**/.gnupg/**",
-			":(exclude,glob)**/.aws/**", ":(exclude,glob)**/.kube/**",
-			":(exclude,glob)**/*.pem", ":(exclude,glob)**/*.key",
-			":(exclude,glob)**/*.ppk", ":(exclude,glob)**/*.p12",
-			":(exclude,glob)**/*.pfx", ":(exclude,glob)**/*.kdbx",
-			":(exclude,glob)**/id_rsa*", ":(exclude,glob)**/id_ed25519*",
-			":(exclude,glob)**/id_ecdsa*", ":(exclude,glob)**/id_dsa*",
-			":(exclude,glob)**/authorized_keys", ":(exclude,glob)**/nodebridge.yaml",
-		)
+		args = append(args, "--", ".")
+		args = append(args, gitSensitiveExcludePathspecs...)
 	}
 
 	stdout, stderr, err := a.runGit(ctx, resolvedRepo.AbsPath, nil, args...)
@@ -195,9 +266,162 @@ func (a *Adapter) DiffAt(ctx context.Context, workspaceID, repoPath string, stag
 		Source:      "git_output",
 		WorkspaceID: workspaceID,
 		Staged:      staged,
+		Base:        baseRef,
+		Target:      targetRef,
 		Truncated:   truncated,
 		Diff:        stdout,
 	}, nil
+}
+
+// LogAt 查看指定 Git 仓库目录的提交历史（支持 ref 与安全校验后的单文件/目录路径过滤）。
+func (a *Adapter) LogAt(ctx context.Context, workspaceID, repoPath, ref, filePath string, limit int) (*LogResult, error) {
+	resolvedRepo, err := a.fsMgr.Resolve(workspaceID, repoPath, false)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = defaultLogLimit
+	}
+	if limit > maxLogLimit {
+		limit = maxLogLimit
+	}
+	ref = strings.TrimSpace(ref)
+	if ref != "" {
+		if err := validateGitRef(ref); err != nil {
+			return nil, fmt.Errorf("无效的 ref 参数: %w", err)
+		}
+	}
+
+	args := []string{
+		"log",
+		fmt.Sprintf("-n%d", limit),
+		"--format=%H%x1f%h%x1f%an%x1f%aI%x1f%s%x1e",
+	}
+	if ref != "" {
+		args = append(args, ref)
+	}
+	if strings.TrimSpace(filePath) != "" {
+		target := filePath
+		if strings.TrimSpace(repoPath) != "" && !filepath.IsAbs(filePath) {
+			target = filepath.Join(resolvedRepo.AbsPath, filepath.FromSlash(filePath))
+		}
+		resolvedTarget, rErr := a.fsMgr.Resolve(workspaceID, target, false)
+		if rErr != nil {
+			return nil, rErr
+		}
+		gitRel := resolvedTarget.RelPath
+		if rel, relErr := filepath.Rel(resolvedRepo.AbsPath, resolvedTarget.AbsPath); relErr == nil {
+			gitRel = filepath.ToSlash(rel)
+		}
+		args = append(args, "--", gitRel)
+	}
+
+	stdout, stderr, err := a.runGit(ctx, resolvedRepo.AbsPath, nil, args...)
+	if err != nil {
+		return nil, fmt.Errorf("git log 失败: %v (%s)", err, strings.TrimSpace(stderr))
+	}
+
+	commits := make([]LogCommit, 0)
+	for _, rec := range strings.Split(stdout, "\x1e") {
+		rec = strings.TrimSpace(rec)
+		if rec == "" {
+			continue
+		}
+		fields := strings.Split(rec, "\x1f")
+		if len(fields) < 5 {
+			continue
+		}
+		commits = append(commits, LogCommit{
+			Hash:      strings.TrimSpace(fields[0]),
+			ShortHash: strings.TrimSpace(fields[1]),
+			Author:    strings.TrimSpace(fields[2]),
+			Date:      strings.TrimSpace(fields[3]),
+			Subject:   audit.RedactPrivateSecrets(strings.TrimSpace(fields[4])),
+		})
+	}
+
+	return &LogResult{
+		Source:      "git_output",
+		WorkspaceID: workspaceID,
+		Ref:         ref,
+		Commits:     commits,
+	}, nil
+}
+
+// ShowAt 查看指定提交的元数据与差异（强制排除敏感密钥路径并执行输出脱敏）。
+func (a *Adapter) ShowAt(ctx context.Context, workspaceID, repoPath, ref string, statOnly bool, maxBytes int) (*ShowResult, error) {
+	resolvedRepo, err := a.fsMgr.Resolve(workspaceID, repoPath, false)
+	if err != nil {
+		return nil, err
+	}
+	if maxBytes <= 0 || maxBytes > 2*1024*1024 {
+		maxBytes = defaultMaxDiff
+	}
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		ref = "HEAD"
+	}
+	if err := validateGitRef(ref); err != nil {
+		return nil, fmt.Errorf("无效的 ref 参数: %w", err)
+	}
+
+	// 1. 提取提交元数据
+	metaOut, metaErr, err := a.runGit(ctx, resolvedRepo.AbsPath, nil,
+		"show", "--no-patch", "--format=%H%x1f%h%x1f%an%x1f%aI%x1f%s%x1f%b", ref)
+	if err != nil {
+		return nil, fmt.Errorf("git show 读取提交元数据失败: %v (%s)", err, strings.TrimSpace(metaErr))
+	}
+	fields := strings.Split(metaOut, "\x1f")
+	res := &ShowResult{
+		Source:      "git_output",
+		WorkspaceID: workspaceID,
+		Ref:         ref,
+		StatOnly:    statOnly,
+	}
+	if len(fields) >= 6 {
+		res.Hash = strings.TrimSpace(fields[0])
+		res.ShortHash = strings.TrimSpace(fields[1])
+		res.Author = strings.TrimSpace(fields[2])
+		res.Date = strings.TrimSpace(fields[3])
+		res.Subject = audit.RedactPrivateSecrets(strings.TrimSpace(fields[4]))
+		res.Body = audit.RedactPrivateSecrets(strings.TrimSpace(fields[5]))
+	}
+
+	// 2. 提取提交差异（强制排除敏感密钥/凭证路径）
+	diffArgs := []string{"show", "--no-ext-diff", "--format="}
+	if statOnly {
+		diffArgs = append(diffArgs, "--stat")
+	}
+	diffArgs = append(diffArgs, ref, "--", ".")
+	diffArgs = append(diffArgs, gitSensitiveExcludePathspecs...)
+
+	diffOut, diffErr, err := a.runGit(ctx, resolvedRepo.AbsPath, nil, diffArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("git show 读取提交差异失败: %v (%s)", err, strings.TrimSpace(diffErr))
+	}
+	diffOut = audit.RedactPrivateSecrets(diffOut)
+	if len(diffOut) > maxBytes {
+		diffOut = diffOut[:maxBytes] + "\n...(diff truncated)"
+		res.Truncated = true
+	}
+	res.Diff = diffOut
+	return res, nil
+}
+
+// validateGitRef 拦截以 '-' 开头或含空白/控制字符的非法 Git 引用，防止参数注入。
+func validateGitRef(ref string) error {
+	if ref == "" {
+		return errors.New("ref 不能为空")
+	}
+	if strings.HasPrefix(ref, "-") {
+		return fmt.Errorf("ref 不能以 '-' 开头: %q", ref)
+	}
+	for _, r := range ref {
+		if r <= 0x20 || r == 0x7f {
+			return fmt.Errorf("ref 包含非法空白或控制字符: %q", ref)
+		}
+	}
+	return nil
 }
 
 // ValidatePatch 在人工审批前解析补丁涉及的全部文件路径并进行目录/敏感文件安全校验与 `git apply --check` 预检。

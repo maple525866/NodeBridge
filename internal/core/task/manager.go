@@ -3,6 +3,7 @@ package task
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -68,6 +69,8 @@ type PollResult struct {
 	StderrNextOff   int    `json:"stderr_next_offset"`
 	StdoutTruncated bool   `json:"stdout_truncated"`
 	StderrTruncated bool   `json:"stderr_truncated"`
+	StdoutTail      string `json:"stdout_tail,omitempty"`
+	StderrTail      string `json:"stderr_tail,omitempty"`
 	ElapsedMs       int64  `json:"elapsed_ms"`
 }
 
@@ -79,35 +82,50 @@ var (
 	reBase64Line = regexp.MustCompile(`^[A-Za-z0-9+/=_,:.\s\-]+$`)
 )
 
-const maxPrivateKeyBlockLines = 256
+const (
+	maxPrivateKeyBlockLines = 256
+	defaultTailBytes        = 64 * 1024 // 超长日志截断时额外保留末尾 64KB 已脱敏输出
+)
 
-// cappedBuffer 为单任务提供线程安全、带容量上限、单调递增流式私钥脱敏与增量偏移读取的输出缓冲区。
-// 通过行缓冲 + 私钥块状态机，在写入端单调追加至 buf，彻底避免分片明文泄露、偏移收缩丢数据、UTF-8 截断与 O(N^2) 重复扫描。
+// cappedBuffer 为单任务提供线程安全、带容量上限、单调递增流式私钥脱敏、增量偏移读取与截断尾部保留的输出缓冲区。
+// 通过行缓冲 + 私钥块状态机，在写入端单调追加至 buf，彻底避免分片明文泄露、偏移收缩丢数据、UTF-8 截断与 O(N^2) 重复扫描；
+// 当输出超过 maxBytes 发生截断后，同步维护独立的已脱敏尾部窗口 tail，确保编译/测试末尾报错始终可见。
 type cappedBuffer struct {
 	mu                sync.Mutex
 	maxBytes          int
+	tailMaxBytes      int
 	buf               []byte // 已脱敏确认安全且单调只增的输出缓冲区
+	tail              []byte // 触发截断后持续保留的最新尾部已脱敏输出
 	pending           []byte // 当前尚未收到换行符的行尾待定缓冲
 	truncated         bool
 	inPEMKeyBlock     bool
 	inPuTTYKeyBlock   bool
 	keyBlockLineCount int
+	onChange          func()
 }
 
-func newCappedBuffer(maxBytes int) *cappedBuffer {
+func newCappedBuffer(maxBytes int, onChange func()) *cappedBuffer {
 	if maxBytes <= 0 {
 		maxBytes = 1024 * 1024
 	}
-	return &cappedBuffer{maxBytes: maxBytes}
+	tailMax := defaultTailBytes
+	if maxBytes < tailMax {
+		tailMax = maxBytes
+	}
+	return &cappedBuffer{
+		maxBytes:     maxBytes,
+		tailMaxBytes: tailMax,
+		onChange:     onChange,
+	}
 }
 
 func (b *cappedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	if len(p) == 0 {
 		return 0, nil
 	}
+	b.mu.Lock()
+	prevLen := len(b.buf)
+	prevTrunc := b.truncated
 	b.pending = append(b.pending, p...)
 	for {
 		idx := bytes.IndexByte(b.pending, '\n')
@@ -132,19 +150,30 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 			b.processLineLocked(chunk)
 		}
 	}
+	changed := len(b.buf) != prevLen || b.truncated != prevTrunc
+	cb := b.onChange
+	b.mu.Unlock()
+	if changed && cb != nil {
+		cb()
+	}
 	return len(p), nil
 }
 
 // Flush 在任务结束时冲刷最后一行无换行符的残余输出（确保经过完整脱敏）。
 func (b *cappedBuffer) Flush() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if len(b.pending) == 0 {
+		b.mu.Unlock()
 		return
 	}
 	line := string(b.pending)
 	b.pending = nil
 	b.processLineLocked(line)
+	cb := b.onChange
+	b.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
 }
 
 func (b *cappedBuffer) processLineLocked(line string) {
@@ -225,7 +254,8 @@ func (b *cappedBuffer) appendSanitizedLocked(s string) {
 	}
 	rem := b.maxBytes - len(b.buf)
 	if rem <= 0 {
-		b.truncated = true
+		b.enterTruncatedTailLocked()
+		b.appendTailLocked(s)
 		return
 	}
 	if len(s) > rem {
@@ -235,10 +265,48 @@ func (b *cappedBuffer) appendSanitizedLocked(s string) {
 			cut--
 		}
 		b.buf = append(b.buf, s[:cut]...)
-		b.truncated = true
+		b.enterTruncatedTailLocked()
+		b.appendTailLocked(s[cut:])
 		return
 	}
 	b.buf = append(b.buf, s...)
+}
+
+func (b *cappedBuffer) enterTruncatedTailLocked() {
+	if b.truncated {
+		return
+	}
+	b.truncated = true
+	if b.tailMaxBytes <= 0 || len(b.buf) == 0 {
+		return
+	}
+	start := 0
+	if len(b.buf) > b.tailMaxBytes {
+		start = len(b.buf) - b.tailMaxBytes
+		for start < len(b.buf) && !utf8.RuneStart(b.buf[start]) {
+			start++
+		}
+	}
+	b.tail = append(b.tail[:0], b.buf[start:]...)
+}
+
+func (b *cappedBuffer) appendTailLocked(s string) {
+	if s == "" || b.tailMaxBytes <= 0 {
+		return
+	}
+	b.tail = append(b.tail, s...)
+	if len(b.tail) > b.tailMaxBytes {
+		start := len(b.tail) - b.tailMaxBytes
+		for start < len(b.tail) && !utf8.RuneStart(b.tail[start]) {
+			start++
+		}
+		if start > 0 && start < len(b.tail) {
+			copy(b.tail, b.tail[start:])
+			b.tail = b.tail[:len(b.tail)-start]
+		} else if start >= len(b.tail) {
+			b.tail = b.tail[:0]
+		}
+	}
 }
 
 func (b *cappedBuffer) ReadFrom(offset int) (chunk string, nextOffset int, truncated bool) {
@@ -254,6 +322,16 @@ func (b *cappedBuffer) ReadFrom(offset int) (chunk string, nextOffset int, trunc
 	return string(b.buf[offset:]), len(b.buf), b.truncated
 }
 
+// Tail 返回截断发生后保留的末尾已脱敏输出；未发生截断时返回空字符串。
+func (b *cappedBuffer) Tail() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.truncated || len(b.tail) == 0 {
+		return ""
+	}
+	return string(b.tail)
+}
+
 func (b *cappedBuffer) Truncated() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -263,10 +341,14 @@ func (b *cappedBuffer) Truncated() bool {
 func (b *cappedBuffer) Summary(maxChars int) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if len(b.buf) == 0 {
+	src := b.buf
+	if b.truncated && len(b.tail) > 0 {
+		src = b.tail
+	}
+	if len(src) == 0 {
 		return ""
 	}
-	s := string(b.buf)
+	s := string(src)
 	if len(s) > maxChars {
 		start := len(s) - maxChars
 		for start < len(s) && !utf8.RuneStart(s[start]) {
@@ -278,17 +360,37 @@ func (b *cappedBuffer) Summary(maxChars int) string {
 }
 
 type managedTask struct {
-	mu            sync.Mutex
-	record        store.TaskRecord
-	stdout        *cappedBuffer
-	stderr        *cappedBuffer
-	handle        process.Handle
-	cancelSignal  chan struct{}
-	cancelOnce    sync.Once
-	cancelReason  string
-	timedOut      bool
-	timeout       time.Duration
-	spec          process.Spec
+	mu           sync.Mutex
+	record       store.TaskRecord
+	stdout       *cappedBuffer
+	stderr       *cappedBuffer
+	handle       process.Handle
+	cancelSignal chan struct{}
+	cancelOnce   sync.Once
+	cancelReason string
+	timedOut     bool
+	timeout      time.Duration
+	spec         process.Spec
+	updateCh     chan struct{}
+}
+
+func (mt *managedTask) broadcastUpdate() {
+	mt.mu.Lock()
+	if mt.updateCh != nil {
+		close(mt.updateCh)
+		mt.updateCh = make(chan struct{})
+	}
+	mt.mu.Unlock()
+}
+
+func (mt *managedTask) watchCh() <-chan struct{} {
+	mt.mu.Lock()
+	if mt.updateCh == nil {
+		mt.updateCh = make(chan struct{})
+	}
+	ch := mt.updateCh
+	mt.mu.Unlock()
+	return ch
 }
 
 // Manager 负责管理所有异步终端任务的生命周期、并发配额、急停清理与持久化快照。
@@ -353,9 +455,10 @@ func NewManager(taskStore store.TaskStore, opts Options) (*Manager, error) {
 				dirty = true
 			}
 			mt := &managedTask{
-				record: rec,
-				stdout: newCappedBuffer(opts.MaxOutputBytes),
-				stderr: newCappedBuffer(opts.MaxOutputBytes),
+				record:   rec,
+				stdout:   newCappedBuffer(opts.MaxOutputBytes, nil),
+				stderr:   newCappedBuffer(opts.MaxOutputBytes, nil),
+				updateCh: make(chan struct{}),
 			}
 			m.tasks[rec.ID] = mt
 			m.order = append(m.order, rec.ID)
@@ -379,8 +482,6 @@ func (m *Manager) Start(req StartRequest) (store.TaskRecord, error) {
 	}
 
 	id := newTaskID()
-	stdoutBuf := newCappedBuffer(m.maxOutputBytes)
-	stderrBuf := newCappedBuffer(m.maxOutputBytes)
 
 	rec := store.TaskRecord{
 		ID:          id,
@@ -396,19 +497,22 @@ func (m *Manager) Start(req StartRequest) (store.TaskRecord, error) {
 
 	mt := &managedTask{
 		record:       rec,
-		stdout:       stdoutBuf,
-		stderr:       stderrBuf,
 		cancelSignal: make(chan struct{}),
 		timeout:      timeout,
-		spec: process.Spec{
-			Executable: req.Executable,
-			Args:       append([]string(nil), req.Args...),
-			Cwd:        req.Cwd,
-			EnvAllow:   append([]string(nil), req.EnvAllow...),
-			UseShell:   req.UseShell,
-			Stdout:     stdoutBuf,
-			Stderr:     stderrBuf,
-		},
+		updateCh:     make(chan struct{}),
+	}
+	stdoutBuf := newCappedBuffer(m.maxOutputBytes, mt.broadcastUpdate)
+	stderrBuf := newCappedBuffer(m.maxOutputBytes, mt.broadcastUpdate)
+	mt.stdout = stdoutBuf
+	mt.stderr = stderrBuf
+	mt.spec = process.Spec{
+		Executable: req.Executable,
+		Args:       append([]string(nil), req.Args...),
+		Cwd:        req.Cwd,
+		EnvAllow:   append([]string(nil), req.EnvAllow...),
+		UseShell:   req.UseShell,
+		Stdout:     stdoutBuf,
+		Stderr:     stderrBuf,
 	}
 
 	m.mu.Lock()
@@ -456,6 +560,7 @@ func (m *Manager) runTask(mt *managedTask) {
 
 	_ = m.persist()
 	m.notify(snap)
+	mt.broadcastUpdate()
 
 	doneCh := make(chan struct{})
 	var exitCode int
@@ -517,6 +622,7 @@ func (m *Manager) finishTask(mt *managedTask, st Status, exitCode *int, errMsg s
 
 	_ = m.persist()
 	m.notify(snap)
+	mt.broadcastUpdate()
 }
 
 func (mt *managedTask) getCancelReason(fallback string) string {
@@ -566,8 +672,80 @@ func (m *Manager) Poll(taskID string, stdoutOffset, stderrOffset int) (*PollResu
 		StderrNextOff:   errNext,
 		StdoutTruncated: outTrunc,
 		StderrTruncated: errTrunc,
+		StdoutTail:      mt.stdout.Tail(),
+		StderrTail:      mt.stderr.Tail(),
 		ElapsedMs:       elapsed,
 	}, nil
+}
+
+// PollWait 带长轮询等待地查询任务增量输出：若 waitDur > 0 且当前尚无新输出且任务未结束，
+// 则阻塞等待直到出现新输出、任务进入终态、超时或上下文取消。
+func (m *Manager) PollWait(ctx context.Context, taskID string, stdoutOffset, stderrOffset int, waitDur time.Duration) (*PollResult, error) {
+	if waitDur <= 0 {
+		return m.Poll(taskID, stdoutOffset, stderrOffset)
+	}
+	m.mu.RLock()
+	mt, ok := m.tasks[taskID]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("任务 %q 不存在", taskID)
+	}
+
+	timer := time.NewTimer(waitDur)
+	defer timer.Stop()
+
+	for {
+		watch := mt.watchCh()
+		res, err := m.Poll(taskID, stdoutOffset, stderrOffset)
+		if err != nil {
+			return nil, err
+		}
+		if res.Status.IsTerminal() || len(res.StdoutChunk) > 0 || len(res.StderrChunk) > 0 {
+			return res, nil
+		}
+		select {
+		case <-watch:
+		case <-timer.C:
+			return m.Poll(taskID, stdoutOffset, stderrOffset)
+		case <-ctx.Done():
+			return m.Poll(taskID, stdoutOffset, stderrOffset)
+		}
+	}
+}
+
+// WaitUntilTerminal 等待指定任务进入终态，或到达 waitDur / ctx 取消时返回当前完整快照。
+// 主要供 terminal.start 的短等待直出模式使用。
+func (m *Manager) WaitUntilTerminal(ctx context.Context, taskID string, waitDur time.Duration) (*PollResult, error) {
+	if waitDur <= 0 {
+		return m.Poll(taskID, 0, 0)
+	}
+	m.mu.RLock()
+	mt, ok := m.tasks[taskID]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("任务 %q 不存在", taskID)
+	}
+
+	timer := time.NewTimer(waitDur)
+	defer timer.Stop()
+
+	for {
+		watch := mt.watchCh()
+		res, err := m.Poll(taskID, 0, 0)
+		if err != nil {
+			return nil, err
+		}
+		if res.Status.IsTerminal() {
+			return res, nil
+		}
+		select {
+		case <-watch:
+		case <-timer.C:
+			return m.Poll(taskID, 0, 0)
+		case <-ctx.Done():
+			return m.Poll(taskID, 0, 0)
+		}
+	}
 }
 
 // Cancel 取消指定任务（若正在运行则强杀整个进程树）。
