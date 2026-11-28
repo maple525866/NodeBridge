@@ -192,9 +192,17 @@ type OAuthConfig struct {
 	AccessTokenTTLSeconds    int      `yaml:"access_token_ttl_seconds"`
 	RefreshTokenTTLSeconds   int      `yaml:"refresh_token_ttl_seconds"`
 	PairingCodeTTLSeconds    int      `yaml:"pairing_code_ttl_seconds"`
-	AllowDynamicRegistration bool     `yaml:"allow_dynamic_registration"`
+	AllowDynamicRegistration *bool    `yaml:"allow_dynamic_registration,omitempty"`
 	AllowedRedirectURIs      []string `yaml:"allowed_redirect_uris,omitempty"`
 	RateLimitPerMinute       int      `yaml:"rate_limit_per_minute"`
+}
+
+// DynamicRegistrationEnabled 保留旧配置省略此项时的行为：启用 OAuth 且没有回调白名单时开放注册。
+func (c OAuthConfig) DynamicRegistrationEnabled() bool {
+	if c.AllowDynamicRegistration == nil {
+		return c.Enabled && len(c.AllowedRedirectURIs) == 0
+	}
+	return *c.AllowDynamicRegistration
 }
 
 // HardSecretDenyGlobs 返回内核级强制生效的敏感密钥目录与私钥/凭证文件保护规则。
@@ -294,6 +302,7 @@ func DefaultConfig(workspaceRoot string) (*Config, error) {
 		return nil, fmt.Errorf("解析默认工作区路径失败: %w", err)
 	}
 
+	allowDynamicRegistration := true
 	return &Config{
 		Server: ServerConfig{
 			MCPListen:   "127.0.0.1:18765",
@@ -363,7 +372,7 @@ func DefaultConfig(workspaceRoot string) (*Config, error) {
 			AccessTokenTTLSeconds:    3600,
 			RefreshTokenTTLSeconds:   604800,
 			PairingCodeTTLSeconds:    300,
-			AllowDynamicRegistration: true,
+			AllowDynamicRegistration: &allowDynamicRegistration,
 			RateLimitPerMinute:       20,
 		},
 	}, nil
@@ -463,10 +472,6 @@ func (c *Config) ApplyDefaults(baseDir string) {
 	}
 	if c.OAuth.RateLimitPerMinute <= 0 {
 		c.OAuth.RateLimitPerMinute = 20
-	}
-	if c.OAuth.Enabled && !c.OAuth.AllowDynamicRegistration && len(c.OAuth.AllowedRedirectURIs) == 0 {
-		// 兼容旧配置文件未显式设置 allow_dynamic_registration 时的默认开启
-		c.OAuth.AllowDynamicRegistration = true
 	}
 	if c.Tasks.MaxConcurrent <= 0 {
 		c.Tasks.MaxConcurrent = 4

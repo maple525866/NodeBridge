@@ -105,6 +105,7 @@ type pendingItem struct {
 	execOnce          sync.Once
 	execDone          chan struct{}
 	execCloseOnce     sync.Once
+	execFinishedAt    time.Time
 }
 
 func (p *pendingItem) closeDecision() {
@@ -130,6 +131,7 @@ type Broker struct {
 	timeout         time.Duration // 0 表示本地直连无限等待
 	maxGrantMinutes int
 	remoteWait      time.Duration // 远程短等待窗口（超时转为异步续接）
+	progressPeriod  time.Duration // 远程同步等待期间的进度通知间隔
 	pendingTTL      time.Duration // 远程异步续接审批单最大存活时间
 	idempotencyTTL  time.Duration // 远程请求指纹幂等去重窗口
 	fullPermissions bool          // 全部权限模式：免除所有操作人工审批，直接自动放行
@@ -157,6 +159,7 @@ func NewBroker(timeoutSeconds, maxGrantMinutes int, killHook func(reason string)
 		timeout:         timeout,
 		maxGrantMinutes: maxGrantMinutes,
 		remoteWait:      45 * time.Second,
+		progressPeriod:  10 * time.Second,
 		pendingTTL:      15 * time.Minute,
 		idempotencyTTL:  5 * time.Minute,
 		pending:         make(map[string]*pendingItem),
@@ -355,7 +358,7 @@ func (b *Broker) ExecuteWithApproval(
 	ctx context.Context,
 	req Request,
 	execFn func() (any, error),
-	progressFn func(elapsed time.Duration),
+	progressFn func(context.Context, time.Duration),
 ) (ExecutionOutcome, error) {
 	// 本地调用完全沿用阶段一无限等待模型
 	if !req.IsRemote {
@@ -388,38 +391,9 @@ func (b *Broker) ExecuteWithApproval(
 
 	// 2. 指纹幂等去重：防云端超时重发造成重复弹窗或重复执行
 	if req.Fingerprint != "" {
-		if entry, ok := b.fingerprints[req.Fingerprint]; ok && now.Before(entry.expiresAt) {
+		if entry, ok := b.fingerprints[req.Fingerprint]; ok {
 			if existing, exists := b.records[entry.approvalID]; exists {
-				switch existing.req.Status {
-				case StatusPending:
-					// 审批单仍在等待中：复用同一审批单继续短等待，不创建新弹窗
-					waitDur := b.remoteWait
-					b.mu.Unlock()
-					return b.waitRemoteItem(ctx, existing, waitDur, true, progressFn)
-				case StatusApproved:
-					// 已批准：若执行结束直接返缓存；若正在执行则等待完成
-					execStatus := existing.req.ExecStatus
-					execRes := existing.req.ExecResult
-					execErrStr := existing.req.ExecError
-					dec := existing.decision
-					dec.DecisionTag = "IDEMPOTENT_REPLAY"
-					if execStatus == "SUCCEEDED" {
-						b.mu.Unlock()
-						return ExecutionOutcome{
-							ReusedIdempotent: true,
-							ApprovalID:       existing.req.ID,
-							Decision:         dec,
-							Result:           execRes,
-						}, nil
-					}
-					if execStatus == "FAILED" {
-						b.mu.Unlock()
-						return ExecutionOutcome{
-							ReusedIdempotent: true,
-							ApprovalID:       existing.req.ID,
-							Decision:         dec,
-						}, errors.New(execErrStr)
-					}
+				if existing.req.Status == StatusPending || existing.req.Status == StatusApproved {
 					waitDur := b.remoteWait
 					b.mu.Unlock()
 					return b.waitRemoteItem(ctx, existing, waitDur, true, progressFn)
@@ -459,17 +433,10 @@ func (b *Broker) ExecuteWithApproval(
 				expiresAt:  now.Add(b.idempotencyTTL),
 			}
 		}
+		waitDur := b.remoteWait
 		b.mu.Unlock()
-
-		b.runExecOnce(item)
-		b.mu.Lock()
-		res := item.req.ExecResult
-		errStr := item.req.ExecError
-		b.mu.Unlock()
-		if errStr != "" {
-			return ExecutionOutcome{ApprovalID: req.ID, Decision: dec}, errors.New(errStr)
-		}
-		return ExecutionOutcome{ApprovalID: req.ID, Decision: dec, Result: res}, nil
+		go b.runExecOnce(item)
+		return b.waitRemoteItem(ctx, item, waitDur, false, progressFn)
 	}
 
 	// 3. 检查 L1 工作区限时批量授权（命中后同样写入幂等缓存防重复写入）
@@ -505,17 +472,10 @@ func (b *Broker) ExecuteWithApproval(
 						expiresAt:  now.Add(b.idempotencyTTL),
 					}
 				}
+				waitDur := b.remoteWait
 				b.mu.Unlock()
-
-				b.runExecOnce(item)
-				b.mu.Lock()
-				res := item.req.ExecResult
-				errStr := item.req.ExecError
-				b.mu.Unlock()
-				if errStr != "" {
-					return ExecutionOutcome{ApprovalID: req.ID, Decision: dec}, errors.New(errStr)
-				}
-				return ExecutionOutcome{ApprovalID: req.ID, Decision: dec, Result: res}, nil
+				go b.runExecOnce(item)
+				return b.waitRemoteItem(ctx, item, waitDur, false, progressFn)
 			}
 			delete(b.grants, req.WorkspaceID)
 		}
@@ -555,122 +515,83 @@ func (b *Broker) waitRemoteItem(
 	item *pendingItem,
 	waitDur time.Duration,
 	reused bool,
-	progressFn func(elapsed time.Duration),
+	progressFn func(context.Context, time.Duration),
 ) (ExecutionOutcome, error) {
 	if waitDur <= 0 {
 		waitDur = 45 * time.Second
 	}
 	start := time.Now()
-	timer := time.NewTimer(waitDur)
-	defer timer.Stop()
-
-	var ticker *time.Ticker
-	var tickC <-chan time.Time
+	waitCtx, cancel := context.WithTimeout(ctx, waitDur)
+	defer cancel()
 	if progressFn != nil {
-		ticker = time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		tickC = ticker.C
-	}
-
-	// 阶段 A：等待人工审批结论（或短窗口到期）
-	for {
-		select {
-		case <-item.decisionDone:
-			b.mu.Lock()
-			dec := item.decision
-			approved := dec.Approved
-			id := item.req.ID
-			b.mu.Unlock()
-			if !approved {
-				return ExecutionOutcome{
-					ReusedIdempotent: reused,
-					ApprovalID:       id,
-					Decision:         dec,
-				}, fmt.Errorf("用户拒绝操作 (%s): %s", id, dec.Note)
+		// 单独串行发送保活；传输阻塞不会占用等待审批或执行结果的协程。
+		go func() {
+			ticker := time.NewTicker(b.progressPeriod)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-waitCtx.Done():
+					return
+				case <-ticker.C:
+					if waitCtx.Err() != nil {
+						return
+					}
+					progressFn(waitCtx, time.Since(start))
+				}
 			}
-			// 审批通过：等待后台闭包执行完成（若短窗口已逼近，最多再宽限等待结果）
-			goto waitExec
-		case <-tickC:
-			progressFn(time.Since(start))
-		case <-timer.C:
-			// 短窗口超时：保留审批单继续等待用户在本地控制台点击确认，不销毁！
-			b.mu.Lock()
-			id := item.req.ID
-			b.mu.Unlock()
-			return ExecutionOutcome{
-				Pending:          true,
-				ReusedIdempotent: reused,
-				ApprovalID:       id,
-				Decision: Decision{
-					Approved:    false,
-					ApprovalID:  id,
-					DecisionTag: "APPROVAL_PENDING",
-					Note:        "等待用户在本地 NodeBridge 控制台确认",
-				},
-			}, nil
-		case <-ctx.Done():
-			// 云端 HTTP 连接提前断开：同样不销毁远程审批单，允许用户稍后批准并用 approval.status 续接！
-			b.mu.Lock()
-			id := item.req.ID
-			b.mu.Unlock()
-			return ExecutionOutcome{
-				Pending:          true,
-				ReusedIdempotent: reused,
-				ApprovalID:       id,
-				Decision: Decision{
-					Approved:    false,
-					ApprovalID:  id,
-					DecisionTag: "APPROVAL_PENDING",
-					Note:        "远程连接中断，审批单已保留在本地控制台等待确认",
-				},
-			}, ctx.Err()
-		}
+		}()
 	}
 
-waitExec:
+	// execDone 在拒绝、取消或执行结束时关闭。审批与后台执行共用本次调用的短窗口。
+	var waitErr error
 	select {
 	case <-item.execDone:
-		b.mu.Lock()
-		res := item.req.ExecResult
-		errStr := item.req.ExecError
-		dec := item.decision
-		id := item.req.ID
-		b.mu.Unlock()
-		if reused {
-			dec.DecisionTag = "IDEMPOTENT_REPLAY"
-		}
-		if errStr != "" {
-			return ExecutionOutcome{
-				ReusedIdempotent: reused,
-				ApprovalID:       id,
-				Decision:         dec,
-			}, errors.New(errStr)
-		}
-		return ExecutionOutcome{
-			ReusedIdempotent: reused,
-			ApprovalID:       id,
-			Decision:         dec,
-			Result:           res,
-		}, nil
-	case <-ctx.Done():
-		b.mu.Lock()
-		id := item.req.ID
-		dec := item.decision
-		b.mu.Unlock()
-		return ExecutionOutcome{
-			Pending:    true,
-			ApprovalID: id,
-			Decision:   dec,
-		}, ctx.Err()
+	case <-waitCtx.Done():
+		waitErr = ctx.Err()
 	}
+
+	// 同时收到超时与状态变更时，以锁内的最新状态为准。
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return item.outcomeLocked(reused, waitErr)
+}
+
+// outcomeLocked 在 Broker 锁内读取审批结论与执行结果的一致快照。
+func (item *pendingItem) outcomeLocked(reused bool, waitErr error) (ExecutionOutcome, error) {
+	out := ExecutionOutcome{
+		ReusedIdempotent: reused,
+		ApprovalID:       item.req.ID,
+		Decision:         item.decision,
+	}
+	switch item.req.Status {
+	case StatusPending:
+		note := "等待用户在本地 NodeBridge 控制台确认"
+		if waitErr != nil {
+			note = "远程连接中断，审批单已保留在本地控制台等待确认"
+		}
+		out.Decision = Decision{ApprovalID: out.ApprovalID, DecisionTag: "APPROVAL_PENDING", Note: note}
+	case StatusApproved:
+		switch item.req.ExecStatus {
+		case "SUCCEEDED", "FAILED":
+			if reused {
+				out.Decision.DecisionTag = "IDEMPOTENT_REPLAY"
+			}
+			if item.req.ExecStatus == "FAILED" {
+				return out, errors.New(item.req.ExecError)
+			}
+			out.Result = item.req.ExecResult
+			return out, nil
+		}
+	default:
+		return out, fmt.Errorf("用户拒绝操作 (%s): %s", out.ApprovalID, out.Decision.Note)
+	}
+	out.Pending = true
+	return out, waitErr
 }
 
 func (b *Broker) runExecOnce(item *pendingItem) {
 	item.execOnce.Do(func() {
 		defer item.closeExec()
-		if item.execFn == nil {
-			return
-		}
 		b.mu.Lock()
 		// 二次检查急停状态：防止批准/开启全权限后异步启动瞬间用户触发 Pause/KillAll 导致竞态执行
 		if b.pauseState.Paused {
@@ -680,6 +601,7 @@ func (b *Broker) runExecOnce(item *pendingItem) {
 			}
 			item.req.ExecStatus = "FAILED"
 			item.req.ExecError = "系统处于急停暂停状态，取消后台执行：" + reason
+			item.execFinishedAt = time.Now().UTC()
 			snapshot := item.req
 			b.broadcastLocked(Event{Type: "approval_resolved", Payload: snapshot})
 			b.mu.Unlock()
@@ -688,9 +610,14 @@ func (b *Broker) runExecOnce(item *pendingItem) {
 		item.req.ExecStatus = "RUNNING"
 		b.mu.Unlock()
 
-		res, err := item.execFn()
+		var res any
+		var err error
+		if item.execFn != nil {
+			res, err = item.execFn()
+		}
 
 		b.mu.Lock()
+		item.execFinishedAt = time.Now().UTC()
 		if err != nil {
 			item.req.ExecStatus = "FAILED"
 			item.req.ExecError = err.Error()
@@ -716,33 +643,26 @@ func (b *Broker) GetRecord(id string) (Request, bool) {
 	return item.req, true
 }
 
-// LookupIdempotent 只读查询指定请求指纹是否已命中近期成功执行的幂等缓存（绝不创建新审批单）。
-func (b *Broker) LookupIdempotent(fingerprint string) (ExecutionOutcome, bool) {
-	fingerprint = strings.TrimSpace(fingerprint)
-	if fingerprint == "" {
-		return ExecutionOutcome{}, false
-	}
-	now := time.Now().UTC()
+// LookupIdempotent 返回匹配审批单的当前结果，不创建审批单或触发执行。
+func (b *Broker) LookupIdempotent(fingerprint string) (ExecutionOutcome, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.expireStaleLocked(now)
+	b.expireStaleLocked(time.Now().UTC())
 
 	entry, ok := b.fingerprints[fingerprint]
-	if !ok || !now.Before(entry.expiresAt) {
-		return ExecutionOutcome{}, false
+	if !ok {
+		return ExecutionOutcome{}, false, nil
 	}
 	existing, exists := b.records[entry.approvalID]
-	if !exists || existing.req.Status != StatusApproved || existing.req.ExecStatus != "SUCCEEDED" {
-		return ExecutionOutcome{}, false
+	if !exists {
+		return ExecutionOutcome{}, false, nil
 	}
-	dec := existing.decision
-	dec.DecisionTag = "IDEMPOTENT_REPLAY"
-	return ExecutionOutcome{
-		ReusedIdempotent: true,
-		ApprovalID:       existing.req.ID,
-		Decision:         dec,
-		Result:           existing.req.ExecResult,
-	}, true
+	if b.pauseState.Paused {
+		dec := Decision{DecisionTag: "PAUSED", Note: b.pauseState.Reason}
+		return ExecutionOutcome{Decision: dec}, true, fmt.Errorf("操作被拦截：%s", dec.Note)
+	}
+	out, err := existing.outcomeLocked(true, nil)
+	return out, true, err
 }
 
 // Resolve 由 Web 控制台或 CLI 调用，完成指定审批单的批准或拒绝。
@@ -941,7 +861,11 @@ func (b *Broker) Subscribe() (<-chan Event, func()) {
 
 func (b *Broker) expireStaleLocked(now time.Time) {
 	for fp, entry := range b.fingerprints {
-		if now.After(entry.expiresAt) {
+		if !now.Before(entry.expiresAt) {
+			item := b.records[entry.approvalID]
+			if item != nil && (item.req.Status == StatusPending || item.req.ExecStatus == "RUNNING") {
+				continue
+			}
 			delete(b.fingerprints, fp)
 		}
 	}
@@ -976,7 +900,10 @@ func (b *Broker) expireStaleLocked(now time.Time) {
 	// 控制内存记录数量，避免长时间运行内存无限增长
 	if len(b.records) > 500 {
 		for id, item := range b.records {
-			if item.req.Status != StatusPending && now.Sub(item.req.ResolvedAt) > time.Hour {
+			if item.req.Status == StatusPending || item.req.ExecStatus == "RUNNING" {
+				continue
+			}
+			if now.Sub(item.req.ResolvedAt) > time.Hour && now.Sub(item.execFinishedAt) > time.Hour {
 				delete(b.records, id)
 			}
 		}

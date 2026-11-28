@@ -422,6 +422,58 @@ func TestStageTwoRemoteOAuthAndHybridApprovalE2E(t *testing.T) {
 	csB := connectRemoteMCP(tokenB)
 	defer csB.Close()
 
+	for _, tc := range []struct {
+		tool string
+		args map[string]any
+	}{
+		{"workspace.patch", map[string]any{
+			"workspace_id": "ws_alpha", "path": "retry.txt",
+			"edits": []map[string]any{{"old_text": "original", "new_text": "approved"}},
+		}},
+		{"git.apply_patch", map[string]any{
+			"workspace_id": "ws_alpha",
+			"patch":        "--- a/retry.txt\n+++ b/retry.txt\n@@ -1 +1 @@\n-original\n+approved\n",
+		}},
+	} {
+		t.Run(tc.tool+"_retry_after_edit", func(t *testing.T) {
+			if tc.tool == "git.apply_patch" && gitAdapter == nil {
+				t.Skip("git unavailable")
+			}
+			path := filepath.Join(wsAlpha, "retry.txt")
+			if err := os.WriteFile(path, []byte("original\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			call := func() string {
+				t.Helper()
+				res, err := csB.CallTool(context.Background(), &mcp.CallToolParams{Name: tc.tool, Arguments: tc.args})
+				if err != nil || res.IsError {
+					t.Fatalf("expected pending result for %s: err=%v result=%+v", tc.tool, err, res)
+				}
+				var out struct {
+					Pending       bool     `json:"pending"`
+					ApprovalID    string   `json:"approval_id"`
+					AffectedFiles []string `json:"affected_files"`
+				}
+				decodeToolJSON(t, res, &out)
+				if !out.Pending || out.ApprovalID == "" {
+					t.Fatalf("expected pending approval ID, got %+v", out)
+				}
+				if tc.tool == "git.apply_patch" && (len(out.AffectedFiles) != 1 || out.AffectedFiles[0] != "retry.txt") {
+					t.Fatalf("expected retry.txt in affected files, got %v", out.AffectedFiles)
+				}
+				return out.ApprovalID
+			}
+			id := call()
+			defer adminCall(http.MethodPost, "/api/approvals/"+id+"/reject", nil)
+			if err := os.WriteFile(path, []byte("edited locally\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if retryID := call(); retryID != id || len(broker.Pending()) != 1 {
+				t.Fatalf("retry ID %q, original ID %q, pending count %d", retryID, id, len(broker.Pending()))
+			}
+		})
+	}
+
 	// 3.0 回归校验：远程无效补丁预检失败时必须立即返回错误，绝不误建空白待审批单
 	invalidPatchRes, err := csB.CallTool(context.Background(), &mcp.CallToolParams{
 		Name: "workspace.patch",

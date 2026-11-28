@@ -126,7 +126,7 @@ func (s *Server) handleAuthServerMetadata(w http.ResponseWriter, r *http.Request
 		"token_endpoint_auth_methods_supported": []string{"none", "client_secret_post", "client_secret_basic"},
 		"scopes_supported":                      []string{"mcp:tools", "mcp:read", "mcp:write"},
 	}
-	if s.cfg.AllowDynamicRegistration {
+	if s.cfg.DynamicRegistrationEnabled() {
 		meta["registration_endpoint"] = base + "/oauth/register"
 	}
 	writeJSON(w, http.StatusOK, meta)
@@ -137,7 +137,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.cfg.AllowDynamicRegistration {
+	if !s.cfg.DynamicRegistrationEnabled() {
 		writeOAuthError(w, http.StatusForbidden, "registration_not_supported", "服务端已禁用动态客户端注册")
 		return
 	}
@@ -426,7 +426,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAuthCodeGrant(w http.ResponseWriter, clientID, clientSecret string, params map[string]string) {
 	code := strings.TrimSpace(params["code"])
-	redirectURI := strings.TrimSpace(params["redirect_uri"])
+	redirectURI := params["redirect_uri"]
 	verifier := strings.TrimSpace(params["code_verifier"])
 	if code == "" || verifier == "" {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "缺少 code 或 code_verifier")
@@ -467,6 +467,7 @@ func (s *Server) handleAuthCodeGrant(w http.ResponseWriter, clientID, clientSecr
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", err.Error())
 		return
 	}
+	// OAuth 2.1 §10.2 允许换码时省略回调地址；兼容客户端传入的非空值必须完全匹配。
 	if redirectURI != "" && redirectURI != rec.RedirectURI {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "redirect_uri 不匹配")
 		return

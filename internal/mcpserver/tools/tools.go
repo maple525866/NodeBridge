@@ -222,66 +222,56 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 			Edits:           edits,
 		}
 
-		// 先预检并生成 Unified Diff，避免无效补丁或越权路径打扰人工审批
-		preview, err := d.FS.PreviewPatch(patchReq)
-		if err != nil {
-			// 注意：远程幂等重发可能命中已经成功应用的补丁（文件已变导致预检失败），仅做纯只读缓存查询，绝不新建审批单！
-			p := session.FromContext(ctx)
-			if p.IsRemote {
-				fp := approval.ComputeFingerprint(p.ClientID, "workspace.patch", in.WorkspaceID, in)
-				if replayOut, ok := d.Broker.LookupIdempotent(fp); ok {
-					if cached, ok := replayOut.Result.(*filesystem.PatchResult); ok && cached != nil {
-						recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": in.Path}, "IDEMPOTENT_REPLAY", replayOut.Decision.Approver, start, nil)
-						return nil, cached, nil
-					}
-				}
-			}
-			recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": in.Path}, "DENIED_PRECHECK", "", start, err)
-			return nil, nil, err
-		}
-
-		// 若调用方未显式传 expected_sha256，在审批等待后自动锁定预检时的旧版本，防审批期间人工编辑被覆盖
-		if patchReq.ExpectedSHA256 == "" && !preview.IsNewFile {
-			patchReq.ExpectedSHA256 = preview.OldSHA256
-		}
-
 		p := session.FromContext(ctx)
 		fp := approval.ComputeFingerprint(p.ClientID, "workspace.patch", in.WorkspaceID, in)
-		outcome, err := d.Broker.ExecuteWithApproval(ctx, approval.Request{
-			SessionID:     p.SessionID,
-			ClientID:      p.ClientID,
-			IsRemote:      p.IsRemote,
-			Fingerprint:   fp,
-			Tool:          "workspace.patch",
-			WorkspaceID:   in.WorkspaceID,
-			RiskLevel:     ev.RiskLevel,
-			AllowBatchTTL: ev.AllowBatchTTL,
-			TargetPath:    preview.Resolved.RelPath,
-			DiffPreview:   preview.UnifiedDiff,
-			Summary:       fmt.Sprintf("修改工作区 %s 中的文件 %s", in.WorkspaceID, preview.Resolved.RelPath),
-			Reason:        ev.Reason,
-		}, func() (any, error) {
-			return d.FS.ApplyPatch(patchReq)
-		}, makeProgressNotifier(ctx, callReq, "正在等待用户在本地 NodeBridge 控制台审批文件补丁..."))
+		var outcome approval.ExecutionOutcome
+		path := in.Path
+		preview, err := d.FS.PreviewPatch(patchReq)
+		if err != nil {
+			outcome, err = replayAfterPrecheck(d.Broker, p.IsRemote, fp, err)
+		} else {
+			path = preview.Resolved.RelPath
+			// 锁定预检时的版本，防止审批期间的人工编辑被覆盖。
+			if patchReq.ExpectedSHA256 == "" && !preview.IsNewFile {
+				patchReq.ExpectedSHA256 = preview.OldSHA256
+			}
+			outcome, err = d.Broker.ExecuteWithApproval(ctx, approval.Request{
+				SessionID:     p.SessionID,
+				ClientID:      p.ClientID,
+				IsRemote:      p.IsRemote,
+				Fingerprint:   fp,
+				Tool:          "workspace.patch",
+				WorkspaceID:   in.WorkspaceID,
+				RiskLevel:     ev.RiskLevel,
+				AllowBatchTTL: ev.AllowBatchTTL,
+				TargetPath:    path,
+				DiffPreview:   preview.UnifiedDiff,
+				Summary:       fmt.Sprintf("修改工作区 %s 中的文件 %s", in.WorkspaceID, path),
+				Reason:        ev.Reason,
+			}, func() (any, error) {
+				return d.FS.ApplyPatch(patchReq)
+			}, makeProgressNotifier(callReq, "正在等待文件补丁处理结果..."))
+		}
 
 		if err != nil {
-			recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": preview.Resolved.RelPath}, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, err)
+			recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": path}, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, err)
 			return nil, nil, err
 		}
 		if outcome.Pending {
-			recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": preview.Resolved.RelPath, "approval_id": outcome.ApprovalID}, "APPROVAL_PENDING", "", start, nil)
+			status, message := pendingResponse(outcome)
+			recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": path, "approval_id": outcome.ApprovalID}, status, outcome.Decision.Approver, start, nil)
 			return nil, &filesystem.PatchResult{
 				Source:      "local_workspace_file",
 				WorkspaceID: in.WorkspaceID,
-				Path:        preview.Resolved.RelPath,
+				Path:        path,
 				Pending:     true,
 				ApprovalID:  outcome.ApprovalID,
-				Message:     fmt.Sprintf("审批单 %s 正在等待用户在本地 NodeBridge 控制台确认。请提示用户批准后，调用 approval.status 查询最终执行结果。", outcome.ApprovalID),
+				Message:     message,
 			}, nil
 		}
 
 		res, _ := outcome.Result.(*filesystem.PatchResult)
-		recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": preview.Resolved.RelPath, "created": preview.IsNewFile}, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, nil)
+		recordAudit(ctx, d.Audit, "workspace.patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": path, "created": res != nil && res.Created}, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, nil)
 		return nil, res, nil
 	})
 }
@@ -340,54 +330,48 @@ func registerGitTools(srv *mcp.Server, d Deps) {
 			return nil, nil, err
 		}
 
-		affected, err := d.Git.ValidatePatchAt(ctx, in.WorkspaceID, in.Path, in.Patch)
-		if err != nil {
-			p := session.FromContext(ctx)
-			if p.IsRemote {
-				fp := approval.ComputeFingerprint(p.ClientID, "git.apply_patch", in.WorkspaceID, in)
-				if replayOut, ok := d.Broker.LookupIdempotent(fp); ok {
-					if cached, ok := replayOut.Result.(*git.ApplyPatchResult); ok && cached != nil {
-						recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"workspace_id": in.WorkspaceID, "path": in.Path}, "IDEMPOTENT_REPLAY", replayOut.Decision.Approver, start, nil)
-						return nil, cached, nil
-					}
-				}
-			}
-			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"workspace_id": in.WorkspaceID, "path": in.Path}, "DENIED_PRECHECK", "", start, err)
-			return nil, nil, err
-		}
-
 		p := session.FromContext(ctx)
 		fp := approval.ComputeFingerprint(p.ClientID, "git.apply_patch", in.WorkspaceID, in)
-		outcome, err := d.Broker.ExecuteWithApproval(ctx, approval.Request{
-			SessionID:     p.SessionID,
-			ClientID:      p.ClientID,
-			IsRemote:      p.IsRemote,
-			Fingerprint:   fp,
-			Tool:          "git.apply_patch",
-			WorkspaceID:   in.WorkspaceID,
-			RiskLevel:     ev.RiskLevel,
-			AllowBatchTTL: ev.AllowBatchTTL,
-			TargetPath:    strings.Join(affected, ", "),
-			DiffPreview:   in.Patch,
-			Summary:       fmt.Sprintf("向工作区 %s 应用 Git 补丁（涉及 %d 个文件）", in.WorkspaceID, len(affected)),
-			Reason:        ev.Reason,
-		}, func() (any, error) {
-			return d.Git.ApplyPatchAt(context.Background(), in.WorkspaceID, in.Path, in.Patch)
-		}, makeProgressNotifier(ctx, callReq, "正在等待用户在本地 NodeBridge 控制台审批 Git 补丁..."))
+		var outcome approval.ExecutionOutcome
+		affected, err := d.Git.ValidatePatchAt(ctx, in.WorkspaceID, in.Path, in.Patch)
+		if err != nil {
+			outcome, err = replayAfterPrecheck(d.Broker, p.IsRemote, fp, err)
+		} else {
+			outcome, err = d.Broker.ExecuteWithApproval(ctx, approval.Request{
+				SessionID:     p.SessionID,
+				ClientID:      p.ClientID,
+				IsRemote:      p.IsRemote,
+				Fingerprint:   fp,
+				Tool:          "git.apply_patch",
+				WorkspaceID:   in.WorkspaceID,
+				RiskLevel:     ev.RiskLevel,
+				AllowBatchTTL: ev.AllowBatchTTL,
+				TargetPath:    strings.Join(affected, ", "),
+				DiffPreview:   in.Patch,
+				Summary:       fmt.Sprintf("向工作区 %s 应用 Git 补丁（涉及 %d 个文件）", in.WorkspaceID, len(affected)),
+				Reason:        ev.Reason,
+			}, func() (any, error) {
+				return d.Git.ApplyPatchAt(context.Background(), in.WorkspaceID, in.Path, in.Patch)
+			}, makeProgressNotifier(callReq, "正在等待 Git 补丁处理结果..."))
+		}
 
 		if err != nil {
-			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"files": affected}, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, err)
+			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": in.Path, "files": affected}, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, err)
 			return nil, nil, err
 		}
 		if outcome.Pending {
-			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"files": affected, "approval_id": outcome.ApprovalID}, "APPROVAL_PENDING", "", start, nil)
+			status, message := pendingResponse(outcome)
+			recordAudit(ctx, d.Audit, "git.apply_patch", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"files": affected, "approval_id": outcome.ApprovalID}, status, outcome.Decision.Approver, start, nil)
+			if affected == nil {
+				affected = []string{}
+			}
 			return nil, &git.ApplyPatchResult{
 				Source:        "git_output",
 				WorkspaceID:   in.WorkspaceID,
 				AffectedFiles: affected,
 				Pending:       true,
 				ApprovalID:    outcome.ApprovalID,
-				Message:       fmt.Sprintf("审批单 %s 正在等待用户在本地控制台确认。请提示用户批准后，调用 approval.status 查询结果。", outcome.ApprovalID),
+				Message:       message,
 			}, nil
 		}
 
@@ -466,23 +450,24 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 				CommandPreview: cmdPreview,
 				Summary:        fmt.Sprintf("在工作区 %s 执行命令: %s", in.WorkspaceID, in.Executable),
 				Reason:         ev.Reason,
-			}, startTaskFn, makeProgressNotifier(ctx, callReq, "正在等待用户在本地 NodeBridge 控制台审批命令执行..."))
+			}, startTaskFn, makeProgressNotifier(callReq, "正在等待命令启动结果..."))
 
 			if err != nil {
 				recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), in, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, err)
 				return nil, nil, err
 			}
 			if outcome.Pending {
-				recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"executable": in.Executable, "approval_id": outcome.ApprovalID}, "APPROVAL_PENDING", "", start, nil)
+				status, message := pendingResponse(outcome)
+				recordAudit(ctx, d.Audit, "terminal.start", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"executable": in.Executable, "approval_id": outcome.ApprovalID}, status, outcome.Decision.Approver, start, nil)
 				return nil, &TerminalStartOutput{
 					Source:      "terminal_task",
 					WorkspaceID: in.WorkspaceID,
-					Status:      "APPROVAL_PENDING",
+					Status:      status,
 					RiskLevel:   string(ev.RiskLevel),
 					Cwd:         resolvedCwd.RelPath,
 					Pending:     true,
 					ApprovalID:  outcome.ApprovalID,
-					Message:     fmt.Sprintf("命令审批单 %s 正在等待用户在本地控制台确认。请提示用户批准后，调用 approval.status 获取 task_id。", outcome.ApprovalID),
+					Message:     message,
 				}, nil
 			}
 			out, _ := outcome.Result.(*TerminalStartOutput)
@@ -645,8 +630,25 @@ func authorizePrincipal(
 	return nil
 }
 
-// makeProgressNotifier 构造等待审批期间向 MCP 客户端推送保活进度的回调，降低云端代理断连概率。
-func makeProgressNotifier(ctx context.Context, callReq *mcp.CallToolRequest, msg string) func(elapsed time.Duration) {
+// replayAfterPrecheck 只复用当前远程客户端的已有工单，保留预检中的权限拒绝。
+func replayAfterPrecheck(broker *approval.Broker, remote bool, fingerprint string, precheckErr error) (approval.ExecutionOutcome, error) {
+	if remote && !errors.Is(precheckErr, filesystem.ErrAccessDenied) {
+		if outcome, found, err := broker.LookupIdempotent(fingerprint); found {
+			return outcome, err
+		}
+	}
+	return approval.ExecutionOutcome{Decision: approval.Decision{DecisionTag: "DENIED_PRECHECK"}}, precheckErr
+}
+
+func pendingResponse(outcome approval.ExecutionOutcome) (status, message string) {
+	if outcome.Decision.Approved {
+		return "EXECUTION_PENDING", fmt.Sprintf("审批单 %s 已获批准，操作正在后台执行。请调用 approval.status 查询执行结果。", outcome.ApprovalID)
+	}
+	return "APPROVAL_PENDING", fmt.Sprintf("审批单 %s 正在等待用户在本地控制台确认。批准后请调用 approval.status 查询执行结果。", outcome.ApprovalID)
+}
+
+// makeProgressNotifier 在同步等待期间向 MCP 客户端推送进度。
+func makeProgressNotifier(callReq *mcp.CallToolRequest, msg string) func(context.Context, time.Duration) {
 	if callReq == nil || callReq.Session == nil || callReq.Params == nil {
 		return nil
 	}
@@ -654,7 +656,7 @@ func makeProgressNotifier(ctx context.Context, callReq *mcp.CallToolRequest, msg
 	if tok == nil {
 		return nil
 	}
-	return func(elapsed time.Duration) {
+	return func(ctx context.Context, elapsed time.Duration) {
 		_ = callReq.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
 			ProgressToken: tok,
 			Progress:      elapsed.Seconds(),
