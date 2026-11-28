@@ -164,12 +164,12 @@ func (e *Engine) evaluateToolBase(toolName string) Evaluation {
 			AllowBatchTTL: false,
 			Reason:        "授权工作区内的只读查询操作，自动放行",
 		}
-	case "workspace.patch", "workspace.write", "workspace.move", "workspace.delete", "git.apply_patch":
+	case "workspace.patch", "workspace.write", "workspace.mkdir", "workspace.move", "workspace.delete", "git.apply_patch":
 		return Evaluation{
 			RiskLevel:     RiskL1,
 			Action:        ActionRequireApproval,
 			AllowBatchTTL: true,
-			Reason:        "将在授权工作区内修改、新建、移动或删除代码文件，需要人工确认（支持限时批量授权）",
+			Reason:        "将在授权工作区内修改、新建、移动或删除代码文件及目录，需要人工确认（支持限时批量授权）",
 		}
 	case "terminal.cancel":
 		return Evaluation{

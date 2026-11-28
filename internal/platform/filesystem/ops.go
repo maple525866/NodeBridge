@@ -57,6 +57,32 @@ type MoveRequest struct {
 	Overwrite           bool   `json:"overwrite,omitempty"`
 }
 
+// MkdirRequest 表示创建目录的请求。
+type MkdirRequest struct {
+	ApprovedPath string `json:"-"`
+	WorkspaceID  string `json:"workspace_id"`
+	Path         string `json:"path"`
+	Parents      bool   `json:"parents"`
+}
+
+// MkdirPreview 表示创建目录的预检结果。
+type MkdirPreview struct {
+	Resolved         *ResolvedPath
+	AlreadyExists    bool
+	MissingAncestors []string // 按从外到内顺序排列的待新建目录绝对路径（含目标目录本身）
+}
+
+// MkdirResult 表示 workspace.mkdir 的执行结果。
+type MkdirResult struct {
+	Source      string `json:"source"`
+	WorkspaceID string `json:"workspace_id"`
+	Path        string `json:"path"`
+	Created     bool   `json:"created"`
+	Pending     bool   `json:"pending,omitempty"`
+	ApprovalID  string `json:"approval_id,omitempty"`
+	Message     string `json:"message,omitempty"`
+}
+
 // MovePreview 表示移动操作预检结果。
 type MovePreview struct {
 	Source      *ResolvedPath
@@ -230,6 +256,162 @@ func (m *Manager) computeWriteLocked(resolved *ResolvedPath, req WriteRequest) (
 		NewSHA256:   newSHA,
 		NewContent:  finalContent,
 		UnifiedDiff: diff,
+	}, nil
+}
+
+// PreviewMkdir 预检目录创建请求（校验工作区边界、审批路径、敏感祖先规则与目标类型冲突）。
+func (m *Manager) PreviewMkdir(req MkdirRequest) (*MkdirPreview, error) {
+	if strings.TrimSpace(req.Path) == "" {
+		return nil, errors.New("path 不能为空")
+	}
+	resolved, err := m.resolveEntryNoFollow(req.WorkspaceID, req.Path, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkApprovedPath(req.ApprovedPath, resolved.AbsPath); err != nil {
+		return nil, err
+	}
+	if m.containsWorkspaceRoot(resolved) {
+		return nil, fmt.Errorf("%w: 目标路径不能为工作区根目录或磁盘根目录", ErrAccessDenied)
+	}
+
+	if fi, err := os.Lstat(resolved.AbsPath); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+			return nil, fmt.Errorf("%w: 目标路径 %q 已存在且不是目录", ErrConflict, resolved.RelPath)
+		}
+		if !req.Parents {
+			return nil, fmt.Errorf("%w: 目标目录 %q 已存在（parents=false）", ErrConflict, resolved.RelPath)
+		}
+		return &MkdirPreview{
+			Resolved:      resolved,
+			AlreadyExists: true,
+		}, nil
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("检查目标路径失败: %w", err)
+	}
+
+	if !req.Parents {
+		parentAbs := filepath.Dir(resolved.AbsPath)
+		pInfo, err := os.Lstat(parentAbs)
+		if err != nil {
+			return nil, fmt.Errorf("父目录不存在（如需递归创建请设置 parents=true）: %w", err)
+		}
+		if pInfo.Mode()&os.ModeSymlink != 0 || !pInfo.IsDir() {
+			return nil, fmt.Errorf("%w: 父路径不是有效目录", ErrConflict)
+		}
+		return &MkdirPreview{
+			Resolved:         resolved,
+			MissingAncestors: []string{resolved.AbsPath},
+		}, nil
+	}
+
+	// 收集所有尚不存在的祖先目录并逐层校验边界与敏感路径规则
+	var missing []string
+	cur := resolved.AbsPath
+	allowAllDirs := m.AllowAllDirs()
+	for {
+		fi, err := os.Lstat(cur)
+		if err == nil {
+			if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+				return nil, fmt.Errorf("%w: 祖先路径 %q 已存在且不是目录", ErrConflict, filepath.ToSlash(cur))
+			}
+			break
+		}
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("检查祖先路径失败: %w", err)
+		}
+		if !allowAllDirs && !isWithinRoot(resolved.Workspace.RealRoot, cur) {
+			return nil, fmt.Errorf("%w: 待创建的祖先目录超出授权工作区边界", ErrAccessDenied)
+		}
+		if isRootOrDrivePath(cur) {
+			return nil, fmt.Errorf("%w: 无法创建磁盘根目录", ErrAccessDenied)
+		}
+		if err := m.checkHardSecretPath(filepath.ToSlash(cur)); err != nil {
+			return nil, err
+		}
+		checkRel := filepath.ToSlash(cur)
+		if isWithinRoot(resolved.Workspace.RealRoot, cur) {
+			if rel, rErr := filepath.Rel(resolved.Workspace.RealRoot, cur); rErr == nil {
+				checkRel = filepath.ToSlash(rel)
+			}
+		}
+		if checkRel != "." {
+			if err := m.checkSensitivePath(resolved.Workspace, checkRel); err != nil {
+				return nil, err
+			}
+		}
+		missing = append(missing, cur)
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	// 反转为自顶向下顺序（先建父目录，再建子目录）
+	for i, j := 0, len(missing)-1; i < j; i, j = i+1, j-1 {
+		missing[i], missing[j] = missing[j], missing[i]
+	}
+
+	return &MkdirPreview{
+		Resolved:         resolved,
+		MissingAncestors: missing,
+	}, nil
+}
+
+// Mkdir 在路径互斥锁下重新校验并创建目标目录（不跟随符号链接）。
+func (m *Manager) Mkdir(req MkdirRequest) (*MkdirResult, error) {
+	preview, err := m.PreviewMkdir(req)
+	if err != nil {
+		return nil, err
+	}
+
+	unlock := m.LockPath(preview.Resolved.AbsPath)
+	defer unlock()
+
+	// 持锁二次预检防竞态
+	preview, err = m.PreviewMkdir(req)
+	if err != nil {
+		return nil, err
+	}
+	if preview.AlreadyExists {
+		return &MkdirResult{
+			Source:      "local_workspace_mkdir",
+			WorkspaceID: req.WorkspaceID,
+			Path:        preview.Resolved.RelPath,
+			Created:     false,
+			Message:     fmt.Sprintf("目录 %s 已存在", preview.Resolved.RelPath),
+		}, nil
+	}
+
+	createdAny := false
+	for _, dir := range preview.MissingAncestors {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			if os.IsExist(err) {
+				// 允许并发创建同名真实目录，但严禁符号链接或普通文件冒充目录
+				fi, lErr := os.Lstat(dir)
+				if lErr != nil || fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+					return nil, fmt.Errorf("%w: 路径 %q 已被非目录条目占用", ErrConflict, filepath.ToSlash(dir))
+				}
+				if !req.Parents && dir == preview.Resolved.AbsPath {
+					return nil, fmt.Errorf("%w: 目标目录 %q 已存在（parents=false）", ErrConflict, preview.Resolved.RelPath)
+				}
+				continue
+			}
+			return nil, fmt.Errorf("创建目录失败: %w", err)
+		}
+		createdAny = true
+	}
+
+	msg := fmt.Sprintf("目录 %s 已存在", preview.Resolved.RelPath)
+	if createdAny {
+		msg = fmt.Sprintf("已创建目录 %s", preview.Resolved.RelPath)
+	}
+	return &MkdirResult{
+		Source:      "local_workspace_mkdir",
+		WorkspaceID: req.WorkspaceID,
+		Path:        preview.Resolved.RelPath,
+		Created:     createdAny,
+		Message:     msg,
 	}, nil
 }
 

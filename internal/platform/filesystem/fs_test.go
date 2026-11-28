@@ -529,6 +529,70 @@ func TestWriteMoveAndDeleteWithSecurityAndRiskFlags(t *testing.T) {
 	}
 }
 
+func TestMkdirSecurityAndSemantics(t *testing.T) {
+	mgr, wsDir := setupTestFS(t)
+
+	// 1. parents=false 且父目录不存在时拒绝
+	if _, err := mgr.Mkdir(MkdirRequest{WorkspaceID: "demo", Path: "newpkg/sub", Parents: false}); err == nil {
+		t.Fatalf("parents=false 且父目录缺失时应当失败")
+	}
+
+	// 2. parents=true 递归创建多层目录并验证再次调用幂等
+	r1, err := mgr.Mkdir(MkdirRequest{WorkspaceID: "demo", Path: "newpkg/sub/deep", Parents: true})
+	if err != nil || !r1.Created || r1.Path != "newpkg/sub/deep" {
+		t.Fatalf("递归创建目录失败: err=%v res=%+v", err, r1)
+	}
+	if fi, err := os.Stat(filepath.Join(wsDir, "newpkg", "sub", "deep")); err != nil || !fi.IsDir() {
+		t.Fatalf("目录未实际创建: err=%v", err)
+	}
+	r2, err := mgr.Mkdir(MkdirRequest{WorkspaceID: "demo", Path: "newpkg/sub/deep", Parents: true})
+	if err != nil || r2.Created {
+		t.Fatalf("parents=true 对已存在目录应幂等返回 Created=false: err=%v res=%+v", err, r2)
+	}
+	if _, err := mgr.Mkdir(MkdirRequest{WorkspaceID: "demo", Path: "newpkg/sub/deep", Parents: false}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("parents=false 对已存在目录应返回 ErrConflict，实际: %v", err)
+	}
+
+	// 3. parents=false 在已有父目录下创建单层目录成功
+	r3, err := mgr.Mkdir(MkdirRequest{WorkspaceID: "demo", Path: "newpkg/sibling", Parents: false})
+	if err != nil || !r3.Created {
+		t.Fatalf("parents=false 单层创建失败: err=%v res=%+v", err, r3)
+	}
+
+	// 4. 目标已被普通文件占用或祖先是普通文件时拒绝
+	if _, err := mgr.Mkdir(MkdirRequest{WorkspaceID: "demo", Path: "hello.go", Parents: true}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("目标已被文件占用应返回 ErrConflict，实际: %v", err)
+	}
+	if _, err := mgr.Mkdir(MkdirRequest{WorkspaceID: "demo", Path: "hello.go/child", Parents: true}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("祖先为普通文件时应返回 ErrConflict，实际: %v", err)
+	}
+
+	// 5. 拒绝工作区根目录、敏感路径与含敏感中间祖先目录
+	for _, bad := range []string{".", "../outside_dir", ".ssh", "a/.ssh/nested", "nested/.aws/sub"} {
+		if _, err := mgr.Mkdir(MkdirRequest{WorkspaceID: "demo", Path: bad, Parents: true}); !errors.Is(err, ErrAccessDenied) {
+			t.Fatalf("危险或敏感目录 %q 应返回 ErrAccessDenied，实际: %v", bad, err)
+		}
+	}
+
+	// 6. 审批路径绑定校验（ApprovedPath 不匹配时拒绝）
+	if _, err := mgr.Mkdir(MkdirRequest{
+		ApprovedPath: filepath.Join(wsDir, "other_dir"),
+		WorkspaceID:  "demo",
+		Path:         "newpkg/pinned",
+		Parents:      true,
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("ApprovedPath 变化应返回 ErrConflict，实际: %v", err)
+	}
+
+	// 7. 符号链接目标不得被视为已存在目录
+	linkPath := filepath.Join(wsDir, "newpkg", "dir_link")
+	if err := os.Symlink(filepath.Join(wsDir, "newpkg", "sibling"), linkPath); err == nil {
+		if _, err := mgr.Mkdir(MkdirRequest{WorkspaceID: "demo", Path: "newpkg/dir_link", Parents: true}); !errors.Is(err, ErrConflict) {
+			t.Fatalf("符号链接目标应返回 ErrConflict 而非视为目录，实际: %v", err)
+		}
+	}
+}
+
 func TestGlobAndEnhancedSearchDualEngine(t *testing.T) {
 	mgr, wsDir := setupTestFS(t)
 

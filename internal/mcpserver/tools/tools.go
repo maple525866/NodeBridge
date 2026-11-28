@@ -1,4 +1,4 @@
-// Package tools 注册全部 18 个 MCP 工具（系统自发现、文件系统读写移删搜、Git 全套只读与补丁、异步/短等待终端与远程审批续接），
+// Package tools 注册全部 19 个 MCP 工具（系统自发现、文件系统读写建移删搜、Git 全套只读与补丁、异步/短等待终端与远程审批续接），
 // 并在工具执行前统一串联客户端级权限护栏、策略引擎、混合人工审批（支持远程异步续接与幂等去重）与审计日志。
 package tools
 
@@ -122,6 +122,12 @@ type WorkspaceWriteInput struct {
 	Content        string `json:"content" jsonschema:"待写入的完整文本内容（最大 2MB，仅支持文本文件）"`
 	ExpectedSHA256 string `json:"expected_sha256,omitempty" jsonschema:"可选：覆写已有文件时的 SHA256 乐观锁校验值"`
 	Overwrite      *bool  `json:"overwrite,omitempty" jsonschema:"目标文件已存在时是否允许覆盖，默认 true"`
+}
+
+type WorkspaceMkdirInput struct {
+	WorkspaceID string `json:"workspace_id" jsonschema:"授权工作区 ID，例如 default（开启全部目录模式时可留空）"`
+	Path        string `json:"path" jsonschema:"待创建的目录相对路径，或开启全部目录模式时的宿主机任意绝对路径"`
+	Parents     *bool  `json:"parents,omitempty" jsonschema:"是否递归创建缺失的父目录（类似 mkdir -p），默认 true；传 false 时要求父目录已存在且目标尚未存在"`
 }
 
 type WorkspaceMoveInput struct {
@@ -571,8 +577,77 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "workspace.mkdir",
+		Description: "在授权工作区内安全创建目录（默认 parents=true 支持递归创建缺失父目录，受工作区边界、敏感路径与人工审批约束；配合 workspace.move 移动文件到新目录前可先调用本工具）",
+	}, func(ctx context.Context, callReq *mcp.CallToolRequest, in WorkspaceMkdirInput) (*mcp.CallToolResult, *filesystem.MkdirResult, error) {
+		start := time.Now()
+		ev := d.Policy.EvaluateTool("workspace.mkdir")
+		if err := authorizePrincipal(ctx, d, "workspace.mkdir", in.WorkspaceID, string(ev.RiskLevel), true, in, start); err != nil {
+			return nil, nil, err
+		}
+
+		parents := true
+		if in.Parents != nil {
+			parents = *in.Parents
+		}
+		mkdirReq := filesystem.MkdirRequest{
+			WorkspaceID: in.WorkspaceID,
+			Path:        in.Path,
+			Parents:     parents,
+		}
+
+		p := session.FromContext(ctx)
+		fp := approval.ComputeFingerprint(p.ClientID, "workspace.mkdir", in.WorkspaceID, in)
+		var outcome approval.ExecutionOutcome
+		targetPath := in.Path
+		preview, err := d.FS.PreviewMkdir(mkdirReq)
+		if err != nil {
+			outcome, err = replayAfterPrecheck(d.Broker, p.IsRemote, fp, err)
+		} else {
+			targetPath = preview.Resolved.RelPath
+			mkdirReq.ApprovedPath = preview.Resolved.AbsPath
+			outcome, err = d.Broker.ExecuteWithApproval(ctx, approval.Request{
+				SessionID:     p.SessionID,
+				ClientID:      p.ClientID,
+				IsRemote:      p.IsRemote,
+				Fingerprint:   fp,
+				Tool:          "workspace.mkdir",
+				WorkspaceID:   in.WorkspaceID,
+				RiskLevel:     ev.RiskLevel,
+				AllowBatchTTL: ev.AllowBatchTTL,
+				TargetPath:    targetPath,
+				Summary:       fmt.Sprintf("在工作区 %s 创建目录 %s", in.WorkspaceID, targetPath),
+				Reason:        ev.Reason,
+			}, func() (any, error) {
+				return d.FS.Mkdir(mkdirReq)
+			}, makeProgressNotifier(callReq, "正在等待目录创建处理结果..."))
+		}
+
+		if err != nil {
+			recordAudit(ctx, d.Audit, "workspace.mkdir", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": targetPath, "parents": parents}, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, err)
+			return nil, nil, err
+		}
+		if outcome.Pending {
+			status, message := pendingResponse(outcome)
+			recordAudit(ctx, d.Audit, "workspace.mkdir", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": targetPath, "parents": parents, "approval_id": outcome.ApprovalID}, status, outcome.Decision.Approver, start, nil)
+			return nil, &filesystem.MkdirResult{
+				Source:      "local_workspace_mkdir",
+				WorkspaceID: in.WorkspaceID,
+				Path:        targetPath,
+				Pending:     true,
+				ApprovalID:  outcome.ApprovalID,
+				Message:     message,
+			}, nil
+		}
+
+		res, _ := outcome.Result.(*filesystem.MkdirResult)
+		recordAudit(ctx, d.Audit, "workspace.mkdir", in.WorkspaceID, string(ev.RiskLevel), map[string]any{"path": targetPath, "created": res != nil && res.Created}, outcome.Decision.DecisionTag, outcome.Decision.Approver, start, nil)
+		return nil, res, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "workspace.move",
-		Description: "在同一文件系统内重命名或移动文件和目录，目标父目录须已存在（受工作区边界、敏感路径与人工审批约束）",
+		Description: "在同一文件系统内重命名或移动文件和目录，目标父目录须已存在（如目标父目录尚不存在请先调用 workspace.mkdir；受工作区边界、敏感路径与人工审批约束）",
 	}, func(ctx context.Context, callReq *mcp.CallToolRequest, in WorkspaceMoveInput) (*mcp.CallToolResult, *filesystem.MoveResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("workspace.move")

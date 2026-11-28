@@ -177,13 +177,13 @@ func TestStageOneEndToEndMCPWorkflow(t *testing.T) {
 	}
 	defer cs.Close()
 
-	// 验证全部 18 个 MCP 工具均已暴露
+	// 验证全部 19 个 MCP 工具均已暴露
 	listToolsRes, err := cs.ListTools(ctx, &mcp.ListToolsParams{})
 	if err != nil {
 		t.Fatalf("ListTools 失败: %v", err)
 	}
-	if len(listToolsRes.Tools) != 18 {
-		t.Fatalf("期望暴露 18 个 MCP 工具，实际 %d", len(listToolsRes.Tools))
+	if len(listToolsRes.Tools) != 19 {
+		t.Fatalf("期望暴露 19 个 MCP 工具，实际 %d", len(listToolsRes.Tools))
 	}
 
 	// 辅助函数：调用本地管理 API
@@ -995,13 +995,29 @@ func TestEnhancedMCPToolsE2E(t *testing.T) {
 		t.Fatalf("workspace.write 失败: %+v", wr)
 	}
 
-	// L1 批授期内：workspace.move 和删单文件应免弹窗放行
+	// L1 批授期内：workspace.mkdir 创建新目录 -> workspace.move 移动文件到该新目录 -> 删单文件应免弹窗放行
+	mkdirRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "workspace.mkdir",
+		Arguments: map[string]any{
+			"workspace_id": "default",
+			"path":         "folder/subpkg",
+		},
+	})
+	if err != nil || mkdirRes.IsError {
+		t.Fatalf("L1 批授期内 workspace.mkdir 应直接成功: err=%v res=%+v", err, mkdirRes)
+	}
+	var mkdirOut filesystem.MkdirResult
+	decodeToolJSON(t, mkdirRes, &mkdirOut)
+	if !mkdirOut.Created || mkdirOut.Path != "folder/subpkg" {
+		t.Fatalf("workspace.mkdir 返回异常: %+v", mkdirOut)
+	}
+
 	mvRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
 		Name: "workspace.move",
 		Arguments: map[string]any{
 			"workspace_id":     "default",
 			"source_path":      "folder/draft.txt",
-			"destination_path": "folder/moved.txt",
+			"destination_path": "folder/subpkg/moved.txt",
 		},
 	})
 	if err != nil || mvRes.IsError {
@@ -1020,7 +1036,7 @@ func TestEnhancedMCPToolsE2E(t *testing.T) {
 	}
 	delSingleRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
 		Name:      "workspace.delete",
-		Arguments: map[string]any{"workspace_id": "default", "path": "folder/moved.txt"},
+		Arguments: map[string]any{"workspace_id": "default", "path": "folder/subpkg/moved.txt"},
 	})
 	if err != nil || delSingleRes.IsError {
 		t.Fatalf("L1 批授期内删除单文件应直接成功: err=%v res=%+v", err, delSingleRes)

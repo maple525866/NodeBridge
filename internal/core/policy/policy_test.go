@@ -149,7 +149,7 @@ func TestNewToolsAndDeleteRiskClassification(t *testing.T) {
 			t.Fatalf("只读工具 %s 应为 L0 ALLOW，实际: %+v", roTool, ev)
 		}
 	}
-	for _, rwTool := range []string{"workspace.write", "workspace.move"} {
+	for _, rwTool := range []string{"workspace.write", "workspace.mkdir", "workspace.move"} {
 		ev := eng.EvaluateTool(rwTool)
 		if ev.RiskLevel != RiskL1 || ev.Action != ActionRequireApproval || !ev.AllowBatchTTL {
 			t.Fatalf("写入工具 %s 应为 L1 支持批授，实际: %+v", rwTool, ev)
