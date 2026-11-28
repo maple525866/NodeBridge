@@ -277,6 +277,16 @@ func (m *Manager) PreviewMove(req MoveRequest) (*MovePreview, error) {
 		}
 	}
 
+	// A move publishes one rename. Creating or rolling back ancestors would
+	// expose additional changes outside the approved source and destination.
+	parent, err := os.Lstat(filepath.Dir(dst.AbsPath))
+	if err != nil {
+		return nil, fmt.Errorf("移动的目标父目录必须已存在: %w", err)
+	}
+	if !parent.IsDir() {
+		return nil, errors.New("移动的目标父路径不是目录")
+	}
+
 	destExists := false
 	if dstInfo, statErr := os.Lstat(dst.AbsPath); statErr == nil {
 		destExists = true
@@ -318,10 +328,7 @@ func (m *Manager) Move(req MoveRequest) (*MoveResult, error) {
 	}
 
 	src, dst := preview.Source.AbsPath, preview.Destination.AbsPath
-	err = withMoveParent(filepath.Dir(dst), func() error {
-		return publishEntry(src, dst, preview.DestExists && req.Overwrite)
-	})
-	if err != nil {
+	if err := publishEntry(src, dst, preview.DestExists && req.Overwrite); err != nil {
 		// Windows returns ERROR_NOT_SAME_DEVICE (17) directly from MoveFileEx.
 		if errors.Is(err, syscall.EXDEV) || (runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(17))) {
 			return nil, fmt.Errorf("workspace.move 仅支持同一文件系统内的重命名或移动: %w", err)
@@ -596,42 +603,6 @@ func checkApprovedPath(approved, current string) error {
 		return fmt.Errorf("%w: 目标路径在审批后发生变化，请重新预览", ErrConflict)
 	}
 	return nil
-}
-
-// Create missing parents from the top down. Unwind only our own empty
-// directories if the move fails or another process changes the destination.
-func withMoveParent(dir string, move func() error) error {
-	info, err := os.Lstat(dir)
-	if err == nil {
-		if !info.IsDir() {
-			return fmt.Errorf("目标父路径不是目录: %s", dir)
-		}
-		return move()
-	}
-	if !os.IsNotExist(err) || filepath.Dir(dir) == dir {
-		return err
-	}
-	return withMoveParent(filepath.Dir(dir), func() error {
-		if err := os.Mkdir(dir, 0o755); err != nil {
-			if os.IsExist(err) {
-				if current, statErr := os.Lstat(dir); statErr == nil && current.IsDir() {
-					return move()
-				}
-			}
-			return err
-		}
-		created, err := os.Lstat(dir)
-		if err != nil {
-			return err
-		}
-		if err := move(); err != nil {
-			if current, statErr := os.Lstat(dir); statErr == nil && current.IsDir() && os.SameFile(created, current) {
-				_ = os.Remove(dir) // The OS preserves directories concurrently populated by others.
-			}
-			return err
-		}
-		return nil
-	})
 }
 
 func isRootOrDrivePath(absPath string) bool {

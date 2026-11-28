@@ -572,7 +572,7 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "workspace.move",
-		Description: "在同一文件系统内重命名或移动文件和目录（受工作区边界、敏感路径与人工审批约束）",
+		Description: "在同一文件系统内重命名或移动文件和目录，目标父目录须已存在（受工作区边界、敏感路径与人工审批约束）",
 	}, func(ctx context.Context, callReq *mcp.CallToolRequest, in WorkspaceMoveInput) (*mcp.CallToolResult, *filesystem.MoveResult, error) {
 		start := time.Now()
 		ev := d.Policy.EvaluateTool("workspace.move")

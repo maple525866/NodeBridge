@@ -103,31 +103,29 @@ func TestCrossVolumeMovePreservesEntries(t *testing.T) {
 	if err := os.WriteFile(child, []byte("child"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	dstTree := filepath.Join(target, "nested", "parent", "tree")
+	dstTree := filepath.Join(target, "tree")
 	checkFailure(srcTree, dstTree, false)
 	if data, err := os.ReadFile(child); err != nil || string(data) != "child" {
 		t.Fatalf("source tree changed: %q, %v", data, err)
 	}
-	if _, err := os.Lstat(filepath.Join(target, "nested")); !os.IsNotExist(err) {
+	if _, err := os.Lstat(dstTree); !os.IsNotExist(err) {
 		t.Fatalf("failed move left a destination directory: %v", err)
 	}
 }
 
-func TestFailedMovePreservesPopulatedParent(t *testing.T) {
-	root := t.TempDir()
-	parent := filepath.Join(root, "new", "parent")
-	retained := filepath.Join(parent, "local.txt")
-	failure := errors.New("rename failed")
-	err := withMoveParent(parent, func() error {
-		if err := os.WriteFile(retained, []byte("keep"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return failure
-	})
-	if !errors.Is(err, failure) {
+func TestMoveRequiresExistingDestinationParent(t *testing.T) {
+	m, root := setupTestFS(t)
+	req := MoveRequest{WorkspaceID: "demo", SourcePath: "hello.go", DestinationPath: "new/sub/file.go"}
+	if _, err := m.PreviewMove(req); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("preview expected missing parent, got %v", err)
+	}
+	if _, err := m.Move(req); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("move expected missing parent, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "hello.go")); err != nil {
 		t.Fatal(err)
 	}
-	if data, err := os.ReadFile(retained); err != nil || string(data) != "keep" {
-		t.Fatalf("rollback changed a populated directory: %q, %v", data, err)
+	if _, err := os.Stat(filepath.Join(root, "new")); !os.IsNotExist(err) {
+		t.Fatalf("unexpected destination parent: %v", err)
 	}
 }
