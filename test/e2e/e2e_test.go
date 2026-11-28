@@ -937,6 +937,42 @@ func TestEnhancedMCPToolsE2E(t *testing.T) {
 		t.Fatalf("workspace.search 上下文/忽略大小写结果异常: %+v", searchOut)
 	}
 
+	// 审批期间本地编辑器写入的新数据应保留。
+	for _, tc := range []struct {
+		tool      string
+		args      map[string]any
+		localFile string
+	}{
+		{"workspace.write", map[string]any{"path": "draft.txt", "content": "remote"}, "draft.txt"},
+		{"workspace.move", map[string]any{"source_path": "main.go", "destination_path": "renamed.go", "overwrite": true}, "renamed.go"},
+		{"workspace.delete", map[string]any{"path": "initially-empty", "recursive": true}, "initially-empty/new.txt"},
+	} {
+		dest := filepath.Join(wsDir, tc.localFile)
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		tc.args["workspace_id"] = "default"
+		done := make(chan *mcp.CallToolResult, 1)
+		go func() {
+			result, _ := cs.CallTool(ctx, &mcp.CallToolParams{Name: tc.tool, Arguments: tc.args})
+			done <- result
+		}()
+		request := waitPending()
+		if request.Tool != tc.tool || request.RiskLevel != policy.RiskL1 {
+			t.Fatalf("%s unexpected approval: %+v", tc.tool, request)
+		}
+		if err := os.WriteFile(dest, []byte("from editor"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		adminCall(http.MethodPost, "/api/approvals/"+request.ID+"/approve", map[string]any{"grant_minutes": 0})
+		if result := <-done; result == nil || !result.IsError {
+			t.Fatalf("%s accepted a changed target: %+v", tc.tool, result)
+		}
+		if data, err := os.ReadFile(dest); err != nil || string(data) != "from editor" {
+			t.Fatalf("%s lost local edit: %q, %v", tc.tool, data, err)
+		}
+	}
+
 	// 3. workspace.write（授予 15 分钟 L1 批授）-> workspace.move（走 L1 批授免再审）-> workspace.delete 单文件（走 L1 批授）-> 递归删非空目录（自动升 L2 必须再次弹窗审批！）
 	writeDone := make(chan *mcp.CallToolResult, 1)
 	go func() {

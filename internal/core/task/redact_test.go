@@ -93,3 +93,24 @@ func TestCappedBufferTailRetentionAndRedaction(t *testing.T) {
 		t.Fatalf("尾部缓冲出现非法 UTF-8 截断: %q", tail)
 	}
 }
+
+func TestTailPreservesUTF8BoundaryAndLatestBytes(t *testing.T) {
+	const limit = 8
+	buf := newCappedBuffer(limit, nil)
+	var all string
+	for _, line := range []string{"12345\n", "你好\n", "\n", "abc\n", "世界\n", "1234567890\n"} {
+		all += line
+		_, _ = buf.Write([]byte(line))
+		if len(all) <= limit {
+			continue
+		}
+		want := all[len(all)-limit:]
+		for len(want) > 0 && !utf8.RuneStart(want[0]) {
+			want = want[1:]
+		}
+		head, _, _ := buf.ReadFrom(0)
+		if got := buf.Tail(); got != want || head != "12345\n" {
+			t.Fatalf("head=%q tail=%q, want tail=%q", head, got, want)
+		}
+	}
+}

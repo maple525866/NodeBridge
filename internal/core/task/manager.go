@@ -96,6 +96,8 @@ type cappedBuffer struct {
 	tailMaxBytes      int
 	buf               []byte // 已脱敏确认安全且单调只增的输出缓冲区
 	tail              []byte // 触发截断后持续保留的最新尾部已脱敏输出
+	tailStart         int    // 尾部环形缓冲区最旧字节的位置
+	written           uint64 // 已脱敏输出的总字节数，包含截断后写入尾部的内容
 	pending           []byte // 当前尚未收到换行符的行尾待定缓冲
 	truncated         bool
 	inPEMKeyBlock     bool
@@ -124,8 +126,7 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 	b.mu.Lock()
-	prevLen := len(b.buf)
-	prevTrunc := b.truncated
+	before := b.written
 	b.pending = append(b.pending, p...)
 	for {
 		idx := bytes.IndexByte(b.pending, '\n')
@@ -150,7 +151,7 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 			b.processLineLocked(chunk)
 		}
 	}
-	changed := len(b.buf) != prevLen || b.truncated != prevTrunc
+	changed := b.written != before
 	cb := b.onChange
 	b.mu.Unlock()
 	if changed && cb != nil {
@@ -168,10 +169,12 @@ func (b *cappedBuffer) Flush() {
 	}
 	line := string(b.pending)
 	b.pending = nil
+	before := b.written
 	b.processLineLocked(line)
+	changed := b.written != before
 	cb := b.onChange
 	b.mu.Unlock()
-	if cb != nil {
+	if changed && cb != nil {
 		cb()
 	}
 }
@@ -252,12 +255,12 @@ func (b *cappedBuffer) appendSanitizedLocked(s string) {
 	if s == "" {
 		return
 	}
-	rem := b.maxBytes - len(b.buf)
-	if rem <= 0 {
-		b.enterTruncatedTailLocked()
+	b.written += uint64(len(s))
+	if b.truncated {
 		b.appendTailLocked(s)
 		return
 	}
+	rem := b.maxBytes - len(b.buf)
 	if len(s) > rem {
 		// 按 UTF-8 字符边界截断，防止多字节字符乱码
 		cut := rem
@@ -265,48 +268,43 @@ func (b *cappedBuffer) appendSanitizedLocked(s string) {
 			cut--
 		}
 		b.buf = append(b.buf, s[:cut]...)
-		b.enterTruncatedTailLocked()
+		b.truncated = true
+		start := max(0, len(b.buf)-b.tailMaxBytes)
+		b.tail = make([]byte, len(b.buf)-start, b.tailMaxBytes)
+		copy(b.tail, b.buf[start:])
 		b.appendTailLocked(s[cut:])
 		return
 	}
 	b.buf = append(b.buf, s...)
 }
 
-func (b *cappedBuffer) enterTruncatedTailLocked() {
-	if b.truncated {
+func (b *cappedBuffer) appendTailLocked(s string) {
+	if len(s) >= b.tailMaxBytes {
+		b.tail = b.tail[:b.tailMaxBytes]
+		copy(b.tail, s[len(s)-b.tailMaxBytes:])
+		b.tailStart = 0
 		return
 	}
-	b.truncated = true
-	if b.tailMaxBytes <= 0 || len(b.buf) == 0 {
-		return
+	fill := min(len(s), b.tailMaxBytes-len(b.tail))
+	b.tail = append(b.tail, s[:fill]...)
+	s = s[fill:]
+	if len(s) > 0 {
+		n := copy(b.tail[b.tailStart:], s)
+		copy(b.tail, s[n:])
+		b.tailStart = (b.tailStart + len(s)) % b.tailMaxBytes
 	}
-	start := 0
-	if len(b.buf) > b.tailMaxBytes {
-		start = len(b.buf) - b.tailMaxBytes
-		for start < len(b.buf) && !utf8.RuneStart(b.buf[start]) {
-			start++
-		}
-	}
-	b.tail = append(b.tail[:0], b.buf[start:]...)
 }
 
-func (b *cappedBuffer) appendTailLocked(s string) {
-	if s == "" || b.tailMaxBytes <= 0 {
-		return
+func (b *cappedBuffer) tailLocked() string {
+	var out strings.Builder
+	out.Grow(len(b.tail))
+	out.Write(b.tail[b.tailStart:])
+	out.Write(b.tail[:b.tailStart])
+	s := out.String()
+	for len(s) > 0 && !utf8.RuneStart(s[0]) {
+		s = s[1:]
 	}
-	b.tail = append(b.tail, s...)
-	if len(b.tail) > b.tailMaxBytes {
-		start := len(b.tail) - b.tailMaxBytes
-		for start < len(b.tail) && !utf8.RuneStart(b.tail[start]) {
-			start++
-		}
-		if start > 0 && start < len(b.tail) {
-			copy(b.tail, b.tail[start:])
-			b.tail = b.tail[:len(b.tail)-start]
-		} else if start >= len(b.tail) {
-			b.tail = b.tail[:0]
-		}
-	}
+	return s
 }
 
 func (b *cappedBuffer) ReadFrom(offset int) (chunk string, nextOffset int, truncated bool) {
@@ -329,7 +327,7 @@ func (b *cappedBuffer) Tail() string {
 	if !b.truncated || len(b.tail) == 0 {
 		return ""
 	}
-	return string(b.tail)
+	return b.tailLocked()
 }
 
 func (b *cappedBuffer) Truncated() bool {
@@ -341,14 +339,12 @@ func (b *cappedBuffer) Truncated() bool {
 func (b *cappedBuffer) Summary(maxChars int) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	src := b.buf
-	if b.truncated && len(b.tail) > 0 {
-		src = b.tail
+	var s string
+	if b.truncated {
+		s = b.tailLocked()
+	} else {
+		s = string(b.buf)
 	}
-	if len(src) == 0 {
-		return ""
-	}
-	s := string(src)
 	if len(s) > maxChars {
 		start := len(s) - maxChars
 		for start < len(s) && !utf8.RuneStart(s[start]) {
@@ -372,13 +368,14 @@ type managedTask struct {
 	timeout      time.Duration
 	spec         process.Spec
 	updateCh     chan struct{}
+	done         chan struct{}
 }
 
 func (mt *managedTask) broadcastUpdate() {
 	mt.mu.Lock()
 	if mt.updateCh != nil {
 		close(mt.updateCh)
-		mt.updateCh = make(chan struct{})
+		mt.updateCh = nil
 	}
 	mt.mu.Unlock()
 }
@@ -455,10 +452,9 @@ func NewManager(taskStore store.TaskStore, opts Options) (*Manager, error) {
 				dirty = true
 			}
 			mt := &managedTask{
-				record:   rec,
-				stdout:   newCappedBuffer(opts.MaxOutputBytes, nil),
-				stderr:   newCappedBuffer(opts.MaxOutputBytes, nil),
-				updateCh: make(chan struct{}),
+				record: rec,
+				stdout: newCappedBuffer(opts.MaxOutputBytes, nil),
+				stderr: newCappedBuffer(opts.MaxOutputBytes, nil),
 			}
 			m.tasks[rec.ID] = mt
 			m.order = append(m.order, rec.ID)
@@ -499,7 +495,7 @@ func (m *Manager) Start(req StartRequest) (store.TaskRecord, error) {
 		record:       rec,
 		cancelSignal: make(chan struct{}),
 		timeout:      timeout,
-		updateCh:     make(chan struct{}),
+		done:         make(chan struct{}),
 	}
 	stdoutBuf := newCappedBuffer(m.maxOutputBytes, mt.broadcastUpdate)
 	stderrBuf := newCappedBuffer(m.maxOutputBytes, mt.broadcastUpdate)
@@ -560,7 +556,6 @@ func (m *Manager) runTask(mt *managedTask) {
 
 	_ = m.persist()
 	m.notify(snap)
-	mt.broadcastUpdate()
 
 	doneCh := make(chan struct{})
 	var exitCode int
@@ -618,11 +613,11 @@ func (m *Manager) finishTask(mt *managedTask, st Status, exitCode *int, errMsg s
 	}
 	mt.record.OutputSummary = summary
 	snap := mt.record
+	close(mt.done)
 	mt.mu.Unlock()
 
 	_ = m.persist()
 	m.notify(snap)
-	mt.broadcastUpdate()
 }
 
 func (mt *managedTask) getCancelReason(fallback string) string {
@@ -632,6 +627,19 @@ func (mt *managedTask) getCancelReason(fallback string) string {
 		return mt.cancelReason
 	}
 	return fallback
+}
+
+// WorkspaceID returns the task's authorization scope without reading its output.
+func (m *Manager) WorkspaceID(taskID string) (string, error) {
+	m.mu.RLock()
+	mt, ok := m.tasks[taskID]
+	m.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("任务 %q 不存在", taskID)
+	}
+	mt.mu.Lock()
+	defer mt.mu.Unlock()
+	return mt.record.WorkspaceID, nil
 }
 
 // Poll 查询任务状态及增量 stdout/stderr 输出。
@@ -694,23 +702,18 @@ func (m *Manager) PollWait(ctx context.Context, taskID string, stdoutOffset, std
 	timer := time.NewTimer(waitDur)
 	defer timer.Stop()
 
-	for {
-		watch := mt.watchCh()
-		res, err := m.Poll(taskID, stdoutOffset, stderrOffset)
-		if err != nil {
-			return nil, err
-		}
-		if res.Status.IsTerminal() || len(res.StdoutChunk) > 0 || len(res.StderrChunk) > 0 {
-			return res, nil
-		}
-		select {
-		case <-watch:
-		case <-timer.C:
-			return m.Poll(taskID, stdoutOffset, stderrOffset)
-		case <-ctx.Done():
-			return m.Poll(taskID, stdoutOffset, stderrOffset)
-		}
+	watch := mt.watchCh()
+	res, err := m.Poll(taskID, stdoutOffset, stderrOffset)
+	if err != nil || res.Status.IsTerminal() || res.StdoutChunk != "" || res.StderrChunk != "" {
+		return res, err
 	}
+	select {
+	case <-watch:
+	case <-mt.done:
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	return m.Poll(taskID, stdoutOffset, stderrOffset)
 }
 
 // WaitUntilTerminal 等待指定任务进入终态，或到达 waitDur / ctx 取消时返回当前完整快照。
@@ -726,26 +729,17 @@ func (m *Manager) WaitUntilTerminal(ctx context.Context, taskID string, waitDur 
 		return nil, fmt.Errorf("任务 %q 不存在", taskID)
 	}
 
-	timer := time.NewTimer(waitDur)
-	defer timer.Stop()
-
-	for {
-		watch := mt.watchCh()
-		res, err := m.Poll(taskID, 0, 0)
-		if err != nil {
-			return nil, err
-		}
-		if res.Status.IsTerminal() {
-			return res, nil
-		}
+	// 恢复自持久化的历史任务均已进入终态，没有完成通知。
+	if mt.done != nil {
+		timer := time.NewTimer(waitDur)
+		defer timer.Stop()
 		select {
-		case <-watch:
+		case <-mt.done:
 		case <-timer.C:
-			return m.Poll(taskID, 0, 0)
 		case <-ctx.Done():
-			return m.Poll(taskID, 0, 0)
 		}
 	}
+	return m.Poll(taskID, 0, 0)
 }
 
 // Cancel 取消指定任务（若正在运行则强杀整个进程树）。

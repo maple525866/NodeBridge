@@ -10,6 +10,42 @@ import (
 	"nodebridge/internal/core/store"
 )
 
+func TestPollWaitReturnsNewTailBeforeCompletion(t *testing.T) {
+	mt := &managedTask{record: store.TaskRecord{ID: "tail", Status: string(StatusRunning)}, done: make(chan struct{})}
+	mt.stdout = newCappedBuffer(8, mt.broadcastUpdate)
+	mt.stderr = newCappedBuffer(8, mt.broadcastUpdate)
+	_, _ = mt.stdout.Write([]byte("0123456789\n"))
+	mgr := &Manager{tasks: map[string]*managedTask{"tail": mt}}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result := make(chan *PollResult, 1)
+	go func() {
+		res, _ := mgr.PollWait(ctx, "tail", 8, 0, 10*time.Second)
+		result <- res
+	}()
+	for {
+		mt.mu.Lock()
+		watching := mt.updateCh != nil
+		mt.mu.Unlock()
+		if watching {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatal("poll did not subscribe")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	_, _ = mt.stdout.Write([]byte("last\n"))
+	select {
+	case got := <-result:
+		if got == nil || got.StdoutChunk != "" || !strings.HasSuffix(got.StdoutTail, "last\n") || got.Status != StatusRunning || ctx.Err() != nil {
+			t.Fatalf("poll did not report a tail-only update: %+v", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("new tail did not wake poll")
+	}
+}
+
 func TestTaskLifecycleTimeoutCancelAndRecovery(t *testing.T) {
 	dataDir := t.TempDir()
 	st, err := store.NewJSONFileTaskStore(dataDir)

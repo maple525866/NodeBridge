@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 )
 
 // WriteRequest 表示整文件新建或覆写请求。
@@ -140,23 +141,19 @@ func (m *Manager) WriteFile(req WriteRequest) (*WriteResult, error) {
 		return nil, fmt.Errorf("创建临时文件失败: %w", err)
 	}
 	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
 	if _, err := tmpFile.WriteString(preview.NewContent); err != nil {
 		_ = tmpFile.Close()
-		_ = os.Remove(tmpPath)
 		return nil, fmt.Errorf("写入临时文件失败: %w", err)
 	}
 	if err := tmpFile.Close(); err != nil {
-		_ = os.Remove(tmpPath)
 		return nil, fmt.Errorf("关闭临时文件失败: %w", err)
 	}
-	_ = os.Chmod(tmpPath, perm)
-
-	if err := os.Rename(tmpPath, resolved.AbsPath); err != nil {
-		if wErr := os.WriteFile(resolved.AbsPath, []byte(preview.NewContent), perm); wErr != nil {
-			_ = os.Remove(tmpPath)
-			return nil, fmt.Errorf("提交文件写入失败: %w", wErr)
-		}
-		_ = os.Remove(tmpPath)
+	if err := os.Chmod(tmpPath, perm); err != nil {
+		return nil, err
+	}
+	if err := publishEntry(tmpPath, resolved.AbsPath, !preview.IsNewFile); err != nil {
+		return nil, fmt.Errorf("提交文件写入失败: %w", err)
 	}
 
 	return &WriteResult{
@@ -179,21 +176,21 @@ func (m *Manager) computeWriteLocked(resolved *ResolvedPath, req WriteRequest) (
 		return nil, fmt.Errorf("%w: workspace.write 仅支持文本内容，禁止写入二进制 NUL 字节", ErrAccessDenied)
 	}
 
-	raw, err := os.ReadFile(resolved.AbsPath)
-	isNew := false
-	if err != nil {
-		if os.IsNotExist(err) {
-			isNew = true
-			raw = nil
-		} else {
-			return nil, fmt.Errorf("读取目标文件失败: %w", err)
-		}
+	_, err := os.Lstat(resolved.AbsPath)
+	isNew := os.IsNotExist(err)
+	if err != nil && !isNew {
+		return nil, fmt.Errorf("读取目标文件失败: %w", err)
 	}
 
 	var oldSHA string
+	var raw []byte
 	if !isNew {
 		if !req.Overwrite {
 			return nil, fmt.Errorf("%w: 目标文件 %q 已存在（overwrite=false）", ErrConflict, resolved.RelPath)
+		}
+		raw, err = readBoundedRegularFile(resolved.AbsPath)
+		if err != nil {
+			return nil, err
 		}
 		if isBinaryContent(raw) {
 			return nil, fmt.Errorf("目标文件 %q 为二进制文件，禁止使用文本写入覆盖", resolved.RelPath)
@@ -212,6 +209,9 @@ func (m *Manager) computeWriteLocked(resolved *ResolvedPath, req WriteRequest) (
 	// 若原文件使用 CRLF 且新内容纯 LF，保留原文件行尾风格
 	if !isNew && strings.Contains(oldContent, "\r\n") && !strings.Contains(finalContent, "\r\n") {
 		finalContent = strings.ReplaceAll(finalContent, "\n", "\r\n")
+	}
+	if len(finalContent) > defaultReadMaxBytes {
+		return nil, fmt.Errorf("转换行尾后的文件超过 %d bytes", defaultReadMaxBytes)
 	}
 
 	newSHA := sha256Hex([]byte(finalContent))
@@ -243,7 +243,7 @@ func (m *Manager) PreviewMove(req MoveRequest) (*MovePreview, error) {
 	if sameFSPath(src.AbsPath, dst.AbsPath) {
 		return nil, fmt.Errorf("%w: 源路径与目标路径相同", ErrConflict)
 	}
-	if isRootOrDrivePath(src.AbsPath) || sameFSPath(src.AbsPath, src.Workspace.RealRoot) {
+	if m.containsWorkspaceRoot(src) {
 		return nil, fmt.Errorf("%w: 禁止移动工作区根目录或磁盘根目录", ErrAccessDenied)
 	}
 
@@ -272,6 +272,9 @@ func (m *Manager) PreviewMove(req MoveRequest) (*MovePreview, error) {
 		}
 		if dstInfo.IsDir() {
 			return nil, fmt.Errorf("%w: 禁止使用 overwrite 覆盖已存在的目录 %q", ErrConflict, dst.RelPath)
+		}
+		if isDir {
+			return nil, fmt.Errorf("%w: 不能用目录替换文件 %q", ErrConflict, dst.RelPath)
 		}
 	} else if !os.IsNotExist(statErr) {
 		return nil, fmt.Errorf("检查目标路径失败: %w", statErr)
@@ -304,16 +307,23 @@ func (m *Manager) Move(req MoveRequest) (*MoveResult, error) {
 	if err := os.MkdirAll(filepath.Dir(preview.Destination.AbsPath), 0o755); err != nil {
 		return nil, fmt.Errorf("创建目标父目录失败: %w", err)
 	}
-	if preview.DestExists && req.Overwrite {
-		if err := os.Remove(preview.Destination.AbsPath); err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("移除已有目标文件失败: %w", err)
+	src, dst := preview.Source.AbsPath, preview.Destination.AbsPath
+	if err := publishEntry(src, dst, preview.DestExists && req.Overwrite); err != nil {
+		// Windows returns ERROR_NOT_SAME_DEVICE (17) directly from MoveFileEx.
+		if !errors.Is(err, syscall.EXDEV) && !(runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(17))) {
+			return nil, fmt.Errorf("移动失败: %w", err)
 		}
-	}
-
-	if err := os.Rename(preview.Source.AbsPath, preview.Destination.AbsPath); err != nil {
-		// 跨盘符移动安全回退：先复制到目标，成功后删除源
-		if copyErr := copyPathForMove(preview.Source.AbsPath, preview.Destination.AbsPath); copyErr != nil {
-			return nil, fmt.Errorf("移动失败 (rename=%v, copy=%v)", err, copyErr)
+		stage, err := os.MkdirTemp(filepath.Dir(dst), ".nodebridge-move-*")
+		if err != nil {
+			return nil, err
+		}
+		defer os.RemoveAll(stage)
+		copyDst := filepath.Join(stage, "entry")
+		if err := copyPathForMove(src, copyDst); err != nil {
+			return nil, fmt.Errorf("跨文件系统复制失败: %w", err)
+		}
+		if err := publishEntry(copyDst, dst, preview.DestExists && req.Overwrite); err != nil {
+			return nil, fmt.Errorf("提交移动失败: %w", err)
 		}
 		if rmErr := os.RemoveAll(preview.Source.AbsPath); rmErr != nil {
 			return nil, fmt.Errorf("已复制到目标，但清理源路径失败: %w", rmErr)
@@ -339,7 +349,7 @@ func (m *Manager) PreviewDelete(req DeleteRequest) (*DeletePreview, error) {
 	if err != nil {
 		return nil, err
 	}
-	if isRootOrDrivePath(resolved.AbsPath) || sameFSPath(resolved.AbsPath, resolved.Workspace.RealRoot) {
+	if m.containsWorkspaceRoot(resolved) {
 		return nil, fmt.Errorf("%w: 禁止删除工作区根目录或磁盘根目录", ErrAccessDenied)
 	}
 
@@ -579,6 +589,30 @@ func isRootOrDrivePath(absPath string) bool {
 	return filepath.Dir(clean) == clean
 }
 
+// The chosen workspace may itself be a synthetic all-directories workspace.
+func (m *Manager) containsWorkspaceRoot(target *ResolvedPath) bool {
+	if isRootOrDrivePath(target.AbsPath) || isWithinRoot(target.AbsPath, target.Workspace.RealRoot) {
+		return true
+	}
+	for _, ws := range m.workspaces {
+		if isWithinRoot(target.AbsPath, ws.RealRoot) {
+			return true
+		}
+	}
+	return false
+}
+
+func publishEntry(src, dst string, overwrite bool) error {
+	if overwrite {
+		return os.Rename(src, dst)
+	}
+	err := renameNoReplace(src, dst)
+	if errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("%w: 目标已存在", ErrConflict)
+	}
+	return err
+}
+
 func copyPathForMove(src, dst string) error {
 	info, err := os.Lstat(src)
 	if err != nil {
@@ -592,7 +626,7 @@ func copyPathForMove(src, dst string) error {
 		return os.Symlink(target, dst)
 	}
 	if info.IsDir() {
-		if err := os.MkdirAll(dst, info.Mode().Perm()); err != nil {
+		if err := os.Mkdir(dst, 0o700); err != nil {
 			return err
 		}
 		entries, err := os.ReadDir(src)
@@ -604,7 +638,10 @@ func copyPathForMove(src, dst string) error {
 				return err
 			}
 		}
-		return nil
+		return os.Chmod(dst, info.Mode().Perm())
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("不支持跨文件系统移动特殊文件 %q", src)
 	}
 	in, err := os.Open(src)
 	if err != nil {

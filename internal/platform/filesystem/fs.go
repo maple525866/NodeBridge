@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -29,10 +30,10 @@ var ErrConflict = errors.New("patch conflict")
 
 // ListEntry 表示目录列表中的单个文件或目录条目。
 type ListEntry struct {
-	Path      string `json:"path"`
-	IsDir     bool   `json:"is_dir"`
-	Size      int64  `json:"size"`
-	ModTime   string `json:"mod_time"`
+	Path    string `json:"path"`
+	IsDir   bool   `json:"is_dir"`
+	Size    int64  `json:"size"`
+	ModTime string `json:"mod_time"`
 }
 
 // ListResult 表示 workspace.list 的返回结果。
@@ -507,6 +508,30 @@ func (m *Manager) computePatchLocked(resolved *ResolvedPath, req PatchRequest) (
 		NewContent:  finalContent,
 		UnifiedDiff: diff,
 	}, nil
+}
+
+func readBoundedRegularFile(p string) ([]byte, error) {
+	before, err := os.Lstat(p)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() || before.Size() > defaultReadMaxBytes {
+		return nil, errors.New("文件必须是大小未超限的普通文件")
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !os.SameFile(before, info) || !info.Mode().IsRegular() {
+		return nil, errors.New("读取时目标文件发生变化")
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, defaultReadMaxBytes+1))
+	if len(raw) > defaultReadMaxBytes {
+		return nil, errors.New("文件超过读取上限")
+	}
+	return raw, err
 }
 
 func sha256Hex(data []byte) string {

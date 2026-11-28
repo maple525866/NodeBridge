@@ -474,6 +474,29 @@ func TestStageTwoRemoteOAuthAndHybridApprovalE2E(t *testing.T) {
 		})
 	}
 
+	t.Run("terminal_retry_with_shorter_wait", func(t *testing.T) {
+		args := map[string]any{"workspace_id": "ws_alpha", "executable": "echo preview", "use_shell": true}
+		call := func() string {
+			t.Helper()
+			res, err := csB.CallTool(context.Background(), &mcp.CallToolParams{Name: "terminal.start", Arguments: args})
+			if err != nil || res.IsError {
+				t.Fatalf("terminal.start err=%v result=%+v", err, res)
+			}
+			var out tools.TerminalStartOutput
+			decodeToolJSON(t, res, &out)
+			if !out.Pending || out.ApprovalID == "" {
+				t.Fatalf("expected pending approval: %+v", out)
+			}
+			return out.ApprovalID
+		}
+		id := call()
+		defer adminCall(http.MethodPost, "/api/approvals/"+id+"/reject", nil)
+		args["wait_seconds"] = 0
+		if retry := call(); retry != id || len(broker.Pending()) != 1 {
+			t.Fatalf("retry created another approval: initial=%q retry=%q", id, retry)
+		}
+	})
+
 	// 3.0 回归校验：远程无效补丁预检失败时必须立即返回错误，绝不误建空白待审批单
 	invalidPatchRes, err := csB.CallTool(context.Background(), &mcp.CallToolParams{
 		Name: "workspace.patch",

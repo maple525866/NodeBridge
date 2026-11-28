@@ -526,6 +526,7 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 			}
 			actionWord := "覆写"
 			if preview.IsNewFile {
+				writeReq.Overwrite = false
 				actionWord = "新建"
 			}
 			outcome, err = d.Broker.ExecuteWithApproval(ctx, approval.Request{
@@ -595,6 +596,7 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 		} else {
 			srcRel = preview.Source.RelPath
 			dstRel = preview.Destination.RelPath
+			moveReq.Overwrite = moveReq.Overwrite && preview.DestExists
 			outcome, err = d.Broker.ExecuteWithApproval(ctx, approval.Request{
 				SessionID:     p.SessionID,
 				ClientID:      p.ClientID,
@@ -662,6 +664,7 @@ func registerWorkspaceTools(srv *mcp.Server, d Deps) {
 			outcome, err = replayAfterPrecheck(d.Broker, p.IsRemote, fp, err)
 		} else {
 			targetPath = preview.Resolved.RelPath
+			delReq.Recursive = preview.RecursiveNonEmpty
 			ev = d.Policy.EvaluateDelete(preview.RecursiveNonEmpty)
 			summary := fmt.Sprintf("删除工作区 %s 中的 %s", in.WorkspaceID, targetPath)
 			if preview.RecursiveNonEmpty {
@@ -927,7 +930,9 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 		// 3. 急停检查与按需混合人工审批（远程客户端在全权限模式下同样经 Broker 复用指纹幂等去重与急停校验）
 		if ev.Action == policy.ActionRequireApproval || (p.IsRemote && ev.BypassedByFullPerms) {
 			cmdPreview := formatCommandPreview(in)
-			fp := approval.ComputeFingerprint(p.ClientID, "terminal.start", in.WorkspaceID, in)
+			execArgs := in
+			execArgs.WaitSeconds = nil // Waiting changes the response, not the command.
+			fp := approval.ComputeFingerprint(p.ClientID, "terminal.start", in.WorkspaceID, execArgs)
 			execCtx := ctx
 			if p.IsRemote {
 				// 远程审批回调可能在原 HTTP 短窗口到期后由用户异步批准触发，使用独立上下文保证短等待收集完整输出供 approval.status 取回
@@ -1001,24 +1006,17 @@ func registerTerminalTools(srv *mcp.Server, d Deps) {
 		ev := d.Policy.EvaluateTool("terminal.poll")
 
 		// 先按当前状态执行一次权限校验，避免越权客户端进入长轮询等待
-		initial, err := d.Tasks.Poll(in.TaskID, in.StdoutOffset, in.StderrOffset)
-		wsID := ""
-		if initial != nil {
-			wsID = initial.WorkspaceID
-			if authErr := authorizePrincipal(ctx, d, "terminal.poll", wsID, string(ev.RiskLevel), false, in, start); authErr != nil {
-				return nil, nil, authErr
-			}
-		}
+		wsID, err := d.Tasks.WorkspaceID(in.TaskID)
 		if err != nil {
 			recordAudit(ctx, d.Audit, "terminal.poll", wsID, string(ev.RiskLevel), in, "AUTO_ALLOW", "", start, err)
 			return nil, nil, err
 		}
+		if err := authorizePrincipal(ctx, d, "terminal.poll", wsID, string(ev.RiskLevel), false, in, start); err != nil {
+			return nil, nil, err
+		}
 
 		waitDur := resolvePollWaitDuration(in.WaitSeconds)
-		res := initial
-		if waitDur > 0 && !initial.Status.IsTerminal() && len(initial.StdoutChunk) == 0 && len(initial.StderrChunk) == 0 {
-			res, err = d.Tasks.PollWait(ctx, in.TaskID, in.StdoutOffset, in.StderrOffset, waitDur)
-		}
+		res, err := d.Tasks.PollWait(ctx, in.TaskID, in.StdoutOffset, in.StderrOffset, waitDur)
 		recordAudit(ctx, d.Audit, "terminal.poll", wsID, string(ev.RiskLevel), in, "AUTO_ALLOW", "", start, err)
 		return nil, res, err
 	})

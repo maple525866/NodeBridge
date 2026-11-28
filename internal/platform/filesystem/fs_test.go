@@ -35,6 +35,65 @@ func setupTestFS(t *testing.T) (*Manager, string) {
 	return mgr, wsDir
 }
 
+func TestWriteBoundsBothVersions(t *testing.T) {
+	m, dir := setupTestFS(t)
+	dst := filepath.Join(dir, "existing.txt")
+	req := WriteRequest{WorkspaceID: "demo", Path: "existing.txt", Content: "short", Overwrite: true}
+	if err := os.WriteFile(dst, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(dst, defaultReadMaxBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.PreviewWrite(req); err == nil {
+		t.Fatal("oversize existing file was accepted")
+	}
+	if err := os.WriteFile(dst, []byte("old\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	req.Content = strings.Repeat("\n", defaultReadMaxBytes/2+1)
+	if _, err := m.WriteFile(req); err == nil {
+		t.Fatal("oversize CRLF conversion was accepted")
+	}
+}
+
+func TestMoveFailurePreservesDestination(t *testing.T) {
+	m, dir := setupTestFS(t)
+	if err := os.Mkdir(filepath.Join(dir, "source"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "keep.txt")
+	if err := os.WriteFile(dst, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Move(MoveRequest{WorkspaceID: "demo", SourcePath: "source", DestinationPath: "keep.txt", Overwrite: true}); err == nil {
+		t.Fatal("replaced regular file with a directory")
+	}
+	if got, err := os.ReadFile(dst); err != nil || string(got) != "keep" {
+		t.Fatalf("destination changed after failed move: %q, %v", got, err)
+	}
+}
+
+func TestMoveDeleteProtectNestedWorkspaceRoots(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "projects", "nested")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m, err := NewManager([]config.WorkspaceConfig{{ID: "outer", Root: root}, {ID: "inner", Root: nested}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"projects/nested", "projects"} {
+		if _, err := m.PreviewDelete(DeleteRequest{WorkspaceID: "outer", Path: path, Recursive: true}); !errors.Is(err, ErrAccessDenied) {
+			t.Fatalf("delete %s: %v", path, err)
+		}
+		if _, err := m.PreviewMove(MoveRequest{WorkspaceID: "outer", SourcePath: path, DestinationPath: "new"}); !errors.Is(err, ErrAccessDenied) {
+			t.Fatalf("move %s: %v", path, err)
+		}
+	}
+}
+
 func TestSecurityPathBlocking(t *testing.T) {
 	mgr, _ := setupTestFS(t)
 

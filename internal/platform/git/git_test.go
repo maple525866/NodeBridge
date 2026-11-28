@@ -214,3 +214,87 @@ func TestGitDiffRangeLogAndShow(t *testing.T) {
 		t.Fatalf("应拦截以 '-' 开头的非法 ref 参数")
 	}
 }
+func TestHistoryVisibilityAndReadLimits(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("Git unavailable")
+	}
+	root := t.TempDir()
+	run := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = root
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	write := func(name, content string) {
+		t.Helper()
+		target := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run("init")
+	run("config", "user.email", "test@example.invalid")
+	run("config", "user.name", "Test")
+	write("project/src/main.txt", "public-line\n")
+	write("project/src/CREDENTIALS.JSON", "hard-denied\n")
+	write("project/src/custom.txt", "custom-denied\n")
+	write("project/src/global.txt", "global-denied\n")
+	run("add", "-f", ".")
+	run("commit", "-m", "visible commit")
+	tag := "v1-test"
+	run("tag", "-a", tag, "-m", "annotated")
+	visibleOID := run("rev-parse", "HEAD")
+	write("other.txt", "outside workspace\n")
+	run("add", "other.txt")
+	run("commit", "-m", "other project")
+	fs, err := filesystem.NewManager([]config.WorkspaceConfig{{
+		ID: "project", Root: filepath.Join(root, "project"), DenyGlobs: []string{"s*/custom.txt"},
+	}}, []string{"src/global.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := NewAdapter(fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	log, err := a.LogAt(ctx, "project", "src", "", "", 5)
+	if err != nil || len(log.Commits) != 1 || log.Commits[0].Hash != visibleOID {
+		t.Fatalf("scoped log = %+v, err = %v", log, err)
+	}
+	show, err := a.ShowAt(ctx, "project", "src", tag, false, 0)
+	if err != nil || show.Hash != visibleOID || !strings.Contains(show.Diff, "public-line") || strings.Contains(show.Diff, "-denied") {
+		t.Fatalf("scoped annotated tag = %+v, err = %v", show, err)
+	}
+	blob := run("rev-parse", "HEAD:other.txt")
+	if _, err := a.ShowAt(ctx, "project", "", blob, false, 0); err == nil {
+		t.Fatal("show accepted a non-commit object")
+	}
+	write("project/src/main.txt", strings.Repeat("visible-line\n", 3000))
+	write("project/src/custom.txt", "custom-denied-update\n")
+	write("project/src/CREDENTIALS.JSON", "hard-denied-update\n")
+	diff, err := a.DiffRangeAt(ctx, "project", "", false, tag, "", []string{"src"}, 600)
+	if err != nil || !diff.Truncated || !strings.Contains(diff.Diff, "+visible-line") || strings.Contains(diff.Diff, "-denied") {
+		t.Fatalf("scoped limited diff = %+v, err = %v", diff, err)
+	}
+}
+
+func TestLimitedOutputDrainsAfterLimit(t *testing.T) {
+	b := limitedOutput{limit: 16}
+	payload := []byte(strings.Repeat("a", 2000))
+	for i := 0; i < 10; i++ {
+		if n, err := b.Write(payload); n != len(payload) || err != nil {
+			t.Fatalf("write = %d, %v", n, err)
+		}
+	}
+	if !b.truncated || b.data.Len() != 16 {
+		t.Fatalf("buffer = %d bytes, truncated = %v", b.data.Len(), b.truncated)
+	}
+}

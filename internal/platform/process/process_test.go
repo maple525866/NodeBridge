@@ -44,3 +44,15 @@ func TestSafeBaseEnvIncludesProxyAndSDKVars(t *testing.T) {
 		t.Fatalf("未在白名单中的敏感凭据变量不应默认透传: %v", env)
 	}
 }
+
+func TestAuthenticatedProxyIsNotPassedToSubprocess(t *testing.T) {
+	for _, key := range []string{"HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"} {
+		t.Setenv(key, "http://sample:password@proxy.local:8080")
+	}
+	env := buildFilteredEnv(nil, nil)
+	for _, entry := range env {
+		if strings.Contains(entry, "sample:password@proxy.local") {
+			t.Fatal("subprocess received authenticated proxy URL")
+		}
+	}
+}

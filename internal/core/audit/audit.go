@@ -115,6 +115,16 @@ func Redact(input string) string {
 // RedactPrivateSecrets 面向终端输出与摘要的私钥/高敏密钥实时脱敏兜底，
 // 强制抹除 PEM/OpenSSH/PGP/PuTTY 私钥块（含未闭合分片）及明确格式密钥令牌。
 func RedactPrivateSecrets(input string) string {
+	return redactPrivateSecrets(input, false)
+}
+
+// RedactPrivateSecretsPreservingLines masks complete private-key blocks while
+// retaining line positions for source references and search context.
+func RedactPrivateSecretsPreservingLines(input string) string {
+	return redactPrivateSecrets(input, true)
+}
+
+func redactPrivateSecrets(input string, preserveLines bool) string {
 	if input == "" {
 		return input
 	}
@@ -122,7 +132,13 @@ func RedactPrivateSecrets(input string) string {
 	upper := strings.ToUpper(out)
 	if strings.Contains(upper, "PRIVATE KEY") || strings.Contains(out, "PuTTY-User-Key-File") {
 		for _, re := range privateKeyOutputPatterns {
-			out = re.ReplaceAllString(out, "[REDACTED_PRIVATE_KEY]")
+			if preserveLines {
+				out = re.ReplaceAllStringFunc(out, func(block string) string {
+					return "[REDACTED_PRIVATE_KEY]" + strings.Repeat("\n", strings.Count(block, "\n"))
+				})
+			} else {
+				out = re.ReplaceAllString(out, "[REDACTED_PRIVATE_KEY]")
+			}
 		}
 	}
 	for _, re := range highConfidenceTokenPatterns {

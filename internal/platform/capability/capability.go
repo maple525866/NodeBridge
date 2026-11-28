@@ -4,10 +4,13 @@ package capability
 import (
 	"context"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
+
+	"nodebridge/internal/platform/process"
 )
 
 // ToolInfo 描述本机单个开发工具链的探测结果。
@@ -93,41 +96,16 @@ func Detect() Info {
 				Version:   ver,
 			}
 			if s.name == "git" && ver != "" {
-				info.GitVersion = ver
+				info.GitVersion = "git version " + ver
 			}
 			mu.Unlock()
 		}(spec, binPath)
 	}
 	wg.Wait()
 
-	switch runtime.GOOS {
-	case "windows":
-		if p, err := exec.LookPath("pwsh"); err == nil {
-			info.DefaultShell = "pwsh"
-			info.DefaultShellBin = p
-		} else if p, err := exec.LookPath("powershell"); err == nil {
-			info.DefaultShell = "powershell"
-			info.DefaultShellBin = p
-		} else if p, err := exec.LookPath("cmd"); err == nil {
-			info.DefaultShell = "cmd"
-			info.DefaultShellBin = p
-		}
-	case "darwin":
-		if p, err := exec.LookPath("zsh"); err == nil {
-			info.DefaultShell = "zsh"
-			info.DefaultShellBin = p
-		} else if p, err := exec.LookPath("bash"); err == nil {
-			info.DefaultShell = "bash"
-			info.DefaultShellBin = p
-		}
-	default:
-		if p, err := exec.LookPath("bash"); err == nil {
-			info.DefaultShell = "bash"
-			info.DefaultShellBin = p
-		} else if p, err := exec.LookPath("sh"); err == nil {
-			info.DefaultShell = "sh"
-			info.DefaultShellBin = p
-		}
+	if name, path, err := process.DefaultShell(); err == nil {
+		info.DefaultShell = name
+		info.DefaultShellBin = path
 	}
 
 	return info
@@ -137,18 +115,22 @@ func probeVersionLine(binPath string, args ...string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binPath, args...)
+	cmd.WaitDelay = 100 * time.Millisecond
 	out, err := cmd.CombinedOutput()
-	if err != nil && len(out) == 0 {
+	if err != nil {
 		return ""
 	}
-	norm := strings.ReplaceAll(string(out), "\r\n", "\n")
-	for _, line := range strings.Split(norm, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed != "" {
-			if len(trimmed) > 120 {
-				return trimmed[:120]
-			}
-			return trimmed
+	return versionFromOutput(string(out))
+}
+
+// Return only a version number. Startup diagnostics can contain host settings,
+// including JVM options, before the actual version banner on stderr.
+var versionBanner = regexp.MustCompile(`^(?:git version |go version go|v|Python |pytest |cargo |rustc |ripgrep |GNU Make |cmake version |(?:openjdk|java) version "|Apache Maven |Gradle )?([0-9]+(?:[._][0-9]+)*(?:\.windows\.[0-9]+)?)(?:$|["[:space:]+-])`)
+
+func versionFromOutput(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		if m := versionBanner.FindStringSubmatch(strings.TrimSpace(line)); m != nil && len(m[1]) <= 64 {
+			return m[1]
 		}
 	}
 	return ""

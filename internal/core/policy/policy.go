@@ -347,8 +347,19 @@ func (e *Engine) evaluateCommandBase(executable string, args []string, useShell 
 		}
 	}
 
+	// An interpreter module used for package installation requires its own approval.
+	if (execName == "python" || execName == "python3") && len(args) >= 2 && args[0] == "-m" {
+		module := strings.ToLower(args[1])
+		if module == "pip" || strings.HasPrefix(module, "pip.") || module == "ensurepip" {
+			return Evaluation{RiskLevel: RiskL2, Action: ActionRequireApproval,
+				Reason: "Python 包管理模块需要每次人工审批"}
+		}
+	}
+
 	// 5. L0 白名单匹配
-	if subs, ok := e.l0Rules[execName]; ok && matchSubcommand(subs, args) {
+	bareName := filepath.Base(executable) == executable
+	versionQuery := execName == "node" || execName == "rustc"
+	if subs, ok := e.l0Rules[execName]; ok && bareName && (!versionQuery || len(args) == 1) && matchSubcommand(subs, args) {
 		return Evaluation{
 			RiskLevel:     RiskL0,
 			Action:        ActionAllow,
