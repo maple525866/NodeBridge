@@ -533,8 +533,8 @@ func TestMkdirSecurityAndSemantics(t *testing.T) {
 	mgr, wsDir := setupTestFS(t)
 
 	// 1. parents=false 且父目录不存在时拒绝
-	if _, err := mgr.Mkdir(MkdirRequest{WorkspaceID: "demo", Path: "newpkg/sub", Parents: false}); err == nil {
-		t.Fatalf("parents=false 且父目录缺失时应当失败")
+	if _, err := mgr.Mkdir(MkdirRequest{WorkspaceID: "demo", Path: "newpkg/sub", Parents: false}); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("parents=false 且父目录缺失时应返回 ErrNotExist，实际: %v", err)
 	}
 
 	// 2. parents=true 递归创建多层目录并验证再次调用幂等
@@ -560,11 +560,12 @@ func TestMkdirSecurityAndSemantics(t *testing.T) {
 	}
 
 	// 4. 目标已被普通文件占用或祖先是普通文件时拒绝
-	if _, err := mgr.Mkdir(MkdirRequest{WorkspaceID: "demo", Path: "hello.go", Parents: true}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("目标已被文件占用应返回 ErrConflict，实际: %v", err)
-	}
-	if _, err := mgr.Mkdir(MkdirRequest{WorkspaceID: "demo", Path: "hello.go/child", Parents: true}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("祖先为普通文件时应返回 ErrConflict，实际: %v", err)
+	for _, parents := range []bool{false, true} {
+		for _, path := range []string{"hello.go", "hello.go/child", "hello.go/missing/child"} {
+			if _, err := mgr.Mkdir(MkdirRequest{WorkspaceID: "demo", Path: path, Parents: parents}); !errors.Is(err, ErrConflict) {
+				t.Fatalf("path=%q parents=%t: 期望 ErrConflict，实际: %v", path, parents, err)
+			}
+		}
 	}
 
 	// 5. 拒绝工作区根目录、敏感路径与含敏感中间祖先目录

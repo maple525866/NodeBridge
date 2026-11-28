@@ -266,6 +266,9 @@ func (m *Manager) PreviewMkdir(req MkdirRequest) (*MkdirPreview, error) {
 	}
 	resolved, err := m.resolveEntryNoFollow(req.WorkspaceID, req.Path, true)
 	if err != nil {
+		if errors.Is(err, syscall.ENOTDIR) && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: 祖先路径不是目录", ErrConflict)
+		}
 		return nil, err
 	}
 	if err := checkApprovedPath(req.ApprovedPath, resolved.AbsPath); err != nil {
@@ -273,36 +276,6 @@ func (m *Manager) PreviewMkdir(req MkdirRequest) (*MkdirPreview, error) {
 	}
 	if m.containsWorkspaceRoot(resolved) {
 		return nil, fmt.Errorf("%w: 目标路径不能为工作区根目录或磁盘根目录", ErrAccessDenied)
-	}
-
-	if fi, err := os.Lstat(resolved.AbsPath); err == nil {
-		if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
-			return nil, fmt.Errorf("%w: 目标路径 %q 已存在且不是目录", ErrConflict, resolved.RelPath)
-		}
-		if !req.Parents {
-			return nil, fmt.Errorf("%w: 目标目录 %q 已存在（parents=false）", ErrConflict, resolved.RelPath)
-		}
-		return &MkdirPreview{
-			Resolved:      resolved,
-			AlreadyExists: true,
-		}, nil
-	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("检查目标路径失败: %w", err)
-	}
-
-	if !req.Parents {
-		parentAbs := filepath.Dir(resolved.AbsPath)
-		pInfo, err := os.Lstat(parentAbs)
-		if err != nil {
-			return nil, fmt.Errorf("父目录不存在（如需递归创建请设置 parents=true）: %w", err)
-		}
-		if pInfo.Mode()&os.ModeSymlink != 0 || !pInfo.IsDir() {
-			return nil, fmt.Errorf("%w: 父路径不是有效目录", ErrConflict)
-		}
-		return &MkdirPreview{
-			Resolved:         resolved,
-			MissingAncestors: []string{resolved.AbsPath},
-		}, nil
 	}
 
 	// 收集所有尚不存在的祖先目录并逐层校验边界与敏感路径规则
@@ -313,11 +286,22 @@ func (m *Manager) PreviewMkdir(req MkdirRequest) (*MkdirPreview, error) {
 		fi, err := os.Lstat(cur)
 		if err == nil {
 			if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
-				return nil, fmt.Errorf("%w: 祖先路径 %q 已存在且不是目录", ErrConflict, filepath.ToSlash(cur))
+				return nil, fmt.Errorf("%w: 路径 %q 的目标或祖先不是目录", ErrConflict, resolved.RelPath)
+			}
+			if cur == resolved.AbsPath {
+				if !req.Parents {
+					return nil, fmt.Errorf("%w: 目标目录 %q 已存在（parents=false）", ErrConflict, resolved.RelPath)
+				}
+				return &MkdirPreview{Resolved: resolved, AlreadyExists: true}, nil
 			}
 			break
 		}
-		if !os.IsNotExist(err) {
+		// Windows also reports ENOTDIR for missing parents. Walk up to
+		// distinguish a missing directory from an existing ordinary file.
+		if !errors.Is(err, os.ErrNotExist) {
+			if errors.Is(err, syscall.ENOTDIR) {
+				return nil, fmt.Errorf("%w: 祖先路径不是目录", ErrConflict)
+			}
 			return nil, fmt.Errorf("检查祖先路径失败: %w", err)
 		}
 		if !allowAllDirs && !isWithinRoot(resolved.Workspace.RealRoot, cur) {
@@ -346,6 +330,9 @@ func (m *Manager) PreviewMkdir(req MkdirRequest) (*MkdirPreview, error) {
 			break
 		}
 		cur = parent
+	}
+	if !req.Parents && len(missing) > 1 {
+		return nil, fmt.Errorf("父目录不存在（如需递归创建请设置 parents=true）: %w", os.ErrNotExist)
 	}
 	// 反转为自顶向下顺序（先建父目录，再建子目录）
 	for i, j := 0, len(missing)-1; i < j; i, j = i+1, j-1 {
@@ -662,7 +649,7 @@ func (m *Manager) resolveEntryNoFollow(workspaceID, targetPath string, forWrite 
 
 	parentReal, err := resolveRealPath(filepath.Dir(candidate))
 	if err != nil {
-		return nil, fmt.Errorf("%w: 解析父目录失败: %v", ErrAccessDenied, err)
+		return nil, fmt.Errorf("%w: 解析父目录失败: %w", ErrAccessDenied, err)
 	}
 	entryAbs := filepath.Clean(filepath.Join(parentReal, filepath.Base(candidate)))
 	if !allowAllDirs && !isWithinRoot(ws.RealRoot, entryAbs) {
